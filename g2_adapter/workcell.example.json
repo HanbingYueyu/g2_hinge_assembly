@@ -1,0 +1,23 @@
+{
+  "schema_version": 1,
+  "calibrated": false,
+  "presets_rad": {
+    "left_p1": null,
+    "left_p2": null,
+    "left_p3": null,
+    "left_p4": null,
+    "right_post_grasp": null
+  },
+  "camera": {
+    "source": "agibot_gdk.Camera",
+    "streams": ["head_color", "head_depth", "left_color", "left_depth", "right_color", "right_depth"],
+    "parameter_source": "GDK GetCameraParametersService / installed G2 URDF",
+    "probe_completed": false
+  },
+  "collision": {
+    "primary": "GDK",
+    "require_error_free_status": true,
+    "do_not_modify_gdk_collision_config": true
+  },
+  "notes": "必须在当前 G2 实际工位记录预设姿态。"
+}

@@ -1,0 +1,30 @@
+{
+  "robot_model": "G2_t2v2_crsB",
+  "end_effector": "omnipicker",
+  "gdk_version": "4.1.5",
+  "robot_address": "10.42.1.101",
+  "urdf_path": "/home/flyfuture/agi/G2_crsB_omnipicker/genie_robot_description_210/urdf/G2_t2v2_crsB/G2_t2v2_crsB_omnipicker.urdf",
+  "left_arm_joints": [
+    "idx21_arm_l_joint1", "idx22_arm_l_joint2", "idx23_arm_l_joint3",
+    "idx24_arm_l_joint4", "idx25_arm_l_joint5", "idx26_arm_l_joint6",
+    "idx27_arm_l_joint7"
+  ],
+  "right_arm_joints": [
+    "idx61_arm_r_joint1", "idx62_arm_r_joint2", "idx63_arm_r_joint3",
+    "idx64_arm_r_joint4", "idx65_arm_r_joint5", "idx66_arm_r_joint6",
+    "idx67_arm_r_joint7"
+  ],
+  "left_tool_group": "left_tool",
+  "right_tool_group": "right_tool",
+  "left_tcp_link": "gripper_l_base_link",
+  "right_tcp_link": "gripper_r_base_link",
+  "arm_base_link": "arm_base_link",
+  "omnipicker_range_rad": [-0.7853981633974483, 0.0],
+  "control_period_s": 0.01,
+  "max_software_velocity_rad_s": 0.15,
+  "runtime": "python+gdk",
+  "uses_ros2": false,
+  "uses_moveit": false,
+  "gravity_compensation": "gdk",
+  "collision_detection": "gdk"
+}

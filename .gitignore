@@ -1,0 +1,68 @@
+# Codex / local workspace state
+/.agents/
+/.codex/
+
+# Python caches and local environments
+**/__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+.venv/
+venv/
+
+# Generated build trees
+**/build/
+**/install/
+**/log/
+**/logs/
+CMakeCache.txt
+CMakeFiles/
+compile_commands.json
+
+# Runtime outputs, captures and middleware logs
+/outputs/
+/reference_outputs/
+/logs/
+/saved_images/
+/saved_images/
+*.bag
+*.bag.active
+*.mcap
+*.db3
+*.log
+*.INFO
+*.log.INFO.*
+
+# Raw G2 capture/probe output. The reviewed workcell config remains trackable.
+/g2_adapter/recorded_poses.json
+/g2_adapter/camera_probe.json
+
+# Training datasets and large model checkpoints are provisioned separately.
+/datasets/
+/checkpoints/
+
+# Training runs are generated. Keep only the two compact runtime models used
+# by the traditional detector.
+/runs/**
+!/runs/right_d405_new_target_seg_torch/
+!/runs/right_d405_new_target_seg_torch/positive_only_v5/
+!/runs/right_d405_new_target_seg_torch/positive_only_v5/best.pt
+!/runs/right_d405_shaft_seg_torch/
+!/runs/right_d405_shaft_seg_torch/mixed_auto_p4_v7/
+!/runs/right_d405_shaft_seg_torch/mixed_auto_p4_v7/best.pt
+
+# Upstream SAM demo media is not required by its Python package/runtime.
+/sam3/assets/
+
+# Editors and operating systems
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
