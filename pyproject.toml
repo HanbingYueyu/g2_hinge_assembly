@@ -1,0 +1,15 @@
+[project]
+name = "g2-traditional-auto-flow"
+version = "0.1.0"
+description = "Traditional vision workflow for AgiBot G2 through GDK"
+requires-python = ">=3.10,<3.11"
+dependencies = []
+
+[project.optional-dependencies]
+vision = [
+    "numpy>=1.26,<3",
+    "opencv-python-headless>=4.9,<5",
+]
+
+[tool.uv]
+package = false

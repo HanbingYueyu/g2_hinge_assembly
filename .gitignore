@@ -12,7 +12,9 @@
 .coverage
 htmlcov/
 .venv/
+/.venv-sam3/
 venv/
+/.uv-cache/
 
 # Generated build trees
 **/build/
@@ -27,6 +29,7 @@ compile_commands.json
 /outputs/
 /reference_outputs/
 /logs/
+/build/gdk_pybind312/
 /saved_images/
 /saved_images/
 *.bag

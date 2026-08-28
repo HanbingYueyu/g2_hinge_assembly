@@ -4,7 +4,6 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-import cv2
 import numpy as np
 
 
@@ -20,7 +19,128 @@ class GdkRgbdFrame:
     depth_timestamp_ns: int
 
 
+def intrinsic_to_dict(intrinsic, *, width: int, height: int) -> dict[str, float | int | list[float]]:
+    """Convert GDK's ordered ``fx, fy, cx, cy`` intrinsic object to JSON data."""
+    values = [float(value) for value in intrinsic.intrinsic]
+    if len(values) != 4:
+        raise CameraError(f"expected 4 camera intrinsic values, got {len(values)}")
+    return {
+        "fx": values[0],
+        "fy": values[1],
+        "ppx": values[2],
+        "ppy": values[3],
+        "width": int(width),
+        "height": int(height),
+        "distortion": [float(value) for value in intrinsic.distortion],
+    }
+
+
+def transform_to_dict(transform) -> dict[str, list[float]]:
+    """Return a GDK Transform as JSON-friendly translation and quaternion data."""
+    return {
+        "translation_m": [
+            float(transform.translation.x),
+            float(transform.translation.y),
+            float(transform.translation.z),
+        ],
+        "rotation_xyzw": [
+            float(transform.rotation.x),
+            float(transform.rotation.y),
+            float(transform.rotation.z),
+            float(transform.rotation.w),
+        ],
+    }
+
+
+def _rotation_matrix_from_quaternion_xyzw(quaternion: list[float] | np.ndarray) -> np.ndarray:
+    x, y, z, w = (float(value) for value in quaternion)
+    norm = x * x + y * y + z * z + w * w
+    if norm <= np.finfo(np.float64).eps:
+        raise CameraError("camera extrinsic quaternion has zero length")
+    x, y, z, w = x / norm**0.5, y / norm**0.5, z / norm**0.5, w / norm**0.5
+    return np.array([
+        [1 - 2 * (y * y + z * z), 2 * (x * y - z * w), 2 * (x * z + y * w)],
+        [2 * (x * y + z * w), 1 - 2 * (x * x + z * z), 2 * (y * z - x * w)],
+        [2 * (x * z - y * w), 2 * (y * z + x * w), 1 - 2 * (x * x + y * y)],
+    ], dtype=np.float64)
+
+
+def align_depth_to_color(
+    depth_u16: np.ndarray,
+    *,
+    depth_intrinsic: dict,
+    color_intrinsic: dict,
+    depth_to_color: dict,
+    depth_scale_m: float = 0.001,
+) -> np.ndarray:
+    """Project raw depth-camera Z16 pixels into the color-camera image plane.
+
+    GDK returns the left hand color and depth streams as independent optical
+    sensors.  Their reported shapes may coincide, but their intrinsics do not;
+    a same-pixel lookup would therefore be uncalibrated.  ``depth_to_color``
+    is the GDK transform returned for
+    ``kLeftHandDepthToLeftHandColor`` (or its right-hand equivalent).
+    """
+    if depth_u16.dtype != np.uint16 or depth_u16.ndim != 2:
+        raise CameraError("depth_u16 must be a two-dimensional uint16 image")
+    if not np.isfinite(depth_scale_m) or depth_scale_m <= 0:
+        raise CameraError("depth_scale_m must be positive and finite")
+    output_height = int(color_intrinsic["height"])
+    output_width = int(color_intrinsic["width"])
+    if output_height <= 0 or output_width <= 0:
+        raise CameraError("color intrinsic image shape is invalid")
+    for name, intrinsic in (("depth", depth_intrinsic), ("color", color_intrinsic)):
+        if float(intrinsic["fx"]) <= 0 or float(intrinsic["fy"]) <= 0:
+            raise CameraError(f"{name} focal length must be positive")
+
+    rows, cols = np.nonzero(depth_u16)
+    aligned = np.zeros((output_height, output_width), dtype=np.uint16)
+    if rows.size == 0:
+        return aligned
+    z_depth_m = depth_u16[rows, cols].astype(np.float64) * float(depth_scale_m)
+    points_depth = np.stack((
+        (cols - float(depth_intrinsic["ppx"])) * z_depth_m / float(depth_intrinsic["fx"]),
+        (rows - float(depth_intrinsic["ppy"])) * z_depth_m / float(depth_intrinsic["fy"]),
+        z_depth_m,
+    ), axis=1)
+    rotation = _rotation_matrix_from_quaternion_xyzw(depth_to_color["rotation_xyzw"])
+    translation = np.asarray(depth_to_color["translation_m"], dtype=np.float64)
+    if translation.shape != (3,) or not np.all(np.isfinite(translation)):
+        raise CameraError("camera extrinsic translation is invalid")
+    points_color = points_depth @ rotation.T + translation
+    positive = points_color[:, 2] > np.finfo(np.float64).eps
+    points_color = points_color[positive]
+    if points_color.size == 0:
+        return aligned
+    projected_cols = np.rint(
+        points_color[:, 0] * float(color_intrinsic["fx"]) / points_color[:, 2]
+        + float(color_intrinsic["ppx"])
+    ).astype(np.int64)
+    projected_rows = np.rint(
+        points_color[:, 1] * float(color_intrinsic["fy"]) / points_color[:, 2]
+        + float(color_intrinsic["ppy"])
+    ).astype(np.int64)
+    in_bounds = (
+        (projected_cols >= 0) & (projected_cols < output_width)
+        & (projected_rows >= 0) & (projected_rows < output_height)
+    )
+    if not np.any(in_bounds):
+        return aligned
+    projected_depth_units = np.rint(
+        points_color[in_bounds, 2] / float(depth_scale_m)
+    ).clip(1, np.iinfo(np.uint16).max).astype(np.uint16)
+    flat_indices = (
+        projected_rows[in_bounds] * output_width + projected_cols[in_bounds]
+    )
+    z_buffer = np.full(output_height * output_width, np.iinfo(np.uint16).max, dtype=np.uint16)
+    np.minimum.at(z_buffer, flat_indices, projected_depth_units)
+    z_buffer[z_buffer == np.iinfo(np.uint16).max] = 0
+    return z_buffer.reshape(output_height, output_width)
+
+
 def decode_color_rgb(image, gdk) -> np.ndarray:
+    import cv2
+
     data = np.asarray(image.data, dtype=np.uint8)
     if data.size == 0:
         raise CameraError("GDK returned an empty color image")
@@ -52,6 +172,8 @@ def decode_depth_u16(image, gdk) -> np.ndarray:
     if raw.size == 0:
         raise CameraError("GDK returned an empty depth image")
     if image.encoding == gdk.Encoding.PNG:
+        import cv2
+
         depth = cv2.imdecode(raw, cv2.IMREAD_UNCHANGED)
     elif image.encoding == gdk.Encoding.UNCOMPRESSED:
         expected = int(image.height) * int(image.width) * 2
@@ -111,4 +233,3 @@ class GdkCameraSource:
             color_timestamp_ns=color_timestamp,
             depth_timestamp_ns=depth_timestamp,
         )
-

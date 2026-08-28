@@ -3,7 +3,7 @@
   "end_effector": "omnipicker",
   "gdk_version": "4.1.5",
   "robot_address": "10.42.1.101",
-  "urdf_path": "/home/flyfuture/agi/G2_crsB_omnipicker/genie_robot_description_210/urdf/G2_t2v2_crsB/G2_t2v2_crsB_omnipicker.urdf",
+  "urdf_path": "robot_description/G2_t2v2_crsB_omnipicker.urdf",
   "left_arm_joints": [
     "idx21_arm_l_joint1", "idx22_arm_l_joint2", "idx23_arm_l_joint3",
     "idx24_arm_l_joint4", "idx25_arm_l_joint5", "idx26_arm_l_joint6",

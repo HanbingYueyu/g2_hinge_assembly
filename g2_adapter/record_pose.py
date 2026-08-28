@@ -30,7 +30,7 @@ except ImportError:
         validate_robot_status,
     )
 
-POSE_NAMES = ("left_p1", "left_p2", "left_p3", "left_p4", "right_post_grasp")
+POSE_NAMES = ("left_p1", "left_p2", "left_p3", "right_post_grasp")
 DEFAULT_OUTPUT = Path(__file__).resolve().parent / "recorded_poses.json"
 
 
