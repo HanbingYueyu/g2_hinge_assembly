@@ -1,0 +1,88 @@
+#!/usr/bin/env python3
+"""Read or set one G2 Omnipicker position through the project safety gate.
+
+The default invocation is read-only.  A gripper command requires the sole
+explicit confirmation flag, ``--allow-motion``.  This tool never moves an arm,
+switches a GDK application/control mode, or changes collision/gravity settings.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import sys
+import time
+
+try:
+    from .control import G2Controller
+except ImportError:
+    from control import G2Controller
+
+
+OPEN_RAD = -0.785
+CLOSE_RAD = 0.0
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="读取或设置 G2 Omnipicker")
+    parser.add_argument("--side", choices=("left", "right"), default="left")
+    parser.add_argument("--target", choices=("open", "close"), default="open")
+    parser.add_argument("--allow-motion", action="store_true", help="唯一动作确认参数；未指定时严格只读。")
+    parser.add_argument("--settle-s", type=float, default=0.8, help="发命令后等待反馈的时间。")
+    return parser.parse_args()
+
+
+def main() -> int:
+    args = parse_args()
+    if not 0.0 <= args.settle_s <= 5.0:
+        print("参数错误：--settle-s 必须在 0..5 秒。", file=sys.stderr)
+        return 2
+    try:
+        import agibot_gdk
+    except ImportError:
+        print("agibot_gdk 不可用；请通过 scripts/run_gdk_python.sh 运行。", file=sys.stderr)
+        return 2
+
+    desired = OPEN_RAD if args.target == "open" else CLOSE_RAD
+    initialized = False
+    try:
+        if agibot_gdk.gdk_init() != agibot_gdk.GDKRes.kSuccess:
+            raise RuntimeError("GDK 初始化失败")
+        initialized = True
+        robot = agibot_gdk.Robot()
+        time.sleep(0.5)
+        controller = G2Controller(agibot_gdk, robot, allow_motion=args.allow_motion)
+        controller.checked_arm_state()
+        before = controller.read_gripper_position(args.side)
+        result = {
+            "side": args.side,
+            "target": args.target,
+            "requested_position_rad": desired,
+            "before_position_rad": before,
+            "motion_enabled": args.allow_motion,
+        }
+        if not args.allow_motion:
+            result["command_sent"] = False
+            result["safety"] = "只读预览；追加 --allow-motion 才会发送夹爪命令。"
+            print(json.dumps(result, ensure_ascii=False))
+            return 0
+
+        controller.move_gripper(args.side, desired)
+        time.sleep(args.settle_s)
+        result["command_sent"] = True
+        result["after_position_rad"] = controller.read_gripper_position(args.side)
+        print(json.dumps(result, ensure_ascii=False))
+        return 0
+    except Exception as exc:
+        print(f"Omnipicker 操作失败：{exc}", file=sys.stderr)
+        return 1
+    finally:
+        if initialized:
+            try:
+                agibot_gdk.gdk_release()
+            except Exception:
+                pass
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

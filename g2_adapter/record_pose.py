@@ -30,7 +30,12 @@ except ImportError:
         validate_robot_status,
     )
 
-POSE_NAMES = ("left_p1", "left_p2", "left_p3", "right_post_grasp")
+POSE_NAMES = (
+    "left_p2",
+    "left_p3",
+    "left_p4",
+    "right_post_grasp",
+)
 DEFAULT_OUTPUT = Path(__file__).resolve().parent / "recorded_poses.json"
 
 
@@ -53,6 +58,13 @@ def _gripper(end_state: dict, side: str) -> float | None:
         return None
     value = float(states[0].get("position", math.nan))
     return value if math.isfinite(value) else None
+
+
+def _gripper_names(end_state: dict, side: str) -> list[str]:
+    group = end_state.get(f"{side}_end_state")
+    if not isinstance(group, dict):
+        return []
+    return [str(value) for value in group.get("names", ())]
 
 
 def _atomic_json(path: Path, payload: dict) -> None:
@@ -109,7 +121,9 @@ def main() -> int:
             "joint_positions_rad": list(arms[offset : offset + 7]),
             "both_arms_rad": dict(zip(ARM_JOINT_NAMES, arms)),
             "all_gdk_motor_positions_rad": all_joints,
+            "left_omnipicker_names": _gripper_names(end_state, "left"),
             "left_omnipicker_rad": _gripper(end_state, "left"),
+            "right_omnipicker_names": _gripper_names(end_state, "right"),
             "right_omnipicker_rad": _gripper(end_state, "right"),
             "motion_mode": int(motion.mode),
             "motion_error_code": int(motion.error_code),

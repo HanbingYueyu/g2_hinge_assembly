@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import sys
 from pathlib import Path
 
@@ -21,9 +22,21 @@ from PIL import Image
 from sam3.model.sam3_image_processor import Sam3Processor
 from sam3.model_builder import build_sam3_image_model
 
+try:
+    from .sam_crop import center_crop_image, draw_crop_box, expand_crop_masks
+except ImportError:
+    from sam_crop import center_crop_image, draw_crop_box, expand_crop_masks
+
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 CAPTURE_ROOT = PROJECT_ROOT / "outputs" / "left_d405_gdk"
+# A perforated metal hinge can expose the distant tray/background through its
+# holes.  A whole-mask median would then jump to that background plane.  The
+# foreground layer is deliberately quantised coarsely enough to retain a
+# slightly tilted hinge, while still separating it from a distant background.
+FOREGROUND_DEPTH_BIN_M = 0.005
+FOREGROUND_DEPTH_HALF_WIDTH_M = 0.010
+FOREGROUND_DEPTH_MIN_FRACTION = 0.05
 
 
 def parse_args() -> argparse.Namespace:
@@ -121,7 +134,13 @@ def load_capture(sample: Path) -> tuple[Path, np.ndarray, np.ndarray, dict]:
 
 
 def depth_points(mask: np.ndarray, depth_u16: np.ndarray, scale_m: float, intrinsic: dict) -> tuple[np.ndarray, np.ndarray]:
-    """Return a robust inlier mask and its color-camera XYZ points in metres."""
+    """Return the nearest supported depth layer and its color-camera XYZ points.
+
+    SAM masks for a perforated hinge contain both the metal surface and the
+    distant scene visible through the holes.  Selecting the nearest depth
+    layer with meaningful support prevents the background layer from becoming
+    the reported object depth merely because it occupies more mask pixels.
+    """
     valid = np.asarray(mask, dtype=bool) & (depth_u16 > 0)
     if int(valid.sum()) < 20:
         valid = cv2.dilate(np.asarray(mask, dtype=np.uint8), np.ones((5, 5), np.uint8), iterations=1).astype(bool)
@@ -130,8 +149,20 @@ def depth_points(mask: np.ndarray, depth_u16: np.ndarray, scale_m: float, intrin
     if rows.size == 0:
         return valid, np.empty((0, 3), dtype=np.float64)
     z_m = depth_u16[rows, cols].astype(np.float64) * scale_m
-    low, high = np.percentile(z_m, (10.0, 90.0))
-    keep = (z_m >= low) & (z_m <= high)
+    bin_ids = np.floor(z_m / FOREGROUND_DEPTH_BIN_M).astype(np.int64)
+    unique_bins, counts = np.unique(bin_ids, return_counts=True)
+    minimum_support = max(20, int(math.ceil(z_m.size * FOREGROUND_DEPTH_MIN_FRACTION)))
+    supported = unique_bins[counts >= minimum_support]
+    if supported.size == 0:
+        # Keep the largest layer rather than allowing an unsupported nearest
+        # noise pixel to masquerade as the foreground object.
+        selected_bin = int(unique_bins[int(np.argmax(counts))])
+    else:
+        selected_bin = int(supported.min())
+    layer_center_m = float(np.median(z_m[bin_ids == selected_bin]))
+    keep = np.abs(z_m - layer_center_m) <= FOREGROUND_DEPTH_HALF_WIDTH_M
+    if int(keep.sum()) < minimum_support:
+        keep = bin_ids == selected_bin
     valid.fill(False)
     valid[rows[keep], cols[keep]] = True
     rows, cols, z_m = rows[keep], cols[keep], z_m[keep]
@@ -299,7 +330,9 @@ def main() -> int:
         print(f"loading_checkpoint={checkpoint}", flush=True)
         model = build_sam3_image_model(checkpoint_path=str(checkpoint), load_from_HF=False)
         processor = Sam3Processor(model, confidence_threshold=args.threshold)
-        image = Image.fromarray(cv2.cvtColor(color_bgr, cv2.COLOR_BGR2RGB))
+        color_rgb = cv2.cvtColor(color_bgr, cv2.COLOR_BGR2RGB)
+        sam_input, crop_bounds = center_crop_image(color_rgb)
+        image = Image.fromarray(sam_input)
         # SAM3's CUDA path mixes bfloat16 activations with float32 checkpoint
         # weights.  The upstream video inference path and the prior
         # traditional script both run this section under CUDA AMP; without it
@@ -309,8 +342,9 @@ def main() -> int:
         ):
             state = processor.set_image(image)
             result = processor.set_text_prompt(args.prompt, state)
-        masks = result["masks"].detach().cpu().numpy()
-        masks = [np.asarray(mask, dtype=bool).squeeze() for mask in masks]
+        crop_masks = result["masks"].detach().cpu().numpy()
+        crop_masks = [np.asarray(mask, dtype=bool).squeeze() for mask in crop_masks]
+        masks = expand_crop_masks(crop_masks, full_shape=color_bgr.shape[:2], bounds=crop_bounds)
 
         intrinsic = metadata["color"]["intrinsic"]
         scale_m = float(metadata["depth"]["scale_m_per_unit"])
@@ -344,7 +378,7 @@ def main() -> int:
         overlay_path = output_dir / "overlay.jpg"
         masks_path = output_dir / "masks.npy"
         json_path = output_dir / "localization.json"
-        cv2.imwrite(str(overlay_path), draw_overlay(color_bgr, masks, statistics, selected))
+        cv2.imwrite(str(overlay_path), draw_crop_box(draw_overlay(color_bgr, masks, statistics, selected), crop_bounds))
         np.save(masks_path, np.asarray(masks, dtype=bool))
         document = {
             "schema_version": 1,
@@ -359,6 +393,8 @@ def main() -> int:
                 "checkpoint": str(checkpoint),
                 "prompt": args.prompt,
                 "threshold": args.threshold,
+                "center_crop_fraction": 0.70,
+                "center_crop_xyxy": list(crop_bounds),
                 "min_area_px": args.min_area,
                 "min_valid_depth_pixels": args.min_valid_depth_pixels,
                 "mask_count": len(statistics),

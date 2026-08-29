@@ -29,7 +29,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--scene",
         required=True,
-        help="当前最终检测场景名，例如 left_final_detection；不是预移动点 P1/P2/P3。",
+        help="当前最终检测场景名，例如 left_final_detection；不是预移动点 P2/P3。",
     )
     parser.add_argument(
         "--output-dir", type=Path, default=PROJECT_ROOT / "outputs" / "left_d405_gdk",

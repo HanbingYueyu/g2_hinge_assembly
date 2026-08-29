@@ -180,3 +180,68 @@ class UrdfKinematics:
         result = jacobian.T @ np.linalg.solve(system, delta)
         return np.clip(result, -abs(max_joint_delta), abs(max_joint_delta))
 
+    def translation_waypoints(
+        self,
+        base_link: str,
+        tip_link: str,
+        joint_positions: Mapping[str, float],
+        active_joint_names: Sequence[str],
+        translation_m: Sequence[float],
+        *,
+        max_cartesian_step_m: float,
+        damping: float = 0.03,
+        max_joint_delta: float = 0.005,
+        tolerance_m: float = 1e-5,
+        max_iterations_per_waypoint: int = 20,
+    ) -> tuple[tuple[float, ...], ...]:
+        """Solve a translation as bounded joint-increment waypoints.
+
+        Each waypoint is solved from the previous waypoint, so no individual
+        joint update exceeds ``max_joint_delta``.  This avoids silently
+        truncating a larger Cartesian move at a one-step joint clamp.
+        """
+        translation = np.asarray(translation_m, dtype=np.float64)
+        if translation.shape != (3,) or not np.all(np.isfinite(translation)):
+            raise KinematicsError("translation_m must contain three finite values")
+        if not math.isfinite(max_cartesian_step_m) or max_cartesian_step_m <= 0.0:
+            raise KinematicsError("max_cartesian_step_m must be positive and finite")
+        if not math.isfinite(tolerance_m) or tolerance_m <= 0.0:
+            raise KinematicsError("tolerance_m must be positive and finite")
+        if max_iterations_per_waypoint < 1:
+            raise KinematicsError("max_iterations_per_waypoint must be at least one")
+        names = tuple(active_joint_names)
+        if not names:
+            raise KinematicsError("active_joint_names must not be empty")
+        values = np.asarray([float(joint_positions[name]) for name in names], dtype=np.float64)
+        if not np.all(np.isfinite(values)):
+            raise KinematicsError("joint_positions must be finite")
+        start_pose = self.forward(base_link, tip_link, dict(zip(names, values)))
+        start_position = start_pose[:3, 3].copy()
+        distance = float(np.linalg.norm(translation))
+        if distance == 0.0:
+            return ()
+        waypoint_count = int(math.ceil(distance / max_cartesian_step_m))
+        waypoints: list[tuple[float, ...]] = []
+        for index in range(1, waypoint_count + 1):
+            desired_position = start_position + translation * (index / waypoint_count)
+            for _ in range(max_iterations_per_waypoint):
+                pose = self.forward(base_link, tip_link, dict(zip(names, values)))
+                residual = desired_position - pose[:3, 3]
+                if float(np.linalg.norm(residual)) <= tolerance_m:
+                    break
+                delta = self.damped_joint_delta(
+                    base_link,
+                    tip_link,
+                    dict(zip(names, values)),
+                    names,
+                    residual,
+                    damping=damping,
+                    max_joint_delta=max_joint_delta,
+                )
+                if float(np.linalg.norm(delta)) <= 1e-12:
+                    raise KinematicsError("translation IK made no progress")
+                values = values + delta
+            else:
+                raise KinematicsError("translation IK did not converge within waypoint iteration limit")
+            waypoints.append(tuple(float(value) for value in values))
+        return tuple(waypoints)

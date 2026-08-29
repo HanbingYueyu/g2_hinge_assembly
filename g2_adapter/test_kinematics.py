@@ -41,6 +41,23 @@ class KinematicsTests(unittest.TestCase):
         )
         self.assertLessEqual(abs(delta[0]), 0.01)
 
+    def test_translation_waypoints_reach_requested_translation_with_bounded_increments(self):
+        waypoints = self.model.translation_waypoints(
+            "base",
+            "tip",
+            {"j1": 0.0},
+            ["j1"],
+            [np.sqrt(1.0 - 0.01**2) - 1.0, 0.01, 0.0],
+            max_cartesian_step_m=0.002,
+            max_joint_delta=0.005,
+            tolerance_m=3e-5,
+        )
+
+        self.assertGreaterEqual(len(waypoints), 5)
+        self.assertTrue(all(abs(next_value - previous) <= 0.005 + 1e-12 for previous, next_value in zip((0.0, *[item[0] for item in waypoints[:-1]]), [item[0] for item in waypoints])))
+        pose = self.model.forward("base", "tip", {"j1": waypoints[-1][0]})
+        np.testing.assert_allclose(pose[:3, 3], [np.sqrt(1.0 - 0.01**2), 0.01, 0.0], atol=1e-5)
+
 
 if __name__ == "__main__":
     unittest.main()

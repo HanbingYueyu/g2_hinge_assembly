@@ -25,9 +25,11 @@ from sam3.model_builder import build_sam3_image_model
 try:
     from .camera import align_depth_to_color, decode_color_rgb, decode_depth_u16, intrinsic_to_dict, transform_to_dict
     from .localize_left_d405_sam3 import draw_overlay, eligible_candidates, parse_roi, select_candidate, stats_for_mask
+    from .sam_crop import center_crop_image, draw_crop_box, expand_crop_masks
 except ImportError:
     from camera import align_depth_to_color, decode_color_rgb, decode_depth_u16, intrinsic_to_dict, transform_to_dict
     from localize_left_d405_sam3 import draw_overlay, eligible_candidates, parse_roi, select_candidate, stats_for_mask
+    from sam_crop import center_crop_image, draw_crop_box, expand_crop_masks
 
 
 DEPTH_SCALE_M = 0.001
@@ -43,9 +45,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--warmup", type=int, default=5, help="开始前丢弃的左手彩色帧数。")
     parser.add_argument("--prompt", default="silver triangular hinge", help="SAM3 英文文本提示。")
     parser.add_argument("--threshold", type=float, default=0.10, help="SAM3 置信度阈值。")
-    parser.add_argument("--min-area", type=int, default=1500, help="候选最小掩膜面积。")
-    parser.add_argument("--min-valid-depth-pixels", type=int, default=500, help="候选最少有效对齐深度像素。")
-    parser.add_argument("--roi", default="330,430,1000,760", metavar="X0,Y0,X1,Y1", help="托盘检测区域，彩色图像像素坐标；传 none 关闭。")
+    parser.add_argument("--min-area", type=int, default=1, help="候选最小掩膜面积。")
+    parser.add_argument("--min-valid-depth-pixels", type=int, default=50, help="候选最少有效对齐深度像素。")
+    parser.add_argument("--roi", default="none", metavar="X0,Y0,X1,Y1", help="检测区域，彩色图像像素坐标；默认不限制。")
     parser.add_argument("--selection", choices=("largest", "leftmost", "rightmost"), default="leftmost", help="合格候选选择策略。")
     parser.add_argument("--track-max-distance-px", type=float, default=120.0, help="锁定目标在相邻帧允许的最大中心移动像素，默认 120。")
     parser.add_argument("--track-hold-frames", type=int, default=12, help="锁定目标丢失后拒绝切换的帧数，默认 12。")
@@ -178,10 +180,12 @@ def run() -> int:
                     depth_to_color=depth_to_color,
                     depth_scale_m=DEPTH_SCALE_M,
                 )
+                sam_input, crop_bounds = center_crop_image(color_rgb)
                 with torch.inference_mode(), torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-                    state = processor.set_image(Image.fromarray(color_rgb))
+                    state = processor.set_image(Image.fromarray(sam_input))
                     output = processor.set_text_prompt(args.prompt, state)
-                masks = [np.asarray(mask, dtype=bool).squeeze() for mask in output["masks"].detach().cpu().numpy()]
+                crop_masks = [np.asarray(mask, dtype=bool).squeeze() for mask in output["masks"].detach().cpu().numpy()]
+                masks = expand_crop_masks(crop_masks, full_shape=color_rgb.shape[:2], bounds=crop_bounds)
                 scores = output["scores"].detach().float().cpu().numpy().reshape(-1)
                 if len(masks) != len(scores):
                     raise RuntimeError(f"SAM3 掩膜和置信度数量不一致：{len(masks)} != {len(scores)}")
@@ -242,7 +246,7 @@ def run() -> int:
                     and statistics[selected]["valid_depth_px"] >= args.min_valid_depth_pixels
                     and statistics[selected]["xyz_color_camera_m"] is not None
                 )
-                overlay = draw_overlay(color_bgr, masks, statistics, selected)
+                overlay = draw_crop_box(draw_overlay(color_bgr, masks, statistics, selected), crop_bounds)
                 completed_at = time.monotonic()
                 elapsed_ms = (completed_at - started) * 1000.0
                 processing_fps = None if previous_completed_at is None else 1.0 / max(completed_at - previous_completed_at, 1e-9)
@@ -265,6 +269,8 @@ def run() -> int:
                         "missed_frames": missed_track_frames,
                     },
                     "roi_xyxy": roi,
+                    "sam_center_crop_xyxy": list(crop_bounds),
+                    "sam_center_crop_fraction": 0.70,
                     "inference_ms": round(elapsed_ms, 1),
                     "processing_fps": None if processing_fps is None else round(processing_fps, 2),
                     "color_depth_delta_ms": round(abs(int(color.timestamp_ns) - int(depth.timestamp_ns)) / 1_000_000.0, 3),
