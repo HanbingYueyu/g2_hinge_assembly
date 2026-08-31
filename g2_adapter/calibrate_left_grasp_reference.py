@@ -19,22 +19,28 @@ from pathlib import Path
 
 import numpy as np
 import torch
+import cv2
 from PIL import Image
 from sam3.model.sam3_image_processor import Sam3Processor
 from sam3.model_builder import build_sam3_image_model
 
 try:
     from .camera import align_depth_to_color, decode_color_rgb, decode_depth_u16, intrinsic_to_dict, transform_to_dict
-    from .localize_left_d405_sam3 import eligible_candidates, parse_roi, stats_for_mask
+    from .localize_left_d405_sam3 import draw_overlay, eligible_candidates, parse_roi, stats_for_mask
     from .sam_crop import center_crop_image, expand_crop_masks
+    from .yolo_hinge import infer_yolo_masks, load_yolo_segmentation_model
 except ImportError:
     from camera import align_depth_to_color, decode_color_rgb, decode_depth_u16, intrinsic_to_dict, transform_to_dict
-    from localize_left_d405_sam3 import eligible_candidates, parse_roi, stats_for_mask
+    from localize_left_d405_sam3 import draw_overlay, eligible_candidates, parse_roi, stats_for_mask
     from sam_crop import center_crop_image, expand_crop_masks
+    from yolo_hinge import infer_yolo_masks, load_yolo_segmentation_model
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DEPTH_SCALE_M = 0.001
+DEFAULT_G2_NATIVE_YOLO = (
+    PROJECT_ROOT / "models" / "left_d405_hinge_yolo" / "best.pt"
+)
 
 
 def choose_candidate(statistics: list[dict], candidates: list[int], selection: str) -> int | None:
@@ -53,22 +59,37 @@ def choose_candidate(statistics: list[dict], candidates: list[int], selection: s
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="在操作员手动放好的左手最终夹取点读取 SAM3 参考；不发送机器人或夹爪命令。"
+        description="在操作员手动放好的左手最终下探前位置读取视觉参考；不发送机器人或夹爪命令。"
     )
     parser.add_argument("--config", type=Path, default=PROJECT_ROOT / "g2_adapter" / "left_grasp.example.json")
     parser.add_argument("--prompt", default="silver triangular hinge")
     parser.add_argument("--threshold", type=float, default=0.10)
+    parser.add_argument(
+        "--detector", choices=("yolo", "sam3"), default="yolo",
+        help="默认与正式抓取一致，使用 G2 原生 YOLO 的实例中心；sam3 仅保留用于旧参考复核。",
+    )
+    parser.add_argument("--yolo-model", type=Path, default=DEFAULT_G2_NATIVE_YOLO)
+    parser.add_argument("--yolo-confidence", type=float, default=0.25)
+    parser.add_argument("--yolo-target-confidence", type=float, default=0.25)
+    parser.add_argument("--yolo-imgsz", type=int, default=640)
+    parser.add_argument("--yolo-device", default="cuda:0")
     parser.add_argument("--min-area", type=int, default=1)
     parser.add_argument("--min-valid-depth-pixels", type=int, default=50)
     parser.add_argument("--roi", default="none", metavar="X0,Y0,X1,Y1")
     parser.add_argument(
         "--selection",
         choices=("largest", "leftmost", "second-leftmost", "rightmost"),
-        default="second-leftmost",
-        help="当前手工对准的铰链排序；默认第二个从左。",
+        default="leftmost",
+        help="当前手工对准的铰链排序；默认最左，与 left_grasp_gdk.py 一致。",
     )
     parser.add_argument("--warmup", type=int, default=5)
     parser.add_argument("--checkpoint", type=Path, default=PROJECT_ROOT / "checkpoints" / "sam3.1_multiplex.pt")
+    parser.add_argument(
+        "--output-image",
+        type=Path,
+        default=None,
+        help="标定叠加图路径；默认写入 outputs/left_grasp_calibration/。",
+    )
     parser.add_argument("--apply", action="store_true", help="确认后将当前参考写回 --config；省略时只打印建议值。")
     return parser.parse_args()
 
@@ -95,6 +116,9 @@ def main() -> int:
     args = parse_args()
     if not (
         0.0 <= args.threshold <= 1.0
+        and 0.0 <= args.yolo_confidence <= 1.0
+        and 0.0 <= args.yolo_target_confidence <= 1.0
+        and args.yolo_imgsz > 0
         and args.min_area >= 1
         and args.min_valid_depth_pixels >= 1
         and args.warmup >= 0
@@ -106,8 +130,12 @@ def main() -> int:
         return 2
     checkpoint = args.checkpoint.expanduser().resolve()
     config_path = args.config.expanduser().resolve()
-    if not checkpoint.is_file() or not config_path.is_file():
-        print(f"找不到权重或配置：checkpoint={checkpoint}, config={config_path}", file=sys.stderr)
+    yolo_model_path = args.yolo_model.expanduser().resolve()
+    if not config_path.is_file() or (args.detector == "sam3" and not checkpoint.is_file()) or (args.detector == "yolo" and not yolo_model_path.is_file()):
+        print(
+            f"找不到所需权重或配置：checkpoint={checkpoint}, yolo_model={yolo_model_path}, config={config_path}",
+            file=sys.stderr,
+        )
         return 2
     try:
         import agibot_gdk
@@ -142,34 +170,76 @@ def main() -> int:
             depth_to_color=depth_to_color,
             depth_scale_m=DEPTH_SCALE_M,
         )
-        model = build_sam3_image_model(checkpoint_path=str(checkpoint), load_from_HF=False)
-        processor = Sam3Processor(model, confidence_threshold=args.threshold)
-        sam_input, crop_bounds = center_crop_image(color_rgb)
-        with torch.inference_mode(), torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-            image_state = processor.set_image(Image.fromarray(sam_input))
-            result = processor.set_text_prompt(args.prompt, image_state)
-        crop_masks = [np.asarray(mask, dtype=bool).squeeze() for mask in result["masks"].detach().cpu().numpy()]
-        masks = expand_crop_masks(crop_masks, full_shape=color_rgb.shape[:2], bounds=crop_bounds)
-        scores = result["scores"].detach().float().cpu().numpy().reshape(-1)
-        statistics = [stats_for_mask(mask, aligned_depth, DEPTH_SCALE_M, color_intrinsic, rgbd_to_end_link) for mask in masks]
-        for item, score in zip(statistics, scores):
-            item["sam3_confidence"] = float(score)
+        if args.detector == "yolo":
+            yolo_model = load_yolo_segmentation_model(yolo_model_path, device=args.yolo_device)
+            yolo_input = cv2.cvtColor(color_rgb, cv2.COLOR_RGB2BGR)
+            masks, scores = infer_yolo_masks(
+                yolo_model,
+                yolo_input,
+                confidence=args.yolo_confidence,
+                imgsz=args.yolo_imgsz,
+                device=args.yolo_device,
+            )
+            statistics = [stats_for_mask(mask, aligned_depth, DEPTH_SCALE_M, color_intrinsic, rgbd_to_end_link) for mask in masks]
+            for item, score in zip(statistics, scores):
+                item["yolo_confidence"] = float(score)
+            crop_bounds = (0, 0, int(color_rgb.shape[1]), int(color_rgb.shape[0]))
+        else:
+            model = build_sam3_image_model(checkpoint_path=str(checkpoint), load_from_HF=False)
+            processor = Sam3Processor(model, confidence_threshold=args.threshold)
+            sam_input, crop_bounds = center_crop_image(color_rgb)
+            with torch.inference_mode(), torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                image_state = processor.set_image(Image.fromarray(sam_input))
+                result = processor.set_text_prompt(args.prompt, image_state)
+            crop_masks = [np.asarray(mask, dtype=bool).squeeze() for mask in result["masks"].detach().cpu().numpy()]
+            masks = expand_crop_masks(crop_masks, full_shape=color_rgb.shape[:2], bounds=crop_bounds)
+            scores = result["scores"].detach().float().cpu().numpy().reshape(-1)
+            statistics = [stats_for_mask(mask, aligned_depth, DEPTH_SCALE_M, color_intrinsic, rgbd_to_end_link) for mask in masks]
+            for item, score in zip(statistics, scores):
+                item["sam3_confidence"] = float(score)
         roi = parse_roi(args.roi, color_rgb.shape[:2])
         candidates = eligible_candidates(
             statistics,
             min_area=args.min_area,
             min_valid_depth_pixels=args.min_valid_depth_pixels,
             roi=roi,
-            require_depth=True,
+            require_depth=False,
         )
+        if args.detector == "yolo":
+            candidates = [
+                index for index in candidates
+                if float(statistics[index]["yolo_confidence"]) >= args.yolo_target_confidence
+            ]
         selected_index = choose_candidate(statistics, candidates, args.selection)
         if selected_index is None:
             raise RuntimeError("没有符合面积、深度和 ROI 条件的目标；配置没有被修改")
         selected = statistics[selected_index]
+        output_image = args.output_image
+        if output_image is None:
+            stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+            output_image = PROJECT_ROOT / "outputs" / "left_grasp_calibration" / f"reference_{stamp}.jpg"
+        output_image = output_image.expanduser().resolve()
+        output_image.parent.mkdir(parents=True, exist_ok=True)
+        overlay = draw_overlay(
+            cv2.cvtColor(color_rgb, cv2.COLOR_RGB2BGR), masks, statistics, selected_index
+        )
+        center_x, center_y = (int(round(value)) for value in selected["center_px"])
+        cv2.drawMarker(
+            overlay, (center_x, center_y), (0, 255, 255), cv2.MARKER_CROSS,
+            markerSize=34, thickness=2, line_type=cv2.LINE_AA,
+        )
+        cv2.putText(
+            overlay, "REFERENCE: final-descent start", (12, 58),
+            cv2.FONT_HERSHEY_SIMPLEX, 0.62, (0, 255, 255), 2, cv2.LINE_AA,
+        )
+        if not cv2.imwrite(str(output_image), overlay):
+            raise RuntimeError(f"无法写入标定叠加图：{output_image}")
         reference = {
             "target_pixel_px": [float(value) for value in selected["center_px"]],
-            "pre_descent_depth_m": float(selected["depth_median_m"]),
+            "pre_descent_depth_m": None if selected.get("depth_median_m") is None else float(selected["depth_median_m"]),
             "selection": args.selection,
+            "detector": args.detector,
+            "yolo_model": None if args.detector != "yolo" else str(yolo_model_path),
             "selected_mask_index": int(selected_index),
             "selected": selected,
             "mask_count": len(statistics),
@@ -177,13 +247,15 @@ def main() -> int:
             "sam_center_crop_xyxy": list(crop_bounds),
             "sam_center_crop_fraction": 0.70,
             "captured_at_utc": datetime.now(timezone.utc).isoformat(),
+            "overlay_image": str(output_image),
         }
         if args.apply:
             document = json.loads(config_path.read_text(encoding="utf-8"))
             if document.get("schema_version") != 1:
                 raise RuntimeError("配置 schema_version 必须为 1")
             document.setdefault("alignment", {})["target_pixel_px"] = reference["target_pixel_px"]
-            document.setdefault("approach", {})["pre_descent_depth_m"] = reference["pre_descent_depth_m"]
+            if reference["pre_descent_depth_m"] is not None:
+                document.setdefault("approach", {})["pre_descent_depth_m"] = reference["pre_descent_depth_m"]
             document["manual_final_grasp_reference"] = reference
             atomic_json_write(config_path, document)
             reference["config_updated"] = str(config_path)

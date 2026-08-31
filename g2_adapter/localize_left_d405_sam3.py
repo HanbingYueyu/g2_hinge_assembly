@@ -238,7 +238,7 @@ def draw_overlay(image_bgr: np.ndarray, masks: list[np.ndarray], stats: list[dic
         ).astype(np.uint8)
         x0, y0, x1, y1 = item["bbox_xyxy"]
         cv2.rectangle(output, (x0, y0), (x1, y1), color, 2)
-        confidence = item.get("sam3_confidence")
+        confidence = item.get("sam3_confidence", item.get("yolo_confidence"))
         label = f"#{index} area={item['area_px']}"
         if confidence is not None:
             label += f" conf={float(confidence):.2f}"

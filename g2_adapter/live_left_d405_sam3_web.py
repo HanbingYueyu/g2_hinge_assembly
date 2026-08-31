@@ -71,7 +71,7 @@ class SharedView:
             return self.overlay_jpeg, dict(self.status)
 
 
-def handler_class(shared: SharedView):
+def handler_class(shared: SharedView, *, title: str = "G2 左手 D405 / SAM3（只读）"):
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, format: str, *args) -> None:
             return
@@ -99,10 +99,10 @@ def handler_class(shared: SharedView):
             if path not in {"/", "/index.html"}:
                 self.send_error(HTTPStatus.NOT_FOUND)
                 return
-            page = """<!doctype html><meta charset='utf-8'><title>G2 Left D405 SAM3</title>
+            page = """<!doctype html><meta charset='utf-8'><title>__TITLE__</title>
 <style>body{margin:0;background:#161616;color:#eee;font:15px sans-serif}main{max-width:1280px;margin:auto;padding:14px}img{width:100%;background:#222}pre{white-space:pre-wrap;background:#242424;padding:10px;border-radius:6px}</style>
-<main><h2>G2 左手 D405 / SAM3（只读）</h2><img id='overlay' alt='等待相机帧'><pre id='status'>starting</pre></main>
-<script>let s=0;async function tick(){try{let r=await fetch('/status.json',{cache:'no-store'});let j=await r.json();document.querySelector('#status').textContent=JSON.stringify(j,null,2);if(j.sequence!==s){s=j.sequence;document.querySelector('#overlay').src='/overlay.jpg?seq='+s}}catch(e){document.querySelector('#status').textContent=String(e)}}setInterval(tick,350);tick();</script>"""
+<main><h2>__TITLE__</h2><img id='overlay' alt='等待相机帧'><pre id='status'>starting</pre></main>
+<script>let s=0;async function tick(){try{let r=await fetch('/status.json',{cache:'no-store'});let j=await r.json();document.querySelector('#status').textContent=JSON.stringify(j,null,2);if(j.sequence!==s){s=j.sequence;document.querySelector('#overlay').src='/overlay.jpg?seq='+s}}catch(e){document.querySelector('#status').textContent=String(e)}}setInterval(tick,350);tick();</script>""".replace("__TITLE__", title)
             self.send_bytes(page.encode("utf-8"), "text/html; charset=utf-8")
 
     return Handler

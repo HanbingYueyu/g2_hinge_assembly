@@ -26,10 +26,30 @@ CLOSE_RAD = 0.0
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="读取或设置 G2 Omnipicker")
     parser.add_argument("--side", choices=("left", "right"), default="left")
-    parser.add_argument("--target", choices=("open", "close"), default="open")
+    selection = parser.add_mutually_exclusive_group()
+    selection.add_argument("--target", choices=("open", "close"), default=None)
+    selection.add_argument(
+        "--open-percent",
+        type=float,
+        default=None,
+        metavar="0..100",
+        help="按全闭合 0%%、最大张开 100%% 设置张开程度。",
+    )
     parser.add_argument("--allow-motion", action="store_true", help="唯一动作确认参数；未指定时严格只读。")
     parser.add_argument("--settle-s", type=float, default=0.8, help="发命令后等待反馈的时间。")
     return parser.parse_args()
+
+
+def target_position_rad(*, target: str | None, open_percent: float | None) -> tuple[float, str, float | None]:
+    """Resolve a named endpoint or an operator-friendly opening percentage."""
+    if open_percent is not None:
+        if not 0.0 <= open_percent <= 100.0:
+            raise ValueError("--open-percent 必须在 0..100。")
+        # The measured range is 0 rad (closed) through -0.785 rad (fully
+        # open), so percentage increases in the physical opening direction.
+        return OPEN_RAD * (open_percent / 100.0), "open_percent", open_percent
+    resolved_target = target or "open"  # Preserve the old default invocation.
+    return (OPEN_RAD if resolved_target == "open" else CLOSE_RAD), resolved_target, None
 
 
 def main() -> int:
@@ -38,12 +58,18 @@ def main() -> int:
         print("参数错误：--settle-s 必须在 0..5 秒。", file=sys.stderr)
         return 2
     try:
+        desired, target_label, open_percent = target_position_rad(
+            target=args.target, open_percent=args.open_percent,
+        )
+    except ValueError as exc:
+        print(f"参数错误：{exc}", file=sys.stderr)
+        return 2
+    try:
         import agibot_gdk
     except ImportError:
         print("agibot_gdk 不可用；请通过 scripts/run_gdk_python.sh 运行。", file=sys.stderr)
         return 2
 
-    desired = OPEN_RAD if args.target == "open" else CLOSE_RAD
     initialized = False
     try:
         if agibot_gdk.gdk_init() != agibot_gdk.GDKRes.kSuccess:
@@ -56,7 +82,8 @@ def main() -> int:
         before = controller.read_gripper_position(args.side)
         result = {
             "side": args.side,
-            "target": args.target,
+            "target": target_label,
+            "open_percent": open_percent,
             "requested_position_rad": desired,
             "before_position_rad": before,
             "motion_enabled": args.allow_motion,

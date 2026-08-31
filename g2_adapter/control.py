@@ -204,6 +204,16 @@ class LeftEndEffectorPositionStream:
                 return False
             self._at_target.wait(remaining)
 
+    def is_target_reached(self) -> bool:
+        """Return the current target-arrival state without waiting.
+
+        State-machine callers use this to keep perception and the web UI
+        responsive while a 50-Hz position stream is moving.
+        """
+        self.raise_if_failed()
+        with self._lock:
+            return self._arrived_generation >= self._target_generation
+
     def set_left_gripper_target(self, position_rad: float) -> None:
         """Synchronize the left Omnipicker with this 50-Hz pose stream.
 

@@ -153,3 +153,14 @@ class LeftGraspState:
             return
         self.phase = GraspPhase.ALIGN_XY
         self.centered_frames = 0
+
+    def reset_for_regrasp(self) -> None:
+        """Start a new visual alignment after a confirmed failed attempt.
+
+        Unlike ``reset_alignment`` this is deliberately valid after GRASPED:
+        the caller has already retracted and confirmed that the Omnipicker is
+        open, so it is safe to leave the terminal closure phase and reacquire
+        the next visible instance.
+        """
+        self.phase = GraspPhase.ALIGN_XY
+        self.centered_frames = 0

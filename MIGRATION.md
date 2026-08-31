@@ -56,6 +56,31 @@ sudo apt install -y libprotobuf-dev protobuf-compiler
 15%）；网页以黄色框显示该区域。掩膜会映射回完整彩色图坐标，因此深度、目标像素和视觉伺服
 仍使用完整 `1280×1056` 坐标系。
 
+### 可选：左 D405 的 YOLO 主检测与 SAM3 复核
+
+项目内的运行时权重路径为 `models/left_d405_hinge_yolo/best.pt`，其 SHA-256 在
+`g2_adapter/left_d405_hinge_yolo.sha256` 中记录。安装 `ultralytics` 后，
+`live_left_d405_yolo_sam_review_web.py` 用 YOLO11n-seg 作为主检测器，以 SAM3 每秒复核同一
+RGB-D 帧；只有目标中心误差不超过 80 px、深度中值差不超过 50 mm 才发布只读目标。训练相机的完整
+画面为 `680×420`，所以 YOLO 从 G2 左 D405 图取同宽高比的最大中心区域（当前 `1280×791`，
+`[0,132,1280,923]`）再缩放至训练分辨率，而不拉伸整幅图或使用过小的固定像素窗口；掩膜按最近邻恢复到完整 D405 图像坐标。SAM3
+使用中心 70% 图像，YOLO 候选中心也必须落在相同黄色框内。网页的紫色框标出 YOLO 源视野，黄色框标出有效作业区域。YOLO 默认不作软件 FPS 限制。YOLO 推理与显示准入阈值均为 `0.01`，以保留该模型的低分铰链；只有有足够有效深度的候选才会由
+SAM3 按最近像素中心复核并成为可发布目标。此入口仅用于实机感知验证，
+未接入运动、下探或夹爪状态机。
+
+### 重新训练 G2 原生铰链 YOLO
+
+旧的 YOLO 权重来自 `680×420` 的另一相机视角，不能靠持续降低阈值解决 G2 左 D405 的视角域偏移。
+使用 `g2_adapter/capture_left_d405_hinge_yolo_dataset.py` 采集原生 `1280×1056` GDK 彩色帧，并在浏览器中
+逐帧人工勾出所有铰链实例。采集页冻结图像后会按文本提示自动生成可编辑的初始多边形，但不会自动保存，操作员必须
+确认、删除误检或补画后才构成训练真值；它只使用 `Camera`，不创建 `Robot`、不控制运动或夹爪。原始数据保存到
+`datasets/left_d405_hinge_yolo_raw_g2_v1/`。至少采集 120 个正样本帧和 40 个负样本帧后，依次运行
+`prepare_left_d405_hinge_yolo_dataset.py --min-positive 120 --min-negative 40` 与
+`train_left_d405_hinge_yolo.py --epochs 150 --batch 8 --name g2_native_v1`。新模型训练、验证和部署都保持
+G2 原图比例并由 YOLO 内部 letterbox；实时验证时传入
+`--yolo-model models/left_d405_hinge_yolo/best.pt --yolo-input-mode native`，不使用旧模型的
+`680×420` 固定视野预处理。
+
 ## 主要文件
 
 - `g2_adapter/control.py`：唯一 GDK 运动调用边界；
@@ -71,7 +96,7 @@ sudo apt install -y libprotobuf-dev protobuf-compiler
 - `g2_adapter/left_grasp_gdk.py`：最终检测位的左手 D405/SAM3 视觉抓取状态机；默认只读，
   通过唯一 `--allow-motion` 参数且完成 G2 实测标定后才会调用 GDK 运动/夹爪接口。加 `--full-cycle`
   后同一进程只初始化一次 GDK、只加载一次 SAM3，依次完成 P2→P3、抓取、`base_link +Z` 上抬 100 mm、P4。图像对心仍为
-  GDK mode 1 的直接末端位姿控制；接近和闭爪全程不切换 GDK control mode。
+  GDK mode 1 的直接末端位姿控制；接近和闭爪全程不切换 GDK control mode。抓取后会持续监控同一锁定实例：上抬或 P4 请求前掉件会张爪并回到视觉重抓；P4 请求发出后若掉件、形态异常或观测陈旧，则停止发送后续命令并报错，不在运动中自动重抓。
 - `g2_adapter/inspect_force_control.py`、`g2_adapter/probe_left_cartesian_contact.py`：仅为后续力控排障
   保留，当前正式抓取流程不调用。
 
@@ -138,7 +163,7 @@ P3 即实际执行左手视觉检测和抓取前的最终位置。脚本记录�
 
 ### 最终检测位左手抓取
 
-旧 OpenArm 的实际抓取逻辑现已按 G2 结构迁移：有有效深度的最左目标的图像 XY 对心、锁定姿态、在
+旧 OpenArm 的实际抓取逻辑现已按 G2 结构迁移：G2 原生 YOLO 主检测先选择有有效深度的最左目标，同一实例需经 SAM3 低频复核后才会进入图像 XY 对心、锁定姿态、在
 `base_link` 水平面保持高度后，以已标定时长竖直向下接近、闭合 Omnipicker、读取闭合反馈确认。G2 版本读取
 当前 `base_link→arm_l_end_link` 位姿，直接以 GDK `end_effector_pose_control()`（mode 1）发布小范围末端
 目标；不使用 ROS、MoveIt、自写 IK 或自建重力/碰撞控制器。
@@ -147,11 +172,11 @@ GDK 左手 RGB-D 外参以 `arm_l_end_link` 为终点；视觉 FK、Jacobian、I
 避免与 `gripper_l_base_link` 的固定额外旋转混用。
 
 默认入口不控制 P2/P3，也不猜测最终检测位：操作员先完成预移动并确认已经处于
-最终检测位，再启动抓取状态机。若全部 P2/P3/P4 已记录，可在同一入口追加 `--full-cycle`，由单一 GDK/SAM3 进程完成整条流程。左 Omnipicker 的机械行程已实测为张开 `-0.785 rad`、全闭合 `0.0 rad`；夹紧不再依赖固定绝对角度：它先测出当前铰链位置的稳定卡住角度，再从该角度额外闭合 `0.03 rad`；
+最终检测位，再启动抓取状态机。若全部 P2/P3/P4 已记录，可在同一入口追加 `--full-cycle`，由单一 GDK/SAM3 进程完成整条流程。左 Omnipicker 的机械行程已实测为最大张开 `-0.785 rad`、全闭合 `0.0 rad`；当前运行时张开目标设为经操作员确认的 75%（`-0.58875 rad`），以避免碰到周围铰链。夹紧不再依赖固定绝对角度：它先测出当前铰链位置的稳定卡住角度，再从该角度额外闭合 `0.03 rad`；
 `g2_adapter/left_grasp.example.json` 的 `target_pixel_px` 必须在夹爪将要下探的位置实测，表示视觉伺服的
 抓取参考像素。视觉深度仅用于筛除无效目标，**不再用于决定垂直下探距离**；不同铰链的绝对相机深度不能作为公共高度参考。XY 连续对准后，
-`approach.final_descent_speed_mps=0.01` 与 `approach.final_descent_duration_s=25.0` 定义一个最多 250 mm 的、受相对力优先保护的接触搜索行程。每次搜索前读取 20 帧新鲜基线；相对力首次达到 2 N 即停止向下。接触时相对力不超过 3 N 则保持当前位置直接闭爪；仅超过 3 N 才最多上提 15 mm，且相对力连续 3 帧降至或等于 3 N 后才闭爪。250 mm 和 15 mm 均为操作员确认的故障兜底上限。G2 基座方向经操作员确认：`+X` 前、`+Y` 左、`+Z` 上。完整抓取在文件未完成标定时会拒绝执行。
-完整抓取在 P3 会先以 `left_end_state` 确认左 Omnipicker 的实际角度已到张开目标 `-0.785 rad` 附近；若 6 秒内没有这一反馈，流程停止且绝不开始视觉伺服或下探。
+`approach.final_descent_speed_mps=0.01` 与 `approach.final_descent_duration_s=25.0` 定义一个最多 250 mm 的、受相对力优先保护的接触搜索行程。每次搜索前读取 20 帧新鲜基线；加 `--final-descent-visual-servo` 时，最终下探会仅对下探前锁定的同一目标按实测像素 Jacobian 做实时 XY 复位：单次最多 1 mm，默认不设累计 XY 上限（`--final-descent-visual-max-total-m` 设为正值时才重新启用）；相对力达到接触阈值 50% 即冻结视觉修正。视觉不会改变 Z 向下探距离。相对力首次达到 2 N 即停止向下。接触时相对力不超过 3 N 则保持当前位置直接闭爪；仅超过 3 N 才最多上提 15 mm，且相对力连续 3 帧降至或等于 3 N 后才闭爪。250 mm 和 15 mm 均为操作员确认的故障兜底上限。YOLO 以最左视觉候选为优先；对齐深度只记录诊断，不再筛掉最左目标或决定垂直下探。G2 基座方向经操作员确认：`+X` 前、`+Y` 左、`+Z` 上。完整抓取在文件未完成标定时会拒绝执行。
+完整抓取在 P3 会先以 `left_end_state` 确认左 Omnipicker 的实际角度已到配置的 75% 张开目标 `-0.58875 rad` 附近；若 6 秒内没有这一反馈，流程停止且绝不开始视觉伺服或下探。
 只读观察可由操作员运行：
 
 ```bash
@@ -162,14 +187,14 @@ GDK 左手 RGB-D 外参以 `arm_l_end_link` 为终点；视觉 FK、Jacobian、I
 
 输出仅写到 `logs/left_grasp_*.jsonl`。每帧都会由实测像素 Jacobian 求出受限小步 `base_link` 位移，
 并在 mode 1 直接以 GDK `end_effector_pose_control()` 控制 `arm_l_end_link`；发送器以 50 Hz 保持目标并将
-平移速率限制为 `0.01 m/s`，并从 `motion_control_status.frame_poses` 读取末端起点与最终位移，不依赖 SAM3 的固定帧率，也不使用笛卡尔阻抗或 mode 2。任何无效深度、
+平移速率限制为配置速度（当前默认 `10 mm/s`，可用 `--speed-mm-s` 在 `1～18 mm/s` 内调整），并从 `motion_control_status.frame_poses` 读取末端起点与最终位移，不依赖 SAM3 的固定帧率，也不使用笛卡尔阻抗或 mode 2。任何无效深度、
 目标丢失、目标重新获取、GDK 返回值或运行异常都会停止继续发送末端目标。XY 连续确认后，直接以 50 Hz 进行最多 250 mm 的力接触搜索；相对力达到 2 N 时立即停止向下。接触触发后，GDK 状态实测末端位移或横向偏差
 超限时不会闭爪。该 GDK 接口不做路径规划或碰撞检测，仅限已验证局部小步。脚本不改 payload、TCP、扭矩零点、
 重力补偿，也不会自动回 P3 或切换任何模式。
 
 若抓取时需要浏览器监看，请在同一个 `left_grasp_gdk.py` 进程加 `--web-port 8766`，并在本机打开
 `http://127.0.0.1:8766`。不要同时启动独立 `live_left_d405_sam3_web.py`：内嵌网页复用抓取进程的
-GDK 相机和同一个已加载的 SAM3 模型；从力接触下探开始到自适应闭爪、上抬及 P4 完成，持续显示 SAM3 叠加结果。该结果只用于观察，不提供控制接口，也不参与下探或夹爪决策。
+GDK 相机和同一个已加载的 SAM3 模型；从力接触下探开始到自适应闭爪、上抬及 P4 完成，持续显示 SAM3 叠加结果。该结果只用于观察，不参与运动、下探、上抬或夹爪决策。
 
 首次真机运行使用 `--stop-after xy --allow-motion` 验证仅水平对准；它达到对准后立即停止，不会下探或
 闭爪。确认后从 P3 再运行 `--stop-after descend --allow-motion`，验证力优先的最多 250 mm 接触搜索且不闭爪。

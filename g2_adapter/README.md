@@ -12,6 +12,12 @@
 - 所有控制默认只读，真机运动只通过 `allow_motion` 参数启用；
 - 任一异常、超时或取消都会停止继续发送新命令；不会假设存在未确认的 `stop()`。
 
+### P4 后右手 hole/target 检测（当前只读）
+
+`right_hole_target_detect_gdk.py` 用训练好的 `hole/target` YOLO 框检测模型读取右手彩色相机。它假设前序左手抓取、上抬和 P4 已完成；带 `--allow-motion` 时只把右臂移动到记录的 `right_post_grasp` 姿态，随后持续输出同一帧中的 `hole`（固定工装孔）和 `target`（被夹铰链销轴）框、置信度和中心误差。当前阶段不执行 XY 对孔、下探、力控或释放夹爪。
+
+检测模型只有 2D 框，不能把像素误差直接转换为毫米运动。`paired` 仅表示同一帧同时看到两类目标；目标缺失、过期或出现多候选时都保持检测状态，不产生运动建议。后续对孔必须在 P4 姿态单独标定像素到右臂基座水平位移的 Jacobian，并另行定义力传感器成功条件。
+
 `preflight.py` 和 `record_pose.py` 只读状态，不含任何运动 API 调用。
 `control.py` 直接封装 GDK 的规划式关节运动、100 Hz 伺服与 Omnipicker。
 `camera.py` 直接读取 GDK 的头部、左手和右手 RGB-D，不依赖 ROS 或 RealSense。
@@ -48,6 +54,88 @@
 三维抓取点。SAM3 只接收彩色图像中心 70%（每边去掉 15%）；完整画面上的黄色框就是实际
 推理视野。掩膜随后会恢复到完整图像坐标，所以网页坐标、深度计算、标定和视觉伺服仍是原始
 `1280×1056` 像素坐标。
+
+### 可选：YOLO 主检测 + SAM3 低频复核
+
+`models/left_d405_hinge_yolo/best.pt` 是左 D405 的单类铰链 YOLO11n-seg 权重；该模型目录被
+忽略，不提交到 Git。先安装只影响 Python 3.12 SAM3 环境的依赖：
+
+```bash
+uv pip install --python .venv-sam3/bin/python "ultralytics==8.4.80"
+```
+
+使用下面的**只读**入口验证。训练相机的完整画面是 `680×420`；为不拉伸 G2 的原始 `1280×1056`
+画面，YOLO 先取与 `680:420` 同宽高比的最大中心区域（当前为全宽 `1280×791`，即
+`[0,132,1280,923]`），再缩放到 `680×420` 推理。这样保留大部分视野，而不是取一个固定
+`680×420` 像素窗口。YOLO 输出掩膜会按最近邻放回完整图像坐标。只有中心位于黄色框标示中心 70% 内的候选才有资格被选择；紫色框是 YOLO 的源视野，黄色框是 SAM3/作业 ROI。SAM3 保持中心 70% 输入。
+YOLO 默认不作软件 FPS 限制，SAM3 每秒复核一次同一 RGB-D 帧；仅两者中心距离不超过 80 px、
+深度中值差不超过 50 mm 时，网页状态才会为 `accepted` 并显示 `published_target`。`--yolo-confidence`
+与 `--yolo-target-confidence` 均默认 `0.01`，以保留本模型的低分铰链；网页会显示所有满足面积与 ROI 的
+YOLO 掩膜及各自的有效深度点数。只有同时具有有效深度的候选才能被选择或交给 SAM3 复核。SAM3 不再独立选择“最左”掩膜，而是只复核距离该 YOLO 候选最近的掩膜。该程序不创建
+`Robot`、不发送运动或夹爪命令：
+
+```bash
+./scripts/run_gdk_sam3_python.sh \
+  g2_adapter/live_left_d405_yolo_sam_review_web.py \
+  --host 0.0.0.0 --port 8767
+```
+
+权重训练于 `ultralytics 8.4.80`，运行环境固定为该版本。原模型包建议 YOLO 阈值为 `0.35`，但
+当前项目中保存的一张 2026-08-28 历史图在该阈值没有输出，中心 `680×420` 图中三件的分数约为
+`0.177`、`0.154`、`0.016`，故默认使用 `0.01` 并依赖深度与 SAM3 复核兜底。`680×420` 是模型训练相机的完整画面分辨率；运行时使用同宽高比的最大中心区域，而不是固定像素裁切或拉伸整幅图。
+在多组当前 GDK 画面都稳定 `accepted` 前，该入口不会接入抓取状态机。
+
+### 重新采集并训练 G2 原生 YOLO 数据集
+
+现有权重来自另一套 `680×420` 相机视角，和 G2 左 D405 的原生 `1280×1056` 视角、光照、托盘位置
+不一致。不要继续用它的低置信度输出来自动生成真值；应重新采集 G2 原生彩色图，并人工勾出每个可见
+铰链的轮廓。`capture_left_d405_hinge_yolo_dataset.py` 是浏览器标注器：冻结一帧后会自动按提示词运行一次 SAM，
+再逐个确认、删除误检或清空后手画；SAM 建议绝不会自动保存。用左键沿铰链边缘点多边形，
+点完一个铰链按“完成当前实例”，一帧中所有铰链都标完再保存。没有铰链的空托盘、机械臂遮挡、手进入画面的
+负样本也要保存为空标签。
+
+建议至少采集 120 个正样本帧（每帧可含 1--3 个铰链）和 40 个负样本帧；覆盖左/中/右位置、不同数量、
+轻微姿态变化、亮暗变化、夹爪遮挡和空托盘。不要为采集脚本移动机器人，机器人位置由操作员用平板调整。
+
+```bash
+cd /home/flyfuture/traditional_auto_flow_g2_migration
+
+./scripts/run_gdk_sam3_python.sh \
+  g2_adapter/capture_left_d405_hinge_yolo_dataset.py \
+  --host 0.0.0.0 --port 8770 \
+  --sam-prompt "silver triangular hinge"
+```
+
+在浏览器打开 `http://<机器人IP>:8770`。原始帧和标签写入被忽略跟踪的
+`datasets/left_d405_hinge_yolo_raw_g2_v1/`。结束采集后构建确定性的 train/val/test 划分：
+
+```bash
+./.venv-sam3/bin/python g2_adapter/prepare_left_d405_hinge_yolo_dataset.py \
+  --min-positive 120 --min-negative 40
+```
+
+然后训练新的 G2 原生模型。YOLO 会以 `imgsz=640` 对每个原生图等比 letterbox；不再把运行时图像裁成
+固定的 `680×420` 或拉伸图像。首次使用 `yolo11n-seg.pt` 时，Ultralytics 若本机缓存没有该初始化权重，
+会下载它。
+
+```bash
+./.venv-sam3/bin/python g2_adapter/train_left_d405_hinge_yolo.py \
+  --epochs 150 --batch 8 --name g2_native_v1
+```
+
+训练完成后先在验证集和实时只读页面检查新权重，确认三件铰链及负样本均正常，再替换运行时权重；新模型
+测试时必须使用原生输入模式：
+
+```bash
+./scripts/run_gdk_sam3_python.sh \
+  g2_adapter/live_left_d405_yolo_sam_review_web.py \
+  --yolo-model models/left_d405_hinge_yolo/best.pt \
+  --yolo-input-mode native \
+  --host 0.0.0.0 --port 8767
+```
+
+`native` 会将完整 G2 图交给 YOLO，由 `imgsz=640` 的内部 letterbox 保持比例。旧模型若仍需对比，
+保留默认的 `aspect-crop`。两种模式均只读，均不接入抓取状态机。
 
 左手 P2/P3 是预移动路径点，不是检测工位；抓取确认后的运输流程会先在 `base_link +Z` 上抬 100 mm，随后运行 P4（后续工位点）。机器人由操作员完成预移动并到达最终
 检测位后，再采集一组可供视觉定位复现的 GDK RGB-D 数据：
@@ -147,13 +235,13 @@ python3 g2_adapter/derive_left_xy_mapping.py \
 
 `left_grasp_gdk.py` 迁移了旧 OpenArm 的抓取状态机，但不再依赖 ROS、MoveIt 或额外重力补偿：
 
-1. 默认仅在操作员已到达**最终检测位**后运行；带 `--full-cycle` 时，同一进程会在 SAM3 预加载完成后执行 P2→P3；
-2. SAM3 只在具有足够对齐深度的候选中锁定视觉最左目标，先在 `base_link` 水平面完成 XY 对心；
+1. 默认仅在操作员已到达**最终检测位**后运行；带 `--full-cycle` 时，同一进程会在 YOLO/SAM3 预加载完成后执行 P2→P3；
+2. 默认使用新训练的 G2 原生 YOLO 选择具有足够对齐深度的视觉最左目标；同一目标必须通过 SAM3 低频复核才会交给 XY 状态机。复核未通过、过期或目标缺少深度时不发送运动；
 3. 连续对心确认后，锁定 `arm_l_end_link` 法兰姿态；视觉深度仅用于确认目标可用，不能请求额外下探；
-4. 以 50 Hz、固定法兰姿态进行最多 250 mm 的力优先接触搜索；左末端相对力首次达到 2 N 时立即停止下探；若接触力 ≤3 N，保持当前位置直接闭合 Omnipicker；仅接触力 >3 N 时才最多上提 15 mm，并在相对力连续 3 帧 ≤3 N 后闭爪。未触发接触或未能卸力均拒绝闭爪；
-5. Omnipicker 先向 `0 rad` 收拢以测得本次铰链的卡住角度；角度稳定 0.5 秒（变化 ≤0.005 rad）后，仅从该角度再闭合 0.03 rad。它不再要求某个固定夹紧角度；`--full-cycle` 随后以 `base_link +Z` 上抬 100 mm，并执行 P4，期间不再发送夹爪命令。
+4. 以 50 Hz、固定法兰姿态进行最多 250 mm 的力优先接触搜索。追加 `--final-descent-visual-servo` 后，会仅对下探前锁定的同一实例做实时 XY 复位：每次最多 1 mm，默认不设累计 XY 上限（可用 `--final-descent-visual-max-total-m` 设正值重新启用上限）；相对力达到接触阈值的 50% 即冻结视觉修正。视觉绝不改变 Z 向下探距离。相对力首次达到 2 N 都会停止向下；目标真正连续丢失仍会停止并进入安全恢复。接触力 ≤3 N 时保持当前位置直接闭爪；仅接触力 >3 N 才最多上提 15 mm，并在相对力连续 3 帧 ≤3 N 后闭爪。未触发接触或未能卸力均拒绝闭爪；
+5. Omnipicker 先向 `0 rad` 收拢以测得本次铰链的卡住角度；角度稳定 0.5 秒（变化 ≤0.005 rad）后，仅从该角度再闭合 0.03 rad。随后先以 `base_link +Z` 上抬 20 mm，并连续比较同一 YOLO 实例的像素中心和掩膜面积：若它未随夹爪移动，则张爪、回到视觉对准并重新抓取；验证通过后，`--full-cycle` 会持续锁定并监控该同一实例完成 100 mm 上抬，且必须取得一帧新的健康观测才会请求 P4。P4 请求前掉件会张爪并重新抓取；观测暂时陈旧时保持闭爪并等待，只有新鲜观测确认实例丢失或形态异常才进入恢复；P4 请求已发出后若确认异常，程序停止发送后续命令并报错，**不会**在运动中的机械臂上自动重抓（当前 GDK 没有经验证的规划运动抢占接口）。
 
-完整抓取先以 GDK `left_end_state` 确认左 Omnipicker 已张开至 `-0.785 rad` 附近，才允许开始视觉伺服；单次 GDK 接口调用成功不再被视为张开成功。若 6 秒内未收到符合容差的反馈，流程在 P3 停止，不会下探或闭爪。
+完整抓取先以 GDK `left_end_state` 确认左 Omnipicker 已张开至配置的 `-0.58875 rad`（机械最大张开量的 75%）附近，才允许开始视觉伺服；单次 GDK 接口调用成功不再被视为张开成功。若 6 秒内未收到符合容差的反馈，流程在 P3 停止，不会下探或闭爪。
 
 受看护的 `--stop-after xy` 与 `--stop-after descend` 不会改变夹爪状态；只有完整且已标定的抓取流程才会先张开夹爪。
 
@@ -161,32 +249,39 @@ python3 g2_adapter/derive_left_xy_mapping.py \
 不得改用带固定额外旋转的 `gripper_l_base_link`。
 
 其中所有物理量必须为 G2 实测值，不能复制 OpenArm 的值。左 Omnipicker 已实测为
-**张开 `-0.785 rad`、机械全闭合 `0.0 rad`**；配置不再包含固定 `close_rad`。实际夹紧角度由每次闭合的稳定卡住角度加 `0.03 rad` 得出。配置中的 `target_pixel_px`
+**机械最大张开 `-0.785 rad`、机械全闭合 `0.0 rad`**；当前运行时张开目标为 **75% (`-0.58875 rad`)**，以避开周围铰链。配置不再包含固定 `close_rad`。实际夹紧角度由每次闭合的稳定卡住角度加 `0.03 rad` 得出。配置中的 `target_pixel_px`
 必须在“夹爪将要最终下探”的实际姿态读取，它是目标在左 D405 图像中的中心（视觉伺服的抓取参考点）。
 `pre_descent_*` 为兼容旧配置保留，不参与竖直运动决策；G2 基座坐标为 `+X` 前、`+Y` 左、`+Z` 上。完整抓取仅当这些值已实测且
 `calibrated=true` 后，`--allow-motion` 才会被接受。
-默认不带该参数时可检查实时相机、SAM3、最左目标锁定和深度，且日志只写入 `logs/`：
+默认不带该参数时可检查实时相机、YOLO/SAM3 复核、最左目标锁定和深度，且日志只写入 `logs/`：
 
 ```bash
 /home/flyfuture/traditional_auto_flow_g2_migration/scripts/run_gdk_sam3_python.sh \
   g2_adapter/left_grasp_gdk.py \
-  --config g2_adapter/left_grasp.example.json --max-frames 20
+  --config g2_adapter/left_grasp.example.json \
+  --yolo-model models/left_d405_hinge_yolo/best.pt \
+  --max-frames 20
 ```
 
 该命令是只读预览，不打开/关闭夹爪、不移动机械臂、也不切换任何模式。真机运行仅在操作员完成现场检查后
 使用同一命令追加唯一确认参数 `--allow-motion`；Codex 不执行该命令。程序读取当前
 `base_link→arm_l_end_link` 位姿，并以 GDK `end_effector_pose_control()` 在 mode 1 直接发布目标；发送器固定为
-50 Hz，并将位置变化限为 `0.01 m/s`，不发送阶跃目标。目标丢失、重新获取、深度、GDK 返回值或运行异常都会停止
+50 Hz，并将位置变化限为配置速度（当前默认 `10 mm/s`，可用 `--speed-mm-s` 在 `1～18 mm/s` 内调整），不发送阶跃目标。目标丢失、重新获取、深度、GDK 返回值或运行异常都会停止
 后续末端目标。XY 对准后，程序以 50 Hz 进行最多 250 mm 的力接触搜索，首次相对力达到 2 N 即停止向下；GDK 状态实测位移不足或横向
 偏差超限时不闭爪。末端起点和最终位移均从该状态的 `frame_poses` 读取，不使用 TF 查询作为末端控制反馈。该 GDK 接口没有路径规划或碰撞检测，仅用于已验证的局部小步；抓取完成后保持当前位置和夹爪状态，不会自动回 P3。
 
-已记录 P2/P3/P4 后，完整连续作业只运行一次以下脚本。它只初始化一次 GDK、只加载一次 SAM3，SAM3 在 P2 请求前已经加载完成；任一预设、视觉抓取、接触卸力或夹爪确认失败都会阻止后续阶段：
+最后一个 XY 小步后，程序会先最多等待 5 秒，确认 50 Hz 末端位置流已经到达最后的水平设定点，才允许构造向下目标；等待期间仅保持现有 XY 目标。若仍未到位则停止且不下探。可用 `--pre-final-settle-timeout-s` 在 `1--10` 秒内调整该保护等待。
+
+视觉候选按 YOLO 置信度、面积和 ROI 的最左顺序选择；对齐深度仅记录诊断，不再筛掉最左铰链或参与下探决策。真机动作确认仍只有 `--allow-motion`。
+
+已记录 P2/P3/P4 后，完整连续作业只运行一次以下脚本。它只初始化一次 GDK，并在 P2 请求前加载一次 YOLO 和一次 SAM3；任一预设、视觉抓取、接触卸力或夹爪确认失败都会阻止后续阶段：
 
 ```bash
 /home/flyfuture/traditional_auto_flow_g2_migration/scripts/run_gdk_sam3_python.sh \
   g2_adapter/left_grasp_gdk.py \
   --full-cycle \
   --selection leftmost \
+  --speed-mm-s 10 \
   --web-host 0.0.0.0 \
   --web-port 8766 \
   --allow-motion
@@ -197,7 +292,7 @@ P2/P3 的规划接口可将 GDK `control_mode` 留在 `3`；全流程会在 P3 �
 
 需要在抓取时实时监看同一份 SAM3 推理结果时，**不要**另起 `live_left_d405_sam3_web.py`；在抓取命令
 追加 `--web-port 8766` 即可。浏览器打开 `http://127.0.0.1:8766`。内嵌网页不创建第二个相机或模型，
-仅显示抓取循环正在使用的掩膜、最左目标、状态和深度；黄色框显示 SAM3 的中心 70% 实际输入范围。从最终力接触下探开始，会持续复用同一个已加载的 SAM3 模型更新叠加图，直至自适应闭爪、上抬和 P4 完成。这些结果仅供显示，绝不参与下探、卸力或夹爪决策。它没有控制接口。
+仅显示抓取循环正在使用的掩膜、最左目标、状态和深度；黄色框显示 SAM3 的中心 70% 实际输入范围。从最终力接触下探开始，会持续复用同一个已加载的 SAM3 模型更新叠加图，直至自适应闭爪、上抬和 P4 完成。网页仅供观察，不参与下探、上抬或夹爪决策，也没有控制接口。
 
 首次真机验证应使用受限阶段测试，且 `--allow-motion` 仍是唯一的动作确认参数：
 

@@ -1,9 +1,79 @@
+import io
+import json
 import unittest
 
-from left_grasp_gdk import stalled_gripper_position
+from left_grasp_gdk import (
+    SnapshotVisualMailbox,
+    compact_record,
+    held_part_monitor_failure,
+    json_record,
+    stalled_gripper_position,
+)
 
 
 class AdaptiveGripperTests(unittest.TestCase):
+    def test_frame_jsonl_uses_the_compact_runtime_summary(self):
+        record = {
+            "event": "frame",
+            "frame": 3,
+            "state": "align_xy",
+            "reason": "xy_correction",
+            "candidate_diagnostics": [{"large": "discarded"}],
+            "selected": {"center_px": [10.0, 20.0], "area_px": 999, "depth_median_m": 0.2},
+        }
+        stream = io.StringIO()
+        json_record(stream, record)
+        stored = json.loads(stream.getvalue())
+        self.assertEqual(stored, compact_record(record))
+        self.assertNotIn("candidate_diagnostics", stored)
+        self.assertNotIn("area_px", stored["target"])
+
+    def test_held_part_monitor_rejects_loss_or_geometry_change(self):
+        common = {
+            "reference_center_px": [320.0, 240.0],
+            "reference_area_px": 1000,
+            "max_center_drift_px": 12.0,
+            "max_area_change_fraction": 0.10,
+        }
+        self.assertIsNone(held_part_monitor_failure(
+            {"valid": True, "center_px": [325.0, 242.0], "area_px": 1050}, **common,
+        ))
+        self.assertEqual(
+            held_part_monitor_failure({"valid": False, "reason": "locked_target_lost"}, **common)["reason"],
+            "locked_target_lost",
+        )
+        self.assertEqual(
+            held_part_monitor_failure(
+                {"valid": True, "center_px": [340.0, 240.0], "area_px": 1000}, **common,
+            )["reason"],
+            "held_target_geometry_changed",
+        )
+        self.assertIsNone(held_part_monitor_failure({"valid": None}, **common))
+
+    def test_missing_frame_is_counted_once_and_then_confirmed(self):
+        class FakePerception:
+            def __init__(self):
+                self.snapshot = {
+                    "sequence": 1,
+                    "candidates": [],
+                    "statistics": [],
+                }
+
+            def newer_than(self, sequence, timeout_s=0.0):
+                return None if sequence >= self.snapshot["sequence"] else self.snapshot
+
+        mailbox = SnapshotVisualMailbox(
+            FakePerception(), initial_center_px=[320.0, 240.0],
+            track_max_distance_px=120.0, target_lost_frames=2,
+        )
+        pending = mailbox.newer_than(0)
+        self.assertEqual(pending["reason"], "locked_target_missing_pending")
+        self.assertIsNone(mailbox.newer_than(pending["sequence"]))
+
+        mailbox.perception.snapshot = {"sequence": 2, "candidates": [], "statistics": []}
+        confirmed = mailbox.newer_than(pending["sequence"])
+        self.assertEqual(confirmed["reason"], "locked_target_lost")
+
     def test_reports_stall_only_after_full_stable_window(self):
         samples = [(0.0, -0.31), (0.25, -0.308), (0.50, -0.307)]
         self.assertAlmostEqual(

@@ -47,6 +47,7 @@ compile_commands.json
 # Training datasets and large model checkpoints are provisioned separately.
 /datasets/
 /checkpoints/
+/models/
 
 # Training runs are generated. Keep only the two compact runtime models used
 # by the traditional detector.

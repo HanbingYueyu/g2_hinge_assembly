@@ -36,6 +36,71 @@ def center_crop_image(image: np.ndarray, *, fraction: float = SAM_CENTER_CROP_FR
     return np.asarray(image)[y0:y1, x0:x1].copy(), bounds
 
 
+def center_crop_bounds_size(
+    image_shape: tuple[int, ...], *, crop_width: int, crop_height: int
+) -> tuple[int, int, int, int]:
+    """Return centered fixed-size crop bounds in ``(x0, y0, x1, y1)`` form."""
+    if len(image_shape) < 2:
+        raise ValueError("image_shape must contain height and width")
+    height, width = int(image_shape[0]), int(image_shape[1])
+    if not (0 < crop_width <= width and 0 < crop_height <= height):
+        raise ValueError("fixed crop must be positive and fit within the source image")
+    x0 = (width - int(crop_width)) // 2
+    y0 = (height - int(crop_height)) // 2
+    return x0, y0, x0 + int(crop_width), y0 + int(crop_height)
+
+
+def center_crop_image_size(
+    image: np.ndarray, *, crop_width: int, crop_height: int
+) -> tuple[np.ndarray, tuple[int, int, int, int]]:
+    """Return a centered fixed-size image crop and its source-image bounds."""
+    bounds = center_crop_bounds_size(image.shape, crop_width=crop_width, crop_height=crop_height)
+    x0, y0, x1, y1 = bounds
+    return np.asarray(image)[y0:y1, x0:x1].copy(), bounds
+
+
+def center_crop_bounds_aspect(
+    image_shape: tuple[int, ...], *, aspect_width: int, aspect_height: int
+) -> tuple[int, int, int, int]:
+    """Return the largest centered crop with the requested aspect ratio.
+
+    The crop is always fully inside the source image.  This is useful when a
+    detector was trained with a particular camera aspect ratio: resize this
+    crop to the trained resolution instead of geometrically stretching the
+    whole G2 frame or reducing the field of view to a fixed pixel window.
+    """
+    if len(image_shape) < 2:
+        raise ValueError("image_shape must contain height and width")
+    height, width = int(image_shape[0]), int(image_shape[1])
+    if height <= 0 or width <= 0:
+        raise ValueError("image dimensions must be positive")
+    if aspect_width <= 0 or aspect_height <= 0:
+        raise ValueError("aspect dimensions must be positive")
+
+    requested_ratio = float(aspect_width) / float(aspect_height)
+    source_ratio = float(width) / float(height)
+    if source_ratio >= requested_ratio:
+        crop_height = height
+        crop_width = max(1, min(width, int(round(height * requested_ratio))))
+    else:
+        crop_width = width
+        crop_height = max(1, min(height, int(round(width / requested_ratio))))
+    x0 = (width - crop_width) // 2
+    y0 = (height - crop_height) // 2
+    return x0, y0, x0 + crop_width, y0 + crop_height
+
+
+def center_crop_image_aspect(
+    image: np.ndarray, *, aspect_width: int, aspect_height: int
+) -> tuple[np.ndarray, tuple[int, int, int, int]]:
+    """Return a largest aspect-matched centered crop and its source bounds."""
+    bounds = center_crop_bounds_aspect(
+        image.shape, aspect_width=aspect_width, aspect_height=aspect_height
+    )
+    x0, y0, x1, y1 = bounds
+    return np.asarray(image)[y0:y1, x0:x1].copy(), bounds
+
+
 def expand_crop_masks(
     crop_masks: list[np.ndarray],
     *,

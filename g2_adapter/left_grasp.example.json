@@ -7,8 +7,8 @@
     "center_confirmations": 3,
     "max_xy_step_m": 0.002,
     "target_pixel_px": [
-      619.4533855441344,
-      559.9730624898026
+      613.0339433854728,
+      527.8723956684187
     ],
     "pixel_jacobian_px_per_m": [
       [
@@ -23,7 +23,7 @@
     "mapping_controller": "gdk_mode1_end_effector_pose_control"
   },
   "approach": {
-    "pre_descent_depth_m": 0.138,
+    "pre_descent_depth_m": 0.211,
     "pre_descent_confirmations": 3,
     "pre_descent_step_m": 0.001,
     "pre_descent_duration_s": 0.1,
@@ -32,7 +32,7 @@
     "final_descent_completion_tolerance_m": 0.0005
   },
   "gripper": {
-    "open_rad": -0.785,
+    "open_rad": -0.58875,
     "close_tolerance_rad": 0.035,
     "close_timeout_s": 6.0
   },
@@ -54,46 +54,56 @@
     "relief_force_delta_threshold_n": 3.0,
     "relief_consecutive_samples": 3
   },
-  "notes": "Coordinate convention confirmed by the operator: base_link +X=forward, -X=backward, +Y=left, -Y=right, +Z=up, -Z=down. Left Omnipicker measured 2026-08-28: closed=0.0 rad, open=-0.785 rad. The verified horizontal grasp reference was read on 2026-08-28 from the second-leftmost hinge while the open left gripper was manually placed at the intended pre-close pose: target_pixel_px=[659.9209502012997,526.0894572426121], aligned depth median=0.145 m, valid depth pixels=12741. The pixel Jacobian was measured on 2026-08-28 using the same GDK mode-1 end_effector_pose_control interface as the grasp loop, with actual arm_l_end_link displacement from motion_control_status.frame_poses. +X actual=[0.0010838205,-0.0002608543] m produced pixel=[-0.7325887,2.8297410]; +Y actual=[0.0001078357,0.0007211699] m produced pixel=[1.4250970,0.8327916]. This replaces the retired custom-IK/joint-servo mapping. Supervised one-step XY tests on 2026-08-29 confirmed the image moves left under base Y- for the right target and right under base Y+ for the left target. Candidate selection and tracking require valid aligned depth. After XY alignment, the program samples a fresh 20-frame left end-link wrench baseline, without force zeroing or a mode switch, and begins one 250 mm maximum, 0.01 m/s downward force-contact search. Image depth is diagnostic only and can never request additional vertical motion. The first relative-force sample at or above 2 N immediately stops downward motion. If that contact force is at or below 3 N, it holds position and closes without lifting; only a contact above 3 N is relieved by up to 15 mm, then requires 3 consecutive samples at or below 3 N before closure. If no contact occurs within 250 mm or force does not release within 15 mm, it stops without closing. This version does not change application mode or GDK control_mode and does not use Cartesian impedance, custom IK, MoveIt, ROS, gravity compensation, payload/TCP calibration, or application collision-detection commands. GDK documents end_effector_pose_control as unplanned and without collision detection, so it is limited to these verified local steps.",
+  "notes": "Coordinate convention confirmed by the operator: base_link +X=forward, -X=backward, +Y=left, -Y=right, +Z=up, -Z=down. Left Omnipicker measured 2026-08-28: closed=0.0 rad, mechanically fully open=-0.785 rad. The runtime grasp opening is operator-confirmed 75%=-0.58875 rad to avoid contacting neighbouring hinges. The verified horizontal grasp reference was read on 2026-08-28 from the second-leftmost hinge while the open left gripper was manually placed at the intended pre-close pose: target_pixel_px=[659.9209502012997,526.0894572426121], aligned depth median=0.145 m, valid depth pixels=12741. The pixel Jacobian was measured on 2026-08-28 using the same GDK mode-1 end_effector_pose_control interface as the grasp loop, with actual arm_l_end_link displacement from motion_control_status.frame_poses. +X actual=[0.0010838205,-0.0002608543] m produced pixel=[-0.7325887,2.8297410]; +Y actual=[0.0001078357,0.0007211699] m produced pixel=[1.4250970,0.8327916]. This replaces the retired custom-IK/joint-servo mapping. Supervised one-step XY tests on 2026-08-29 confirmed the image moves left under base Y- for the right target and right under base Y+ for the left target. Candidate selection and tracking require valid aligned depth. After XY alignment, the program samples a fresh 20-frame left end-link wrench baseline, without force zeroing or a mode switch, and begins one 250 mm maximum, 0.01 m/s downward force-contact search. Image depth is diagnostic only and can never request additional vertical motion. The first relative-force sample at or above 2 N immediately stops downward motion. If that contact force is at or below 3 N, it holds position and closes without lifting; only a contact above 3 N is relieved by up to 15 mm, then requires 3 consecutive samples at or below 3 N before closure. If no contact occurs within 250 mm or force does not release within 15 mm, it stops without closing. This version does not change application mode or GDK control_mode and does not use Cartesian impedance, custom IK, MoveIt, ROS, gravity compensation, payload/TCP calibration, or application collision-detection commands. GDK documents end_effector_pose_control as unplanned and without collision detection, so it is limited to these verified local steps.",
   "manual_final_grasp_reference": {
     "target_pixel_px": [
-      619.4533855441344,
-      559.9730624898026
+      613.0339433854728,
+      527.8723956684187
     ],
-    "pre_descent_depth_m": 0.138,
+    "pre_descent_depth_m": 0.211,
     "selection": "leftmost",
+    "detector": "yolo",
+    "yolo_model": "/home/flyfuture/traditional_auto_flow_g2_migration/models/left_d405_hinge_yolo/best.pt",
     "selected_mask_index": 1,
     "selected": {
-      "area_px": 61290,
+      "area_px": 15791,
       "bbox_xyxy": [
-        504,
-        377,
-        750,
-        815
+        547,
+        439,
+        667,
+        646
       ],
       "center_px": [
-        619.4533855441344,
-        559.9730624898026
+        613.0339433854728,
+        527.8723956684187
       ],
-      "valid_depth_px": 19479,
+      "valid_depth_px": 2030,
       "xyz_color_camera_m": [
-        -0.007410053006530021,
-        0.028454636945083916,
-        0.138
+        -0.010878588456395137,
+        0.028320701932753413,
+        0.211
       ],
       "xyz_left_arm_end_link_m": [
-        -0.008841621965515195,
-        0.020661265211834604,
-        0.14578471494608713
+        -0.012217197919444997,
+        0.07070572040758662,
+        0.1989373881422126
       ],
-      "depth_median_m": 0.138,
-      "sam3_confidence": 0.26953125
+      "depth_median_m": 0.211,
+      "yolo_confidence": 0.962421715259552
     },
     "mask_count": 2,
     "eligible_candidate_indices": [
       0,
       1
     ],
-    "captured_at_utc": "2026-08-29T09:26:50.252007+00:00"
+    "sam_center_crop_xyxy": [
+      0,
+      0,
+      1280,
+      1056
+    ],
+    "sam_center_crop_fraction": 0.7,
+    "captured_at_utc": "2026-08-30T07:32:50.242460+00:00",
+    "overlay_image": "/home/flyfuture/traditional_auto_flow_g2_migration/outputs/left_grasp_calibration/reference_20260830T073250Z.jpg"
   }
 }
