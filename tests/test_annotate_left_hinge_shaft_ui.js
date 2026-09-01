@@ -1,0 +1,72 @@
+#!/usr/bin/gjs
+/* Smoke-test the embedded canvas interaction without a GUI. */
+const {GLib} = imports.gi;
+
+let sourcePath = ARGV[0] || 'g2_adapter/annotate_left_hinge_shaft_sam3.py';
+let [ok, bytes] = GLib.file_get_contents(sourcePath);
+if (!ok) throw new Error('cannot read ' + sourcePath);
+let source = imports.byteArray.toString(bytes);
+let match = source.match(/PAGE = r"""([\s\S]*?)"""/);
+if (!match) throw new Error('PAGE not found');
+let script = match[1].match(/<script>([\s\S]*)<\/script>/)[1];
+/* Do not perform the real initial fetch/image load in this unit test. */
+script = script.replace(/document\.addEventListener\('keydown',[\s\S]*?\);load\(\);\s*$/, '');
+
+let handlers = {};
+let elements = {};
+function element(id) {
+    if (!elements[id]) elements[id] = {
+        classList: {add() {}, remove() {}, toggle() {}},
+        textContent: '', value: '', max: 0,
+    };
+    return elements[id];
+}
+let ctx = {
+    clearRect() {}, drawImage() {}, beginPath() {}, ellipse() {}, stroke() {},
+    arc() {}, fill() {}, moveTo() {}, lineTo() {}, closePath() {},
+    strokeStyle: '', fillStyle: '', lineWidth: 0,
+};
+let canvas = {
+    width: 400, height: 300,
+    addEventListener(name, fn) { handlers[name] = fn; },
+    setPointerCapture() {}, hasPointerCapture() { return false; }, releasePointerCapture() {},
+    getBoundingClientRect() { return {left: 0, top: 0, width: 400, height: 300}; },
+    getContext() { return ctx; },
+};
+let fakeDocument = {
+    querySelector(sel) { return sel === '#canvas' ? canvas : element(sel.slice(1)); },
+    addEventListener() {},
+};
+let fakeImage = function() { this.complete = true; };
+let fakeWindow = {document: fakeDocument, Image: fakeImage};
+/* Make browser globals visible to the embedded page code. */
+var document = fakeDocument;
+var Image = fakeImage;
+eval('(function(){' + script + '\n})();');
+
+/* The page code is scoped by the function above, so run the same event path
+ * in a second eval with assertions in that scope. */
+let testScript = script + `
+function assert(c, m) { if (!c) throw new Error(m); }
+width=400; height=300; c.width=400; c.height=300; img.complete=true;
+ellipseMode=true; currentClass=1;
+handlers.pointerdown({button:0, pointerId:1, clientX:100, clientY:100, preventDefault(){}});
+handlers.pointermove({pointerId:1, clientX:220, clientY:180});
+handlers.pointerup({button:0, pointerId:1});
+assert(polys.length===1 && polys[0].shape==='ellipse', 'ellipse was not created');
+assert(ellipseMode===false && selected===0, 'create mode did not switch to edit mode');
+let oldCx=polys[0].cx, oldCy=polys[0].cy;
+handlers.pointerdown({button:0, pointerId:2, clientX:160, clientY:140, preventDefault(){}});
+handlers.pointermove({pointerId:2, clientX:180, clientY:155});
+handlers.pointerup({button:0, pointerId:2});
+assert(polys[0].cx===oldCx+20 && polys[0].cy===oldCy+15, 'ellipse center did not move');
+let oldRx=polys[0].rx;
+handlers.pointerdown({button:0, pointerId:3, clientX:polys[0].cx+oldRx, clientY:polys[0].cy, preventDefault(){}});
+handlers.pointermove({pointerId:3, clientX:polys[0].cx+oldRx+20, clientY:polys[0].cy});
+handlers.pointerup({button:0, pointerId:3});
+assert(polys[0].rx===oldRx+20, 'ellipse handle did not resize');
+let saved=serializable()[0];
+assert(saved.shape==='ellipse' && saved.points.length===48, 'ellipse serialization is not editable metadata');
+print('UI ellipse create/edit/serialize smoke test: PASS');
+`;
+eval('(function(){' + testScript + '\n})();');

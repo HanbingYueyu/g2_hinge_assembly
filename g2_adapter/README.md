@@ -18,6 +18,16 @@
 
 检测模型只有 2D 框，不能把像素误差直接转换为毫米运动。`paired` 仅表示同一帧同时看到两类目标；目标缺失、过期或出现多候选时都保持检测状态，不产生运动建议。后续对孔必须在 P4 姿态单独标定像素到右臂基座水平位移的 Jacobian，并另行定义力传感器成功条件。
 
+如果需要先验证 SAM3 是否能理解这两个物体，可运行 `right_hole_target_sam3_preview.py`。它在同一右手彩色帧上分别使用 `the exposed cylindrical metal pin at the end of the hinge` 和 `the white circular opening in the fixture` 两个文本提示，只读显示掩膜，不接入动作状态机。SAM3 的英文提示应描述可见外观和用途；“axis”容易被理解成数学轴，优先使用 `pin`、`shaft`、`cylindrical metal pin`。
+
+`annotate_hole_target_video.py` 是对应的快速框标注器：输入视频后按间隔抽帧，用当前 `hole/target` YOLO 低阈值预标，浏览器中只需补漏框、删误框或拖动边界，最终写出标准 YOLO `images/`、`labels/` 和 `classes.txt`。它不连接 GDK；默认每 6 帧取一帧，适合 30 FPS 视频快速建立初始数据集。
+
+如果需要直接采集实时数据，使用 `capture_right_hole_target_yolo_dataset.py`。它只打开右手彩色相机，网页持续刷新实时画面；冻结时运行一次 YOLO 预标，修正后保存为 `hole/target` 框。空画面也可以保存，作为负样本。
+
+更推荐先用 `record_right_camera_video.py` 录制右手彩色视频，再用 `annotate_hole_target_video.py` 离线抽帧和修框。这样可以重复回放、补标困难帧，并按场景分组划分训练/测试集。
+
+多台电脑完成标注后，使用 `merge_hole_target_annotations.py` 合并各目录的 `images/` 和 `labels/`，生成可直接训练的 `data.yaml`。
+
 `preflight.py` 和 `record_pose.py` 只读状态，不含任何运动 API 调用。
 `control.py` 直接封装 GDK 的规划式关节运动、100 Hz 伺服与 Omnipicker。
 `camera.py` 直接读取 GDK 的头部、左手和右手 RGB-D，不依赖 ROS 或 RealSense。
