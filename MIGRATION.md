@@ -58,15 +58,19 @@ sudo apt install -y libprotobuf-dev protobuf-compiler
 
 ### 可选：左 D405 的 YOLO 主检测与 SAM3 复核
 
-项目内的运行时权重路径为 `models/left_d405_hinge_yolo/best.pt`，其 SHA-256 在
-`g2_adapter/left_d405_hinge_yolo.sha256` 中记录。安装 `ultralytics` 后，
+当前两类运行时权重为
+`models/left_d405_hinge_shaft_yolo/best.pt`
+（类别 `0=hinge`、`1=shaft`）；旧的单类权重 `models/left_d405_hinge_yolo/best.pt` 保留作回退。
+安装 `ultralytics` 后，
 `live_left_d405_yolo_sam_review_web.py` 用 YOLO11n-seg 作为主检测器，以 SAM3 每秒复核同一
-RGB-D 帧；只有目标中心误差不超过 80 px、深度中值差不超过 50 mm 才发布只读目标。训练相机的完整
-画面为 `680×420`，所以 YOLO 从 G2 左 D405 图取同宽高比的最大中心区域（当前 `1280×791`，
-`[0,132,1280,923]`）再缩放至训练分辨率，而不拉伸整幅图或使用过小的固定像素窗口；掩膜按最近邻恢复到完整 D405 图像坐标。SAM3
-使用中心 70% 图像，YOLO 候选中心也必须落在相同黄色框内。网页的紫色框标出 YOLO 源视野，黄色框标出有效作业区域。YOLO 默认不作软件 FPS 限制。YOLO 推理与显示准入阈值均为 `0.01`，以保留该模型的低分铰链；只有有足够有效深度的候选才会由
-SAM3 按最近像素中心复核并成为可发布目标。此入口仅用于实机感知验证，
-未接入运动、下探或夹爪状态机。
+RGB-D 帧；只有目标中心误差不超过 80 px、深度中值差不超过 50 mm 才发布只读目标。当前新模型按
+原生 G2 图像训练，运行时使用 `--yolo-input-mode native`，由 YOLO `imgsz=640` 内部 letterbox，
+不拉伸也不裁剪图像；掩膜保持完整 D405 图像坐标。旧的单类 `680×420` 模型才使用
+`aspect-crop`。SAM3 使用中心 70% 图像，YOLO 候选中心也必须落在相同黄色框内。网页的紫色框标出
+YOLO 源视野，黄色框标出有效作业区域。YOLO 默认不作软件 FPS 限制；只有有足够有效深度的候选才会由
+SAM3 按最近像素中心复核并成为可发布目标。两类模型中只有 `hinge` 会进入抓取候选，`shaft`
+只做同一铰链的近邻关联和审计记录，不能单独触发抓取。此入口仅用于实机感知验证，未接入运动、
+下探或夹爪状态机；shaft 目前不参与 P4 后右手对孔控制。
 
 ### 重新训练 G2 原生铰链 YOLO
 
@@ -78,7 +82,7 @@ SAM3 按最近像素中心复核并成为可发布目标。此入口仅用于实
 `prepare_left_d405_hinge_yolo_dataset.py --min-positive 120 --min-negative 40` 与
 `train_left_d405_hinge_yolo.py --epochs 150 --batch 8 --name g2_native_v1`。新模型训练、验证和部署都保持
 G2 原图比例并由 YOLO 内部 letterbox；实时验证时传入
-`--yolo-model models/left_d405_hinge_yolo/best.pt --yolo-input-mode native`，不使用旧模型的
+`--yolo-model models/left_d405_hinge_shaft_yolo/best.pt --yolo-input-mode native`，不使用旧模型的
 `680×420` 固定视野预处理。
 
 ## 主要文件
@@ -91,6 +95,7 @@ G2 原图比例并由 YOLO 内部 letterbox；实时验证时传入
 - `g2_adapter/run_left_premove_sequence.py`：按到位确认顺序执行左 P2→P3，P3 为最终检测位；
 - `g2_adapter/run_left_post_grasp_sequence.py`：抓取确认后先在 `base_link +Z` 实测上抬 100 mm，再按到位确认执行左 P4，并保持夹爪状态；
 - `g2_adapter/probe_left_xy_mapping.py`：从 P3 在 `base_link` 的单一 X 或 Y 轴发送一次 1 mm 位置伺服，并测量同一 SAM3 目标的像素变化；
+- `g2_adapter/run_bilateral_alignment_gdk.py`：P4 后右臂固定观察、左臂按双相机三维误差做受限 XY mode-1 伺服。direct 模式由右相机提供固定 `hole`、左 D405 的 `shaft`（关联唯一 hinge 后取远端轴尖）提供被夹持 `target`，并接入左右官方 RGB-D 外参与动态 `base_link←arm_*_end_link` TF，默认只读；旧 `off/veto` 仅保留单右图 pixel-J 诊断路径。真实 direct 运动必须显式 `--allow-motion --approve-rgbd-direct-motion`；不包含下探、力控、插入或夹爪动作；
 - `g2_adapter/inspect_cameras.py`：只读检查实际相机流和 binding；
 - `g2_adapter/workcell.example.json`：待填充工位配置。
 - `g2_adapter/left_grasp_gdk.py`：最终检测位的左手 D405/SAM3 视觉抓取状态机；默认只读，
@@ -244,8 +249,10 @@ binding 实际公开的参数方法，请由操作员运行：
 /home/flyfuture/traditional_auto_flow_g2_migration/scripts/run_gdk_python.sh g2_adapter/inspect_cameras.py
 ```
 
-该脚本只读取每路一帧，不保存图像、不发送控制命令。得到输出后即可确定深度单位、
-彩色/深度对齐关系及标定参数入口，再把三维定位接入 GDK 帧。
+该脚本只读取每路一帧，不保存图像、不发送控制命令。得到输出后即可确认深度单位、
+彩色/深度对齐关系及标定参数入口。右手官方外参现已由
+`run_bilateral_alignment_gdk.py --geometry-mode direct` 接入 GDK 帧；首次只读验证必须先确认
+`geometry_error_m`、深度支持率和 `right_tf_timestamp_ns` 稳定，再允许真实 XY 运动。
 
 实时查看胸口和双手六路图像时，使用项目自带的只读网页查看器：
 

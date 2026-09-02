@@ -25,17 +25,28 @@ try:
     from .live_left_d405_sam3_web import SharedView, handler_class
     from .localize_left_d405_sam3 import eligible_candidates, parse_roi, stats_for_mask
     from .sam_crop import center_crop_bounds, center_crop_image, center_crop_image_aspect, draw_crop_box, expand_crop_masks
-    from .yolo_hinge import infer_yolo_masks, load_yolo_segmentation_model, resize_masks_to_full_image, review_matches
+    from .yolo_hinge import associate_shaft_to_hinge, infer_yolo_masks, load_yolo_segmentation_model, resize_masks_to_full_image, review_matches, split_yolo_candidates
 except ImportError:
     from camera import align_depth_to_color, decode_color_rgb, decode_depth_u16, intrinsic_to_dict, transform_to_dict
     from live_left_d405_sam3_web import SharedView, handler_class
     from localize_left_d405_sam3 import eligible_candidates, parse_roi, stats_for_mask
     from sam_crop import center_crop_bounds, center_crop_image, center_crop_image_aspect, draw_crop_box, expand_crop_masks
-    from yolo_hinge import infer_yolo_masks, load_yolo_segmentation_model, resize_masks_to_full_image, review_matches
+    from yolo_hinge import associate_shaft_to_hinge, infer_yolo_masks, load_yolo_segmentation_model, resize_masks_to_full_image, review_matches, split_yolo_candidates
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DEPTH_SCALE_M = 0.001
+HINGE_CLASS_ID = 0
+SHAFT_CLASS_ID = 1
+CLASS_NAMES = {HINGE_CLASS_ID: "hinge", SHAFT_CLASS_ID: "shaft"}
+_PREFERRED_G2_HINGE_SHAFT_YOLO = PROJECT_ROOT / "models" / "left_d405_hinge_shaft_yolo" / "best.pt"
+_ROLLBACK_G2_HINGE_YOLO = PROJECT_ROOT / "models" / "left_d405_hinge_yolo" / "best.pt"
+DEFAULT_G2_NATIVE_YOLO = (
+    _PREFERRED_G2_HINGE_SHAFT_YOLO
+    if _PREFERRED_G2_HINGE_SHAFT_YOLO.is_file()
+    else _ROLLBACK_G2_HINGE_YOLO
+)
+DEFAULT_YOLO_INPUT_MODE = "native" if _PREFERRED_G2_HINGE_SHAFT_YOLO.is_file() else "aspect-crop"
 
 
 def parse_args() -> argparse.Namespace:
@@ -56,17 +67,20 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--roi", default="none", metavar="X0,Y0,X1,Y1", help="可选的额外 ROI；始终与中心 70%% 相交。")
     parser.add_argument("--review-max-pixel-error", type=float, default=80.0)
     parser.add_argument("--review-max-depth-error-m", type=float, default=0.05)
+    parser.add_argument("--shaft-association-max-distance-px", type=float, default=320.0)
+    parser.add_argument("--shaft-association-max-horizontal-distance-px", type=float, default=140.0)
+    parser.add_argument("--shaft-association-ambiguity-margin-px", type=float, default=20.0)
     parser.add_argument("--yolo-imgsz", type=int, default=640)
     parser.add_argument(
         "--yolo-input-mode",
         choices=("aspect-crop", "native"),
-        default="aspect-crop",
-        help="旧 680x420 模型用 aspect-crop；重新训练的 G2 原生模型必须用 native。",
+        default=DEFAULT_YOLO_INPUT_MODE,
+        help="重新训练的 G2 原生模型用 native；旧 680x420 模型用 aspect-crop。",
     )
     parser.add_argument("--yolo-input-width", type=int, default=680, help="YOLO 训练相机输入宽度；最大同宽高比中心区域会缩放到该宽度。")
     parser.add_argument("--yolo-input-height", type=int, default=420, help="YOLO 训练相机输入高度；最大同宽高比中心区域会缩放到该高度。")
     parser.add_argument("--yolo-device", default="cuda:0")
-    parser.add_argument("--yolo-model", type=Path, default=PROJECT_ROOT / "models" / "left_d405_hinge_yolo" / "best.pt")
+    parser.add_argument("--yolo-model", type=Path, default=DEFAULT_G2_NATIVE_YOLO)
     parser.add_argument("--checkpoint", type=Path, default=PROJECT_ROOT / "checkpoints" / "sam3.1_multiplex.pt")
     return parser.parse_args()
 
@@ -153,13 +167,15 @@ def draw_yolo_overlay(
     for index in visible_indices:
         item = statistics[index]
         mask = np.asarray(masks[index], dtype=bool)
-        color = (0, 220, 0) if index == selected else (0, 120, 255)
+        class_id = int(item.get("yolo_class_id", HINGE_CLASS_ID))
+        base_color = (0, 220, 0) if class_id == HINGE_CLASS_ID else (0, 165, 255)
+        color = (0, 255, 0) if index == selected else base_color
         overlay[mask] = (0.55 * overlay[mask] + 0.45 * np.asarray(color)).astype(np.uint8)
         x0, y0, x1, y1 = item["bbox_xyxy"]
         cv2.rectangle(overlay, (x0, y0), (x1, y1), color, 2)
         cv2.putText(
             overlay,
-            f"YOLO #{index} conf={float(item['yolo_confidence']):.2f} depth={int(item['valid_depth_px'])}",
+            f"{CLASS_NAMES.get(class_id, f'class{class_id}')} #{index} conf={float(item['yolo_confidence']):.2f} depth={int(item['valid_depth_px'])}",
             (x0, max(y0 - 5, 18)),
             cv2.FONT_HERSHEY_SIMPLEX,
             0.48,
@@ -202,6 +218,9 @@ def valid_args(args: argparse.Namespace) -> bool:
         and args.min_valid_depth_pixels >= 1
         and args.review_max_pixel_error > 0
         and args.review_max_depth_error_m > 0
+        and args.shaft_association_max_distance_px > 0
+        and args.shaft_association_max_horizontal_distance_px > 0
+        and args.shaft_association_ambiguity_margin_px >= 0
         and args.yolo_imgsz > 0
         and args.yolo_input_width > 0
         and args.yolo_input_height > 0
@@ -290,7 +309,7 @@ def run() -> int:
                         (args.yolo_input_width, args.yolo_input_height),
                         interpolation=cv2.INTER_LINEAR,
                     )
-                yolo_input_masks, yolo_scores = infer_yolo_masks(
+                yolo_input_masks, yolo_scores, yolo_class_ids = infer_yolo_masks(
                     yolo_model, yolo_input, confidence=args.yolo_confidence, imgsz=args.yolo_imgsz, device=args.yolo_device
                 )
                 yolo_source_masks = resize_masks_to_full_image(
@@ -302,8 +321,10 @@ def run() -> int:
                     bounds=yolo_source_bounds,
                 )
                 yolo_stats = [stats_for_mask(mask, aligned_depth, DEPTH_SCALE_M, color_intrinsic, end_link_transform) for mask in yolo_masks]
-                for item, score in zip(yolo_stats, yolo_scores):
+                for item, score, class_id in zip(yolo_stats, yolo_scores, yolo_class_ids):
                     item["yolo_confidence"] = float(score)
+                    item["yolo_class_id"] = int(class_id)
+                    item["yolo_class_name"] = CLASS_NAMES.get(int(class_id), f"class{int(class_id)}")
                 yolo_visual_candidates = [
                     index
                     for index, item in enumerate(yolo_stats)
@@ -322,13 +343,19 @@ def run() -> int:
                     roi=effective_roi,
                     require_depth=True,
                 ) if effective_roi is not None else []
-                yolo_candidates = [
-                    index for index in yolo_geometry_candidates
-                    if float(yolo_stats[index]["yolo_confidence"]) >= args.yolo_target_confidence
-                ]
+                hinge_geometry_candidates, shaft_geometry_candidates = split_yolo_candidates(
+                    yolo_stats,
+                    yolo_geometry_candidates,
+                    confidence_threshold=args.yolo_target_confidence,
+                    hinge_class_id=HINGE_CLASS_ID,
+                    shaft_class_id=SHAFT_CLASS_ID,
+                )
+                yolo_candidates = hinge_geometry_candidates
                 yolo_diagnostics = [
                     {
                         "mask_index": index,
+                        "class_id": int(item.get("yolo_class_id", -1)),
+                        "class_name": item.get("yolo_class_name"),
                         "confidence": float(item["yolo_confidence"]),
                         "area_px": int(item["area_px"]),
                         "center_px": item.get("center_px"),
@@ -336,12 +363,22 @@ def run() -> int:
                         "depth_median_m": item.get("depth_median_m"),
                         "visual_eligible": index in yolo_visual_candidates,
                         "geometry_eligible": index in yolo_geometry_candidates,
+                        "hinge_geometry_eligible": index in hinge_geometry_candidates,
+                        "shaft_geometry_eligible": index in shaft_geometry_candidates,
                         "target_eligible": index in yolo_candidates,
                     }
                     for index, item in enumerate(yolo_stats)
                 ]
                 yolo_index = choose_candidate(yolo_stats, yolo_candidates, args.selection)
                 yolo_selected = None if yolo_index is None else yolo_stats[yolo_index]
+                shaft_association = associate_shaft_to_hinge(
+                    yolo_stats,
+                    yolo_index,
+                    shaft_indices=shaft_geometry_candidates,
+                    max_center_distance_px=args.shaft_association_max_distance_px,
+                    max_horizontal_distance_px=args.shaft_association_max_horizontal_distance_px,
+                    ambiguity_margin_px=args.shaft_association_ambiguity_margin_px,
+                )
 
                 now = time.monotonic()
                 sam_selected = review.get("sam_selected")
@@ -392,8 +429,20 @@ def run() -> int:
                     "yolo": {
                         "model": str(args.yolo_model), "confidence_threshold": args.yolo_confidence,
                         "mask_count": len(yolo_stats),
+                        "hinge_class_id": HINGE_CLASS_ID,
+                        "shaft_class_id": SHAFT_CLASS_ID,
                         "visual_candidate_indices": yolo_visual_candidates,
-                        "geometry_candidate_indices": yolo_geometry_candidates,
+                        "geometry_candidate_indices": hinge_geometry_candidates,
+                        "shaft_geometry_candidate_indices": shaft_geometry_candidates,
+                        "shaft_indices": [
+                            int(index) for index, item in enumerate(yolo_stats)
+                            if int(item.get("yolo_class_id", -1)) == SHAFT_CLASS_ID
+                        ],
+                        "shaft_candidate_indices": [int(index) for index in shaft_geometry_candidates],
+                        "shaft_association": shaft_association,
+                        "shaft_association_max_distance_px": args.shaft_association_max_distance_px,
+                        "shaft_association_max_horizontal_distance_px": args.shaft_association_max_horizontal_distance_px,
+                        "shaft_association_ambiguity_margin_px": args.shaft_association_ambiguity_margin_px,
                         "eligible_candidate_indices": yolo_candidates,
                         "target_confidence_threshold": args.yolo_target_confidence,
                         "candidate_diagnostics": yolo_diagnostics,
@@ -401,6 +450,12 @@ def run() -> int:
                     },
                     "sam_review": {key: value for key, value in review.items() if key != "timestamp_monotonic"},
                     "published_target": published,
+                    "shaft_association": shaft_association,
+                    "shaft": (
+                        None
+                        if shaft_association.get("shaft_index") is None
+                        else yolo_stats[int(shaft_association["shaft_index"])]
+                    ),
                     "effective_roi_xyxy": effective_roi,
                     "sam_center_crop_xyxy": list(crop_bounds),
                     "sam_center_crop_fraction": 0.70,

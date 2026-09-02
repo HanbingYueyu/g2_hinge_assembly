@@ -232,14 +232,18 @@ def draw_overlay(image_bgr: np.ndarray, masks: list[np.ndarray], stats: list[dic
     for index, (mask, item) in enumerate(zip(masks, stats)):
         if item.get("area_px", 0) == 0:
             continue
-        color = (0, 220, 0) if index == selected else (0, 80, 255)
+        class_name = item.get("yolo_class_name")
+        if class_name == "shaft":
+            color = (0, 165, 255)
+        else:
+            color = (0, 220, 0) if index == selected else (0, 80, 255)
         output[np.asarray(mask, dtype=bool)] = (
             0.55 * output[np.asarray(mask, dtype=bool)] + 0.45 * np.asarray(color)
         ).astype(np.uint8)
         x0, y0, x1, y1 = item["bbox_xyxy"]
         cv2.rectangle(output, (x0, y0), (x1, y1), color, 2)
         confidence = item.get("sam3_confidence", item.get("yolo_confidence"))
-        label = f"#{index} area={item['area_px']}"
+        label = f"{class_name} #{index} area={item['area_px']}" if class_name else f"#{index} area={item['area_px']}"
         if confidence is not None:
             label += f" conf={float(confidence):.2f}"
         cv2.putText(output, label, (x0, max(y0 - 5, 18)), cv2.FONT_HERSHEY_SIMPLEX, 0.48, color, 2, cv2.LINE_AA)

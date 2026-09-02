@@ -38,8 +38,12 @@ except ImportError:
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DEPTH_SCALE_M = 0.001
+_PREFERRED_G2_HINGE_SHAFT_YOLO = PROJECT_ROOT / "models" / "left_d405_hinge_shaft_yolo" / "best.pt"
+_ROLLBACK_G2_HINGE_YOLO = PROJECT_ROOT / "models" / "left_d405_hinge_yolo" / "best.pt"
 DEFAULT_G2_NATIVE_YOLO = (
-    PROJECT_ROOT / "models" / "left_d405_hinge_yolo" / "best.pt"
+    _PREFERRED_G2_HINGE_SHAFT_YOLO
+    if _PREFERRED_G2_HINGE_SHAFT_YOLO.is_file()
+    else _ROLLBACK_G2_HINGE_YOLO
 )
 
 
@@ -173,7 +177,7 @@ def main() -> int:
         if args.detector == "yolo":
             yolo_model = load_yolo_segmentation_model(yolo_model_path, device=args.yolo_device)
             yolo_input = cv2.cvtColor(color_rgb, cv2.COLOR_RGB2BGR)
-            masks, scores = infer_yolo_masks(
+            masks, scores, class_ids = infer_yolo_masks(
                 yolo_model,
                 yolo_input,
                 confidence=args.yolo_confidence,
@@ -181,8 +185,12 @@ def main() -> int:
                 device=args.yolo_device,
             )
             statistics = [stats_for_mask(mask, aligned_depth, DEPTH_SCALE_M, color_intrinsic, rgbd_to_end_link) for mask in masks]
-            for item, score in zip(statistics, scores):
+            names = getattr(yolo_model, "names", {})
+            for item, score, class_id in zip(statistics, scores, class_ids):
+                class_id = int(class_id)
                 item["yolo_confidence"] = float(score)
+                item["yolo_class_id"] = class_id
+                item["yolo_class_name"] = names.get(class_id, str(class_id)) if isinstance(names, dict) else str(class_id)
             crop_bounds = (0, 0, int(color_rgb.shape[1]), int(color_rgb.shape[0]))
         else:
             model = build_sam3_image_model(checkpoint_path=str(checkpoint), load_from_HF=False)
@@ -208,7 +216,10 @@ def main() -> int:
         if args.detector == "yolo":
             candidates = [
                 index for index in candidates
-                if float(statistics[index]["yolo_confidence"]) >= args.yolo_target_confidence
+                if (
+                    int(statistics[index].get("yolo_class_id", 0)) == 0
+                    and float(statistics[index]["yolo_confidence"]) >= args.yolo_target_confidence
+                )
             ]
         selected_index = choose_candidate(statistics, candidates, args.selection)
         if selected_index is None:

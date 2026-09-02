@@ -16,7 +16,11 @@
 
 `right_hole_target_detect_gdk.py` 用训练好的 `hole/target` YOLO 框检测模型读取右手彩色相机。它假设前序左手抓取、上抬和 P4 已完成；带 `--allow-motion` 时只把右臂移动到记录的 `right_post_grasp` 姿态，随后持续输出同一帧中的 `hole`（固定工装孔）和 `target`（被夹铰链销轴）框、置信度和中心误差。当前阶段不执行 XY 对孔、下探、力控或释放夹爪。
 
-检测模型只有 2D 框，不能把像素误差直接转换为毫米运动。`paired` 仅表示同一帧同时看到两类目标；目标缺失、过期或出现多候选时都保持检测状态，不产生运动建议。后续对孔必须在 P4 姿态单独标定像素到右臂基座水平位移的 Jacobian，并另行定义力传感器成功条件。
+`run_bilateral_alignment_gdk.py` 是独立的 P4 后定位入口：右臂预移动一次后固定观察，左臂通过 GDK mode-1 50 Hz 末端位姿流逐步做 XY 对孔。正确的双相机定义是：右手相机只识别固定工装 `hole`，左手 D405 的 `hinge/shaft` 模型把 `shaft` 作为被夹持的 `target`。默认 `--geometry-mode off` 保留旧的单右图 pixel-J 诊断路径；`--geometry-mode direct` 同时打开左右 RGB-D，接入左右官方深度→彩色、RGB-D→各自末端外参与动态 `base_link←arm_*_end_link` TF，把两点都变换到 `base_link` 后计算三维 XY 误差。direct 默认仍只读，真实运动必须同时显式提供 `--allow-motion --approve-rgbd-direct-motion`。
+
+建议先用 direct 只读观察日志和网页中的 `geometry_error_m`、`hole_base_m`、`target_base_m`。确认左右深度、时间同步、左侧 shaft 关联和坐标方向稳定后，再讨论 direct 真实运动。原有 `--geometry-mode veto` 仅适用于旧的“右图同时有 hole/target” pixel-J 诊断路径；跨左右相机时不能相减像素坐标。程序不会在两套控制律之间自动切换；任何缺失、多候选、跳变、深度噪声、时间戳偏差或右臂漂移都会保持最后目标。完成定位后不下探、不力控、不操作夹爪。
+
+检测模型只有 2D 框/分割，不能直接把框中心当作可靠深度。direct 模式对右 hole 取框内环带；左侧要求唯一 hinge 和关联 shaft，沿 shaft 掩膜主轴取远离 hinge 主体的一端作为配合端点，再在该端点邻域取稳健深度。两侧点分别用各自 RGB-D 外参与动态 TF 统一到 base；有效像素比例和 MAD 用于过滤遮挡/背景深度。左图若无唯一 hinge/shaft、关联不明确或端点深度无效，整帧会进入 `geometry_hold`。`paired` 仅表示右 hole 与左 target 在同一控制周期都可用；它不是运动许可。
 
 如果需要先验证 SAM3 是否能理解这两个物体，可运行 `right_hole_target_sam3_preview.py`。它在同一右手彩色帧上分别使用 `the exposed cylindrical metal pin at the end of the hinge` 和 `the white circular opening in the fixture` 两个文本提示，只读显示掩膜，不接入动作状态机。SAM3 的英文提示应描述可见外观和用途；“axis”容易被理解成数学轴，优先使用 `pin`、`shaft`、`cylindrical metal pin`。
 
@@ -67,17 +71,19 @@
 
 ### 可选：YOLO 主检测 + SAM3 低频复核
 
-`models/left_d405_hinge_yolo/best.pt` 是左 D405 的单类铰链 YOLO11n-seg 权重；该模型目录被
-忽略，不提交到 Git。先安装只影响 Python 3.12 SAM3 环境的依赖：
+当前左 D405 权重是两类 YOLO11n-seg 模型
+`models/left_d405_hinge_shaft_yolo/best.pt`：
+`0=hinge`、`1=shaft`。旧的单类 `models/left_d405_hinge_yolo/best.pt` 仅作回退；模型目录被忽略，
+不提交到 Git。先安装只影响 Python 3.12 SAM3 环境的依赖：
 
 ```bash
 uv pip install --python .venv-sam3/bin/python "ultralytics==8.4.80"
 ```
 
-使用下面的**只读**入口验证。训练相机的完整画面是 `680×420`；为不拉伸 G2 的原始 `1280×1056`
-画面，YOLO 先取与 `680:420` 同宽高比的最大中心区域（当前为全宽 `1280×791`，即
-`[0,132,1280,923]`），再缩放到 `680×420` 推理。这样保留大部分视野，而不是取一个固定
-`680×420` 像素窗口。YOLO 输出掩膜会按最近邻放回完整图像坐标。只有中心位于黄色框标示中心 70% 内的候选才有资格被选择；紫色框是 YOLO 的源视野，黄色框是 SAM3/作业 ROI。SAM3 保持中心 70% 输入。
+使用下面的**只读**入口验证。新模型使用 `--yolo-input-mode native`，将完整 G2 原图交给 YOLO，
+由 `imgsz=640` 内部 letterbox 保持比例；掩膜按原图坐标输出。旧的 `680×420` 单类模型才使用
+`aspect-crop`。只有中心位于黄色框标示中心 70% 内的候选才有资格被选择；紫色框是 YOLO 的源视野，
+黄色框是 SAM3/作业 ROI。SAM3 保持中心 70% 输入。
 YOLO 默认不作软件 FPS 限制，SAM3 每秒复核一次同一 RGB-D 帧；仅两者中心距离不超过 80 px、
 深度中值差不超过 50 mm 时，网页状态才会为 `accepted` 并显示 `published_target`。`--yolo-confidence`
 与 `--yolo-target-confidence` 均默认 `0.01`，以保留本模型的低分铰链；网页会显示所有满足面积与 ROI 的
@@ -87,13 +93,14 @@ YOLO 掩膜及各自的有效深度点数。只有同时具有有效深度的候
 ```bash
 ./scripts/run_gdk_sam3_python.sh \
   g2_adapter/live_left_d405_yolo_sam_review_web.py \
+  --yolo-model models/left_d405_hinge_shaft_yolo/best.pt \
+  --yolo-input-mode native \
+  --yolo-confidence 0.25 --yolo-target-confidence 0.25 \
   --host 0.0.0.0 --port 8767
 ```
 
-权重训练于 `ultralytics 8.4.80`，运行环境固定为该版本。原模型包建议 YOLO 阈值为 `0.35`，但
-当前项目中保存的一张 2026-08-28 历史图在该阈值没有输出，中心 `680×420` 图中三件的分数约为
-`0.177`、`0.154`、`0.016`，故默认使用 `0.01` 并依赖深度与 SAM3 复核兜底。`680×420` 是模型训练相机的完整画面分辨率；运行时使用同宽高比的最大中心区域，而不是固定像素裁切或拉伸整幅图。
-在多组当前 GDK 画面都稳定 `accepted` 前，该入口不会接入抓取状态机。
+运行环境固定为 `ultralytics 8.4.80`。运行时阈值可按验证结果调整；在多组当前 GDK 画面都稳定
+`accepted` 前，该入口不会接入抓取状态机。
 
 ### 重新采集并训练 G2 原生 YOLO 数据集
 
@@ -133,17 +140,19 @@ cd /home/flyfuture/traditional_auto_flow_g2_migration
   --epochs 150 --batch 8 --name g2_native_v1
 ```
 
-训练完成后先在验证集和实时只读页面检查新权重，确认三件铰链及负样本均正常，再替换运行时权重；新模型
+训练完成后先在验证集和实时只读页面检查新权重，确认铰链、铰链末端轴及负样本均正常，再替换运行时权重；新模型
 测试时必须使用原生输入模式：
 
 ```bash
 ./scripts/run_gdk_sam3_python.sh \
   g2_adapter/live_left_d405_yolo_sam_review_web.py \
-  --yolo-model models/left_d405_hinge_yolo/best.pt \
+  --yolo-model models/left_d405_hinge_shaft_yolo/best.pt \
   --yolo-input-mode native \
   --host 0.0.0.0 --port 8767
 ```
 
+当前权重为两类模型（`hinge`、`shaft`）；抓取状态机只消费 `hinge`，并把近邻 `shaft` 作为关联审计信息。
+`shaft` 目前不参与 P4 后右手对孔控制。
 `native` 会将完整 G2 图交给 YOLO，由 `imgsz=640` 的内部 letterbox 保持比例。旧模型若仍需对比，
 保留默认的 `aspect-crop`。两种模式均只读，均不接入抓取状态机。
 
@@ -269,7 +278,7 @@ python3 g2_adapter/derive_left_xy_mapping.py \
 /home/flyfuture/traditional_auto_flow_g2_migration/scripts/run_gdk_sam3_python.sh \
   g2_adapter/left_grasp_gdk.py \
   --config g2_adapter/left_grasp.example.json \
-  --yolo-model models/left_d405_hinge_yolo/best.pt \
+  --yolo-model models/left_d405_hinge_shaft_yolo/best.pt \
   --max-frames 20
 ```
 

@@ -41,7 +41,7 @@ try:
     from .sam_crop import center_crop_bounds, center_crop_image, draw_crop_box, expand_crop_masks
     from .visual_servo import base_position_after_delta, empirical_horizontal_base_delta_from_pixel_error
     from .xy_mapping import choose_candidate_by_left_rank
-    from .yolo_hinge import infer_yolo_masks, load_yolo_segmentation_model, review_matches
+    from .yolo_hinge import associate_shaft_to_hinge, infer_yolo_masks, load_yolo_segmentation_model, review_matches, split_yolo_candidates
     from .record_pose import DEFAULT_OUTPUT as DEFAULT_POSES_OUTPUT
     from .run_left_premove_sequence import load_presets as load_premove_presets
     from .run_left_post_grasp_sequence import (
@@ -60,7 +60,7 @@ except ImportError:
     from sam_crop import center_crop_bounds, center_crop_image, draw_crop_box, expand_crop_masks
     from visual_servo import base_position_after_delta, empirical_horizontal_base_delta_from_pixel_error
     from xy_mapping import choose_candidate_by_left_rank
-    from yolo_hinge import infer_yolo_masks, load_yolo_segmentation_model, review_matches
+    from yolo_hinge import associate_shaft_to_hinge, infer_yolo_masks, load_yolo_segmentation_model, review_matches, split_yolo_candidates
     from record_pose import DEFAULT_OUTPUT as DEFAULT_POSES_OUTPUT
     from run_left_premove_sequence import load_presets as load_premove_presets
     from run_left_post_grasp_sequence import (
@@ -78,9 +78,17 @@ LEFT_VISUAL_TIP_LINK = "arm_l_end_link"
 # SAM3 inference itself sets the cadence (about a few Hz on the current GPU).
 # Do not add a material artificial delay between display-only descent frames.
 FORCE_DESCENT_SAM_PREVIEW_PERIOD_S = 0.01
+_PREFERRED_G2_HINGE_SHAFT_YOLO = PROJECT_ROOT / "models" / "left_d405_hinge_shaft_yolo" / "best.pt"
+_ROLLBACK_G2_HINGE_YOLO = PROJECT_ROOT / "models" / "left_d405_hinge_yolo" / "best.pt"
+# Prefer the newly trained two-class model when it is present, while retaining
+# the known one-class weight as a safe checkout/rollback fallback.
 DEFAULT_G2_NATIVE_YOLO = (
-    PROJECT_ROOT / "models" / "left_d405_hinge_yolo" / "best.pt"
+    _PREFERRED_G2_HINGE_SHAFT_YOLO
+    if _PREFERRED_G2_HINGE_SHAFT_YOLO.is_file()
+    else _ROLLBACK_G2_HINGE_YOLO
 )
+HINGE_CLASS_ID = 0
+SHAFT_CLASS_ID = 1
 
 
 @dataclass(frozen=True)
@@ -309,6 +317,24 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--yolo-model", type=Path, default=DEFAULT_G2_NATIVE_YOLO)
     parser.add_argument("--yolo-confidence", type=float, default=0.25)
     parser.add_argument("--yolo-target-confidence", type=float, default=0.25)
+    parser.add_argument(
+        "--shaft-association-max-distance-px",
+        type=float,
+        default=320.0,
+        help="选定 hinge 附近允许关联 shaft 的最大像素距离；超出或不明确时只保留 hinge 抓取目标。",
+    )
+    parser.add_argument(
+        "--shaft-association-max-horizontal-distance-px",
+        type=float,
+        default=140.0,
+        help="关联 shaft 与 hinge 时允许的最大水平像素差，避免串到相邻铰链。",
+    )
+    parser.add_argument(
+        "--shaft-association-ambiguity-margin-px",
+        type=float,
+        default=20.0,
+        help="最近两个 shaft 的距离差小于该值时拒绝关联。",
+    )
     parser.add_argument("--yolo-imgsz", type=int, default=640)
     parser.add_argument("--yolo-device", default="cuda:0")
     parser.add_argument("--sam-review-interval-s", type=float, default=0.50)
@@ -866,6 +892,8 @@ def publish_web_preview(
         "frame": record["frame"],
         "selected_mask_index": selected,
         "selected": record.get("selected"),
+        "shaft": record.get("shaft"),
+        "shaft_association": record.get("shaft_association"),
         "tracking": record.get("tracking"),
         "detector": record.get("detector", "sam3"),
         "sam_center_crop_xyxy": list(crop_bounds),
@@ -875,6 +903,23 @@ def publish_web_preview(
         "safety": "网页仅显示本抓取进程的同一帧检测结果；不提供机器人或夹爪控制接口。",
     })
     return sequence
+
+
+def compact_detection(statistics: list[dict], index: int | None) -> dict | None:
+    """Keep JSONL shaft audit records small and JSON-serializable."""
+    if index is None or index < 0 or index >= len(statistics):
+        return None
+    item = statistics[index]
+    return {
+        "mask_index": int(index),
+        "center_px": item.get("center_px"),
+        "bbox_xyxy": item.get("bbox_xyxy"),
+        "yolo_confidence": item.get("yolo_confidence"),
+        "yolo_class_id": item.get("yolo_class_id"),
+        "yolo_class_name": item.get("yolo_class_name"),
+        "valid_depth_px": item.get("valid_depth_px"),
+        "depth_median_m": item.get("depth_median_m"),
+    }
 
 
 class PersistentPerception:
@@ -955,11 +1000,41 @@ class PersistentPerception:
                     candidates = eligible_candidates(statistics, min_area=self.args.min_area, min_valid_depth_pixels=self.args.min_valid_depth_pixels, roi=roi, require_depth=False)
                     sam_review = {"accepted": True, "fresh": True, "reason": "sam3_primary"}
                 else:
-                    masks, scores = infer_yolo_masks(self.yolo_model, cv2.cvtColor(color_rgb, cv2.COLOR_RGB2BGR), confidence=self.args.yolo_confidence, imgsz=self.args.yolo_imgsz, device=self.args.yolo_device)
-                    statistics = [stats_for_mask(mask, aligned_depth, DEPTH_SCALE_M, color_intrinsic, end_link_transform) for mask in masks]
-                    for item, score in zip(statistics, scores): item["yolo_confidence"] = float(score)
-                    geometry = eligible_candidates(statistics, min_area=self.args.min_area, min_valid_depth_pixels=self.args.min_valid_depth_pixels, roi=roi, require_depth=False)
-                    candidates = [index for index in geometry if float(statistics[index]["yolo_confidence"]) >= self.args.yolo_target_confidence]
+                    masks, scores, class_ids = infer_yolo_masks(
+                        self.yolo_model,
+                        cv2.cvtColor(color_rgb, cv2.COLOR_RGB2BGR),
+                        confidence=self.args.yolo_confidence,
+                        imgsz=self.args.yolo_imgsz,
+                        device=self.args.yolo_device,
+                    )
+                    statistics = [
+                        stats_for_mask(mask, aligned_depth, DEPTH_SCALE_M, color_intrinsic, end_link_transform)
+                        for mask in masks
+                    ]
+                    names = getattr(self.yolo_model, "names", {})
+                    for item, score, class_id in zip(statistics, scores, class_ids):
+                        class_id = int(class_id)
+                        item["yolo_confidence"] = float(score)
+                        item["yolo_class_id"] = class_id
+                        item["yolo_class_name"] = names.get(class_id, str(class_id)) if isinstance(names, dict) else str(class_id)
+                    geometry = eligible_candidates(
+                        statistics,
+                        min_area=self.args.min_area,
+                        min_valid_depth_pixels=self.args.min_valid_depth_pixels,
+                        roi=roi,
+                        require_depth=False,
+                    )
+                    # Only a class-0 hinge may enter the grasp state machine.
+                    # Shaft detections are published separately for future
+                    # axis/assembly use and can never become the grasp target.
+                    hinge_candidates, shaft_candidates = split_yolo_candidates(
+                        statistics,
+                        geometry,
+                        confidence_threshold=self.args.yolo_target_confidence,
+                        hinge_class_id=HINGE_CLASS_ID,
+                        shaft_class_id=SHAFT_CLASS_ID,
+                    )
+                    candidates = hinge_candidates
                     provisional = choose_candidate(statistics, candidates, self.args.selection)
                     now = time.monotonic()
                     with self._condition:
@@ -982,9 +1057,17 @@ class PersistentPerception:
                     age = None if "timestamp_monotonic" not in sam_review else now - float(sam_review["timestamp_monotonic"])
                     sam_review = {**sam_review, "fresh": age is not None and age <= self.args.sam_review_ttl_s, "age_s": None if age is None else round(max(age, 0.0), 3)}
                 selected = choose_candidate(statistics, candidates, self.args.selection)
+                shaft_association = associate_shaft_to_hinge(
+                    statistics,
+                    selected,
+                    max_center_distance_px=self.args.shaft_association_max_distance_px,
+                    max_horizontal_distance_px=self.args.shaft_association_max_horizontal_distance_px,
+                    ambiguity_margin_px=self.args.shaft_association_ambiguity_margin_px,
+                    shaft_indices=shaft_candidates if self.args.detector == "yolo-sam" else None,
+                ) if self.args.detector == "yolo-sam" else {"shaft_index": None, "reason": "sam3_mode"}
                 with self._condition:
                     self._sequence += 1
-                    snapshot = {"sequence": self._sequence, "color_rgb": color_rgb, "masks": masks, "statistics": statistics, "candidates": candidates, "selected": selected, "aligned_depth": aligned_depth, "color_intrinsic": color_intrinsic, "depth_intrinsic": depth_intrinsic, "depth_to_color": depth_to_color, "end_link_transform": end_link_transform, "roi": roi, "crop_bounds": crop_bounds, "sam_review": dict(sam_review), "inference_ms": (time.monotonic() - started) * 1000.0}
+                    snapshot = {"sequence": self._sequence, "color_rgb": color_rgb, "masks": masks, "statistics": statistics, "candidates": candidates, "hinge_candidates": candidates, "shaft_candidates": shaft_candidates if self.args.detector == "yolo-sam" else [], "selected": selected, "shaft_association": shaft_association, "aligned_depth": aligned_depth, "color_intrinsic": color_intrinsic, "depth_intrinsic": depth_intrinsic, "depth_to_color": depth_to_color, "end_link_transform": end_link_transform, "roi": roi, "crop_bounds": crop_bounds, "sam_review": dict(sam_review), "inference_ms": (time.monotonic() - started) * 1000.0}
                     self._latest = snapshot
                     phase = dict(self._phase)
                     self._condition.notify_all()
@@ -992,7 +1075,7 @@ class PersistentPerception:
                     overlay = draw_crop_box(draw_overlay(cv2.cvtColor(color_rgb, cv2.COLOR_RGB2BGR), masks, statistics, selected), crop_bounds)
                     ok, encoded = cv2.imencode(".jpg", overlay, [cv2.IMWRITE_JPEG_QUALITY, 82])
                     if ok:
-                        self.shared.update(encoded.tobytes(), {"state": phase["state"], "sequence": self._sequence, "selected_mask_index": selected, "selected": None if selected is None else statistics[selected], "detector": self.args.detector, "inference_ms": round(snapshot["inference_ms"], 1), "grasp_reason": phase["reason"], "safety": "常驻感知线程独占相机、YOLO/SAM3 与网页更新；动作状态机仅消费最新快照。"})
+                        self.shared.update(encoded.tobytes(), {"state": phase["state"], "sequence": self._sequence, "selected_mask_index": selected, "selected": None if selected is None else statistics[selected], "shaft_association": shaft_association, "detector": self.args.detector, "inference_ms": round(snapshot["inference_ms"], 1), "grasp_reason": phase["reason"], "safety": "常驻感知线程独占相机、YOLO/SAM3 与网页更新；动作状态机仅消费最新快照。"})
         except Exception as exc:
             with self._condition:
                 self._failure = exc
@@ -1240,6 +1323,9 @@ def main() -> int:
         and 0 <= args.yolo_confidence <= 1
         and 0 <= args.yolo_target_confidence <= 1
         and args.yolo_imgsz > 0
+        and args.shaft_association_max_distance_px > 0
+        and args.shaft_association_max_horizontal_distance_px > 0
+        and args.shaft_association_ambiguity_margin_px >= 0
         and args.sam_review_interval_s > 0
         and args.sam_review_ttl_s > 0
         and args.sam_review_max_pixel_error > 0
@@ -1865,7 +1951,14 @@ def main() -> int:
                     roi = snapshot["roi"]
                     crop_bounds = snapshot["crop_bounds"]
                     if args.detector == "yolo-sam":
-                        record["yolo"] = {"model": str(yolo_model_path), "input": "persistent_native_left_d405_color_image", "eligible_candidate_indices": [int(index) for index in candidates]}
+                        record["yolo"] = {
+                            "model": str(yolo_model_path),
+                            "input": "persistent_native_left_d405_color_image",
+                            "hinge_candidate_indices": [int(index) for index in snapshot.get("hinge_candidates", candidates)],
+                            "shaft_candidate_indices": [int(index) for index in snapshot.get("shaft_candidates", [])],
+                            "eligible_candidate_indices": [int(index) for index in candidates],
+                            "shaft_association": snapshot.get("shaft_association"),
+                        }
                     record["eligible_candidate_indices"] = [int(index) for index in candidates]
                     record["sam_center_crop_xyxy"] = list(crop_bounds)
                     record["sam_center_crop_fraction"] = 0.70
@@ -1879,6 +1972,8 @@ def main() -> int:
                             "depth_median_m": statistics[index].get("depth_median_m"),
                             "sam3_confidence": statistics[index].get("sam3_confidence"),
                             "yolo_confidence": statistics[index].get("yolo_confidence"),
+                            "yolo_class_id": statistics[index].get("yolo_class_id"),
+                            "yolo_class_name": statistics[index].get("yolo_class_name"),
                         }
                         for index in range(len(statistics))
                     ]
@@ -1933,6 +2028,20 @@ def main() -> int:
                         if not (reviewed_same_target and yolo_sam_review.get("accepted") and yolo_sam_review.get("fresh")):
                             selected = None
                             tracking = "withheld_pending_or_failed_sam_review"
+                    shaft_association = (
+                        associate_shaft_to_hinge(
+                            statistics,
+                            selected,
+                            shaft_indices=[int(index) for index in snapshot.get("shaft_candidates", [])],
+                            max_center_distance_px=args.shaft_association_max_distance_px,
+                            max_horizontal_distance_px=args.shaft_association_max_horizontal_distance_px,
+                            ambiguity_margin_px=args.shaft_association_ambiguity_margin_px,
+                        )
+                        if args.detector == "yolo-sam"
+                        else {"shaft_index": None, "reason": "sam3_mode"}
+                    )
+                    if args.detector == "yolo-sam" and "yolo" in record:
+                        record["yolo"]["shaft_association"] = shaft_association
                     record.update({
                         "tracking": tracking,
                         "tracking_depth_anchor_m": tracked_depth_m,
@@ -1941,6 +2050,11 @@ def main() -> int:
                         "selected_mask_index": selected,
                         "mask_count": len(statistics),
                         "selected": None if selected is None else statistics[selected],
+                        "shaft_association": shaft_association,
+                        "shaft": compact_detection(
+                            statistics,
+                            None if shaft_association.get("shaft_index") is None else int(shaft_association["shaft_index"]),
+                        ),
                     })
                     if selected is None:
                         # FINAL_DESCENT here means that XY centering has just
