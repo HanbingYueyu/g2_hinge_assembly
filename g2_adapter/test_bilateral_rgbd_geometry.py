@@ -4,13 +4,16 @@ import unittest
 import numpy as np
 
 from bilateral_rgbd_geometry import (
+    AdaptiveDepthError,
     apply_transform,
     backproject_pixel,
     compose_transform,
     estimate_box_depth,
+    estimate_hole_depth_adaptive,
     estimate_pair_geometry,
     estimate_point_depth,
     inverse_transform,
+    right_color_point_to_base,
 )
 
 
@@ -33,6 +36,38 @@ class BilateralRgbdGeometryTests(unittest.TestCase):
     def test_backproject_pixel(self):
         point = backproject_pixel((330.0, 250.0), 0.5, {"fx": 100.0, "fy": 100.0, "ppx": 320.0, "ppy": 240.0})
         np.testing.assert_allclose(point, [0.05, 0.05, 0.5], atol=1e-9)
+
+    def test_backproject_pixel_undoes_brown_conrady_distortion(self):
+        # An undistorted normalized point (0.1, 0.2) projected with k1=0.1.
+        distorted_x, distorted_y = 0.1005, 0.201
+        intrinsic = {
+            "fx": 100.0,
+            "fy": 100.0,
+            "ppx": 320.0,
+            "ppy": 240.0,
+            "distortion": [0.1, 0.0, 0.0, 0.0, 0.0],
+        }
+        point = backproject_pixel(
+            (320.0 + 100.0 * distorted_x, 240.0 + 100.0 * distorted_y),
+            0.5,
+            intrinsic,
+        )
+        np.testing.assert_allclose(point, [0.05, 0.1, 0.5], atol=1e-6)
+
+    def test_right_color_point_to_base_uses_camera_then_end_to_base_order(self):
+        quarter_turn = [0.0, 0.0, math.sin(math.pi / 4.0), math.cos(math.pi / 4.0)]
+        right_end_from_color = {
+            "translation_m": [0.1, 0.0, 0.0],
+            "rotation_xyzw": quarter_turn,
+        }
+        base_from_right_end = {
+            "translation_m": [1.0, 2.0, 3.0],
+            "rotation_xyzw": [0.0, 0.0, 0.0, 1.0],
+        }
+        point = right_color_point_to_base(
+            [0.0, 1.0, 0.0], right_end_from_color, base_from_right_end
+        )
+        np.testing.assert_allclose(point, [0.1, 2.0, 3.0], atol=1e-6)
 
     def test_hole_uses_rim_and_target_uses_inner_depth(self):
         depth = np.zeros((100, 120), dtype=np.uint16)
@@ -80,6 +115,74 @@ class BilateralRgbdGeometryTests(unittest.TestCase):
             min_valid_pixels=8,
         )
         self.assertAlmostEqual(estimate.depth_m, 0.7, places=6)
+
+    def test_adaptive_hole_depth_expands_to_next_scale(self):
+        depth = np.zeros((120, 120), dtype=np.uint16)
+        yy, xx = np.mgrid[:120, :120]
+        normalized = ((xx - 60.0) / 5.0) ** 2 + ((yy - 60.0) / 5.0) ** 2
+        depth[(normalized >= 1.0) & (normalized <= 2.0)] = 500
+        estimate, diagnostics = estimate_hole_depth_adaptive(
+            depth,
+            (55.0, 55.0, 65.0, 65.0),
+            intrinsic={"fx": 100.0, "fy": 100.0, "ppx": 60.0, "ppy": 60.0},
+            scales=(1.0, 1.5),
+            min_valid_pixels=8,
+            min_support_fraction=0.20,
+            min_covered_sectors=3,
+        )
+        self.assertAlmostEqual(estimate.depth_m, 0.5, places=6)
+        self.assertEqual(diagnostics["selected"]["scale"], 1.5)
+
+    def test_depth_statistics_include_mean_median_and_mad(self):
+        depth = np.zeros((40, 40), dtype=np.uint16)
+        depth[14:26, 14:26] = 500
+        depth[14, 14] = 900  # rejected by the robust inlier pass
+        estimate, diagnostics = estimate_hole_depth_adaptive(
+            depth,
+            (14.0, 14.0, 26.0, 26.0),
+            intrinsic={"fx": 100.0, "fy": 100.0, "ppx": 20.0, "ppy": 20.0},
+            scales=(1.0,),
+            min_valid_pixels=8,
+            min_support_fraction=0.20,
+            min_covered_sectors=3,
+        )
+        selected = diagnostics["selected"]
+        self.assertEqual(selected["valid_pixels"], estimate.valid_pixels)
+        self.assertIn("mean_m", selected)
+        self.assertIn("median_m", selected)
+        self.assertIn("mad_mm", selected)
+        self.assertAlmostEqual(selected["median_m"], estimate.depth_m, places=6)
+        self.assertAlmostEqual(selected["mean_m"], estimate.mean_m, places=6)
+        self.assertAlmostEqual(selected["mad_mm"], estimate.mad_m * 1000.0, places=6)
+
+    def test_box_sampling_uses_all_valid_pixels_inside_detector_box(self):
+        depth = np.zeros((30, 30), dtype=np.uint16)
+        depth[10:20, 10:20] = 700
+        depth[12, 12] = 900
+        estimate, diagnostics = estimate_hole_depth_adaptive(
+            depth,
+            (10.0, 10.0, 20.0, 20.0),
+            intrinsic={"fx": 100.0, "fy": 100.0, "ppx": 15.0, "ppy": 15.0},
+            scales=(1.0,),
+            sampling_region="box",
+            min_valid_pixels=8,
+            min_support_fraction=0.20,
+            min_covered_sectors=3,
+        )
+        selected = diagnostics["selected"]
+        self.assertEqual(selected["valid_pixels"], 100)
+        self.assertAlmostEqual(selected["mean_m"], 0.702, places=6)
+        self.assertAlmostEqual(selected["median_m"], 0.7, places=6)
+        self.assertEqual(estimate.valid_pixels, 100)
+
+    def test_adaptive_hole_depth_fails_when_all_scales_are_empty(self):
+        with self.assertRaises(AdaptiveDepthError):
+            estimate_hole_depth_adaptive(
+                np.zeros((40, 40), dtype=np.uint16),
+                (15.0, 15.0, 25.0, 25.0),
+                intrinsic={"fx": 100.0, "fy": 100.0, "ppx": 20.0, "ppy": 20.0},
+                scales=(1.0, 1.5),
+            )
 
 
 if __name__ == "__main__":

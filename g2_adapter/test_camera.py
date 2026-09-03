@@ -4,7 +4,7 @@ import unittest
 
 import numpy as np
 
-from camera import align_depth_to_color, decode_depth_u16
+from camera import CameraError, align_depth_to_color, decode_depth_u16, depth_on_color_grid
 
 
 INTRINSIC = {"fx": 1.0, "fy": 1.0, "ppx": 0.0, "ppy": 0.0, "width": 3, "height": 2}
@@ -48,3 +48,37 @@ class CameraAlignmentTests(unittest.TestCase):
             depth_to_color=IDENTITY,
         )
         self.assertEqual(int(aligned[0, 0]), 1000)
+
+    def test_registered_same_pixel_depth_keeps_color_grid(self) -> None:
+        depth = np.array([[0, 1000, 0], [2000, 0, 3000]], dtype=np.uint16)
+        actual = depth_on_color_grid(
+            depth,
+            registration_mode="registered_same_pixel",
+            depth_intrinsic=INTRINSIC,
+            color_intrinsic=INTRINSIC,
+            depth_to_color=None,
+        )
+        np.testing.assert_array_equal(actual, depth)
+        self.assertIsNot(actual, depth)
+
+    def test_registered_same_pixel_rejects_shape_mismatch(self) -> None:
+        depth = np.zeros((1, 3), dtype=np.uint16)
+        with self.assertRaises(CameraError):
+            depth_on_color_grid(
+                depth,
+                registration_mode="registered_same_pixel",
+                depth_intrinsic=INTRINSIC,
+                color_intrinsic=INTRINSIC,
+                depth_to_color=None,
+            )
+
+    def test_reproject_requires_transform(self) -> None:
+        depth = np.zeros((2, 3), dtype=np.uint16)
+        with self.assertRaises(CameraError):
+            depth_on_color_grid(
+                depth,
+                registration_mode="reproject",
+                depth_intrinsic=INTRINSIC,
+                color_intrinsic=INTRINSIC,
+                depth_to_color=None,
+            )

@@ -8,6 +8,7 @@ with a held/old box and no function here produces a motion command.
 from __future__ import annotations
 
 from dataclasses import dataclass
+import math
 from typing import Any
 
 
@@ -90,6 +91,75 @@ def pair_status(detections: list[BoxDetection], selected: dict[str, BoxDetection
     return "unusable"
 
 
+def center_crop(frame: Any, percent: float = 60.0) -> tuple[Any, tuple[int, int]]:
+    """Return a centered crop and its ``(x, y)`` offset in the source frame."""
+    value = float(percent)
+    if not math.isfinite(value) or not 0.0 < value <= 100.0:
+        raise ValueError("center crop percent must be in (0, 100]")
+    shape = getattr(frame, "shape", None)
+    if shape is None or len(shape) < 2:
+        raise ValueError("frame must have height and width")
+    height, width = int(shape[0]), int(shape[1])
+    if height <= 0 or width <= 0:
+        raise ValueError("frame must have positive height and width")
+    crop_width = max(1, min(width, int(round(width * value / 100.0))))
+    crop_height = max(1, min(height, int(round(height * value / 100.0))))
+    x0 = (width - crop_width) // 2
+    y0 = (height - crop_height) // 2
+    return frame[y0 : y0 + crop_height, x0 : x0 + crop_width], (x0, y0)
+
+
+def translate_detection(item: BoxDetection, offset: tuple[int, int]) -> BoxDetection:
+    """Map a detection from a cropped image back to source-frame pixels."""
+    x_offset, y_offset = offset
+    x0, y0, x1, y1 = item.xyxy
+    return BoxDetection(
+        class_id=item.class_id,
+        class_name=item.class_name,
+        confidence=item.confidence,
+        xyxy=(x0 + x_offset, y0 + y_offset, x1 + x_offset, y1 + y_offset),
+    )
+
+
+def select_locked_hole(
+    holes: list[BoxDetection],
+    previous_center_px: tuple[float, float] | None,
+    *,
+    max_jump_px: float = 120.0,
+) -> tuple[BoxDetection | None, str]:
+    """Select one hole and keep its identity across frames.
+
+    The first usable frame selects the highest-confidence candidate.  Once a
+    lock exists, only a candidate within ``max_jump_px`` of the previous
+    center can replace it; a missing or jumping detection returns ``None`` so
+    callers hold safely instead of using a stale box.
+    """
+    if not math.isfinite(float(max_jump_px)) or float(max_jump_px) <= 0.0:
+        raise ValueError("max hole lock jump must be positive and finite")
+    if not holes:
+        return None, "missing_hole"
+    if previous_center_px is None:
+        return max(holes, key=lambda item: float(item.confidence)), "initial_confidence_lock"
+    previous = (float(previous_center_px[0]), float(previous_center_px[1]))
+    if not all(math.isfinite(value) for value in previous):
+        return max(holes, key=lambda item: float(item.confidence)), "initial_confidence_lock"
+    nearby = [
+        item
+        for item in holes
+        if math.hypot(item.center_px[0] - previous[0], item.center_px[1] - previous[1]) <= float(max_jump_px)
+    ]
+    if not nearby:
+        return None, "locked_hole_jump_exceeds_limit"
+    selected = min(
+        nearby,
+        key=lambda item: (
+            math.hypot(item.center_px[0] - previous[0], item.center_px[1] - previous[1]),
+            -float(item.confidence),
+        ),
+    )
+    return selected, "temporal_lock"
+
+
 def load_detection_model(path: str, *, device: str) -> Any:
     """Load the external YOLO detector without importing Ultralytics at import time."""
     from ultralytics import YOLO
@@ -114,4 +184,3 @@ def infer_detection(model: Any, frame_bgr: Any, *, confidence: float, iou: float
     if not results:
         return []
     return extract_detections(results[0])
-

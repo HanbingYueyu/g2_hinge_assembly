@@ -436,7 +436,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--full-cycle",
         action="store_true",
-        help="单进程执行 P2→P3、SAM3 抓取、+Z 上抬 100 mm、P4；要求 --allow-motion，且不能与受看护停止选项合用。",
+        help="单进程执行 P2→P3、SAM3 抓取、+Z 上抬 150 mm、P4；要求 --allow-motion，且不能与受看护停止选项合用。",
     )
     parser.add_argument("--poses", type=Path, default=DEFAULT_POSES_OUTPUT, help="包含左 P2/P3/P4 的 recorded_poses.json。")
     parser.add_argument("--preset-velocity-rad-s", type=float, default=0.08, help="全流程 P2/P3/P4 的规划关节速度。")
@@ -1438,7 +1438,7 @@ def main() -> int:
         "preset_timeout_s": motion_preset_timeout_s,
         "poses": None if not args.full_cycle else str(args.poses.expanduser().resolve()),
         "safety": (
-            "single process: preload SAM3, then P2/P3→visual grasp→+Z 100 mm→P4; "
+            "single process: preload SAM3, then P2/P3→visual grasp→+Z 150 mm→P4; "
             "one GDK initialization and no extra gripper command after grasp"
             if args.full_cycle else "P2/P3/P4 are not commanded by this program"
         ),
@@ -1801,6 +1801,12 @@ def main() -> int:
                             "stale_since": None,
                             "stale_logged": False,
                             "paused": False,
+                            # P4 starts only after one fresh post-lift frame.
+                            # Once the first preset request is sent, the
+                            # reference geometry is no longer comparable at
+                            # preset speed and the action state machine must
+                            # stop consuming visual results until P4 arrives.
+                            "motion_started": False,
                             # A fresh observation after the lift is mandatory
                             # before P4 is even requested.  It closes the
                             # race where the part drops just as the lift ends.
@@ -1808,7 +1814,7 @@ def main() -> int:
                         }
                         perception.set_phase(
                             "post_grasp_p4",
-                            "same-target monitoring before and during P4; stale pauses without opening",
+                            "same-target monitoring before P4; a fresh frame is required before the request",
                         )
                     elif time.monotonic() > monitor["deadline"]:
                         raise SafetyError("受监控的 P4 前上抬超时；保持当前位置且拒绝进入 P4")
@@ -1820,61 +1826,62 @@ def main() -> int:
                 if post_grasp_p4_sequence is not None:
                     assert post_grasp_p4_monitor is not None
                     monitor = post_grasp_p4_monitor
-                    observation = monitor["mailbox"].newer_than(monitor["mailbox_sequence"])
-                    if observation is not None:
-                        monitor["mailbox_sequence"] = int(observation["sequence"])
-                        observed_at = time.monotonic()
-                        monitor["last_observation_at"] = observed_at
-                        monitor["failure"] = held_part_monitor_failure(
-                            observation,
-                            reference_center_px=monitor["reference_center_px"],
-                            reference_area_px=monitor["reference_area_px"],
-                            max_center_drift_px=args.post_grasp_verify_center_drift_px,
-                            max_area_change_fraction=args.post_grasp_verify_area_change_fraction,
-                        )
-                        monitor["awaiting_fresh_observation"] = False
-                        if monitor.get("paused"):
-                            monitor["paused"] = False
-                            monitor["stale_since"] = None
-                            json_record(log, {
-                                "event": "post_grasp_p4_monitor_recovered",
-                                "utc": datetime.now(timezone.utc).isoformat(),
-                                "action": "resume_p4_hold_closed",
-                                "mailbox_sequence": monitor["mailbox_sequence"],
-                                "nonblocking": True,
-                            })
-                    now = time.monotonic()
-                    if (
-                        observation is None
-                        and not monitor.get("paused")
-                        and now - monitor["last_observation_at"] > args.post_grasp_monitor_max_stale_s
-                    ):
-                        # Stale perception is an unknown state.  Stop issuing
-                        # new P4 targets, but never open the gripper without a
-                        # fresh confirmed-loss observation.
-                        monitor["paused"] = True
-                        monitor["stale_since"] = now
-                        if not monitor.get("stale_logged"):
-                            monitor["stale_logged"] = True
-                            json_record(log, {
-                                "event": "post_grasp_p4_monitor_stale_hold",
-                                "utc": datetime.now(timezone.utc).isoformat(),
-                                "reason": "perception_stale_unknown_not_confirmed_lost",
-                                "stale_age_s": round(now - monitor["last_observation_at"], 3),
-                                "max_stale_s": args.post_grasp_monitor_max_stale_s,
-                                "action": "hold_p4_and_keep_gripper_closed",
-                                "mailbox_sequence": monitor["mailbox_sequence"],
-                                "nonblocking": True,
-                            })
-                    if monitor.get("failure") is not None:
-                        failure = monitor["failure"]
-                        # Before P4 is sent, recovery at the verified lift
-                        # pose is safe: open and reacquire the dropped part.
-                        # Once a planned P4 request is in flight, GDK exposes
-                        # no verified pre-empt/stop API.  Never launch a
-                        # regrasp against a moving arm; stop issuing commands
-                        # and require the operator to recover safely.
-                        if post_grasp_p4_sequence.sent_at is None:
+                    if not monitor.get("motion_started"):
+                        observation = monitor["mailbox"].newer_than(monitor["mailbox_sequence"])
+                        if observation is not None:
+                            monitor["mailbox_sequence"] = int(observation["sequence"])
+                            observed_at = time.monotonic()
+                            monitor["last_observation_at"] = observed_at
+                            monitor["failure"] = held_part_monitor_failure(
+                                observation,
+                                reference_center_px=monitor["reference_center_px"],
+                                reference_area_px=monitor["reference_area_px"],
+                                max_center_drift_px=args.post_grasp_verify_center_drift_px,
+                                max_area_change_fraction=args.post_grasp_verify_area_change_fraction,
+                            )
+                            monitor["awaiting_fresh_observation"] = False
+                            if monitor.get("paused"):
+                                monitor["paused"] = False
+                                monitor["stale_since"] = None
+                                json_record(log, {
+                                    "event": "post_grasp_p4_monitor_recovered",
+                                    "utc": datetime.now(timezone.utc).isoformat(),
+                                    "action": "resume_p4_hold_closed",
+                                    "mailbox_sequence": monitor["mailbox_sequence"],
+                                    "nonblocking": True,
+                                })
+                        now = time.monotonic()
+                        if (
+                            observation is None
+                            and not monitor.get("paused")
+                            and now - monitor["last_observation_at"] > args.post_grasp_monitor_max_stale_s
+                        ):
+                            # Before P4 starts, stale perception is an
+                            # unknown state. Do not issue the request until a
+                            # fresh frame arrives, but never open the gripper
+                            # without a fresh confirmed-loss observation.
+                            monitor["paused"] = True
+                            monitor["stale_since"] = now
+                            if not monitor.get("stale_logged"):
+                                monitor["stale_logged"] = True
+                                json_record(log, {
+                                    "event": "post_grasp_p4_monitor_stale_hold",
+                                    "utc": datetime.now(timezone.utc).isoformat(),
+                                    "reason": "perception_stale_unknown_not_confirmed_lost",
+                                    "stale_age_s": round(now - monitor["last_observation_at"], 3),
+                                    "max_stale_s": args.post_grasp_monitor_max_stale_s,
+                                    "action": "hold_before_p4_and_keep_gripper_closed",
+                                    "mailbox_sequence": monitor["mailbox_sequence"],
+                                    "nonblocking": True,
+                                })
+                        if monitor.get("failure") is not None:
+                            failure = monitor["failure"]
+                            # The P4 request has not started yet, so it is
+                            # safe to open and reacquire at the verified lift
+                            # pose. Once motion_started is latched below,
+                            # visual results are deliberately ignored until
+                            # the preset sequence arrives.
+                            assert not monitor.get("motion_started")
                             stop_force_descent_sam_preview(force_preview_stop, force_preview_thread)
                             force_preview_stop = force_preview_thread = None
                             force_preview_phase = None
@@ -1897,20 +1904,28 @@ def main() -> int:
                             post_grasp_p4_sequence = None
                             post_grasp_p4_monitor = None
                             continue
-                        raise SafetyError(
-                            "P4 运输期间检测到铰链掉落/异常；已停止发送后续命令。"
-                            "当前 GDK 未提供经验证的规划运动抢占接口，禁止在运动中自动重抓；"
-                            f"请待机器人静止后由操作员安全恢复。monitor={failure}"
+                        if monitor.get("paused") or monitor["awaiting_fresh_observation"]:
+                            # A fresh post-lift frame is the last visual gate
+                            # before P4. No preset request is sent while it is
+                            # stale or absent.
+                            time.sleep(0.01)
+                            continue
+                        # Lock this before calling tick(). If a GDK request
+                        # fails, the outer error path must not attempt a visual
+                        # regrasp against a possibly moving arm.
+                        monitor["motion_started"] = True
+                        json_record(log, {
+                            "event": "post_grasp_p4_visual_monitor_suspended",
+                            "utc": datetime.now(timezone.utc).isoformat(),
+                            "reason": "rapid_preset_motion_geometry_not_comparable",
+                            "action": "keep_gripper_closed_and_poll_joint_arrival",
+                            "mailbox_sequence": monitor["mailbox_sequence"],
+                            "nonblocking": True,
+                        })
+                        perception.set_phase(
+                            "post_grasp_p4_in_motion",
+                            "preview only; control state machine does not consume detections",
                         )
-                    if monitor.get("paused"):
-                        # Do not advance a preset sequence while perception is
-                        # stale.  A fresh sequence above resumes it.
-                        time.sleep(0.01)
-                        continue
-                    if monitor["awaiting_fresh_observation"]:
-                        # Do not issue the P4 request from a stale lift frame.
-                        time.sleep(0.01)
-                        continue
                     complete, event = post_grasp_p4_sequence.tick(controller, log)
                     if event is not None:
                         print(json.dumps(event, ensure_ascii=False))
@@ -1924,7 +1939,7 @@ def main() -> int:
                             "gripper": "preserved after confirmed grasp",
                             "nonblocking": True,
                         })
-                        print("完整流程完成：P2→P3、抓取、受监控 +Z 上抬 100 mm、P4；夹爪保持闭合。")
+                        print("完整流程完成：P2→P3、抓取、受监控 +Z 上抬 150 mm、P4；夹爪保持闭合。")
                         return 0
                     time.sleep(0.01)
                     continue
@@ -3018,7 +3033,7 @@ def main() -> int:
                                 # blocking helper call.  Keep the existing
                                 # 50-Hz mode-1 stream alive and inspect every
                                 # fresh same-target SAM3 observation while it
-                                # raises 100 mm.  A dropped hinge is therefore
+                                # raises 150 mm.  A dropped hinge is therefore
                                 # a regrasp event, never permission to request
                                 # P4.
                                 lift_origin = measured_left_end_link_pose(controller)

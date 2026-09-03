@@ -3,10 +3,13 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from run_left_post_grasp_sequence import load_presets
+from run_left_post_grasp_sequence import PRE_P4_LIFT_M, load_presets
 
 
 class LeftPostGraspSequenceTests(unittest.TestCase):
+    def test_pre_p4_lift_is_150_mm(self):
+        self.assertAlmostEqual(PRE_P4_LIFT_M, 0.15)
+
     def test_loads_only_p4_then_p5(self):
         document = {
             "schema_version": 1,

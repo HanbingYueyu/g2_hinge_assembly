@@ -23,12 +23,28 @@ import cv2
 
 try:
     from .control import G2Controller
-    from .hole_target_detector import best_per_class, infer_detection, load_detection_model, pair_status
+    from .hole_target_detector import (
+        best_per_class,
+        center_crop,
+        infer_detection,
+        load_detection_model,
+        pair_status,
+        select_locked_hole,
+        translate_detection,
+    )
     from .record_pose import DEFAULT_OUTPUT
     from .camera import decode_color_rgb
 except ImportError:
     from control import G2Controller
-    from hole_target_detector import best_per_class, infer_detection, load_detection_model, pair_status
+    from hole_target_detector import (
+        best_per_class,
+        center_crop,
+        infer_detection,
+        load_detection_model,
+        pair_status,
+        select_locked_hole,
+        translate_detection,
+    )
     from record_pose import DEFAULT_OUTPUT
     from camera import decode_color_rgb
 
@@ -97,6 +113,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--poses", type=Path, default=DEFAULT_OUTPUT, help="包含 right_post_grasp 的 recorded_poses.json")
     parser.add_argument("--right-preset", default="right_post_grasp", help="右臂预移动姿态名，默认 right_post_grasp")
     parser.add_argument("--confidence", type=float, default=0.25)
+    parser.add_argument("--right-crop-percent", type=float, default=60.0, help="右手图像中心裁剪比例，默认 60%%")
+    parser.add_argument("--right-hole-track-max-jump-px", type=float, default=120.0, help="右手孔锁定跨帧最大跳变")
     parser.add_argument("--iou", type=float, default=0.45)
     parser.add_argument("--imgsz", type=int, default=640)
     parser.add_argument("--device", default="cuda:0")
@@ -150,7 +168,18 @@ def draw_overlay(frame_bgr, detections, selected, status: str):
 
 def main() -> int:
     args = parse_args()
-    if not (0.0 <= args.confidence <= 1.0 and 0.0 <= args.iou <= 1.0 and args.imgsz > 0 and args.max_frames >= 0 and 0 <= args.web_port <= 65535 and 0.0 < args.velocity_rad_s <= 0.15 and 0.001 <= args.arrival_tolerance_rad <= 0.10 and 1.0 <= args.premove_timeout_s <= 30.0):
+    if not (
+        0.0 <= args.confidence <= 1.0
+        and 0.0 <= args.iou <= 1.0
+        and args.imgsz > 0
+        and args.max_frames >= 0
+        and 0 <= args.web_port <= 65535
+        and 0.0 < args.velocity_rad_s <= 0.15
+        and 0.001 <= args.arrival_tolerance_rad <= 0.10
+        and 1.0 <= args.premove_timeout_s <= 30.0
+        and 0.0 < args.right_crop_percent <= 100.0
+        and 1.0 <= args.right_hole_track_max_jump_px <= 1000.0
+    ):
         print("参数错误：检测、预移动或网页参数无效。", file=sys.stderr)
         return 2
     model_path = args.model.expanduser().resolve()
@@ -166,7 +195,7 @@ def main() -> int:
             return 2
     log_path = (args.log or PROJECT_ROOT / "logs" / f"right_hole_target_{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}.jsonl").expanduser().resolve()
     log_path.parent.mkdir(parents=True, exist_ok=True)
-    print(json.dumps({"mode": "motion" if args.allow_motion else "read_only_preview", "stage": "post_p4_detection", "camera": "right_hand_color", "model": str(model_path), "right_preset": None if args.skip_premove else args.right_preset, "log": str(log_path)}, ensure_ascii=False))
+    print(json.dumps({"mode": "motion" if args.allow_motion else "read_only_preview", "stage": "post_p4_detection", "camera": "right_hand_color", "model": str(model_path), "right_preset": None if args.skip_premove else args.right_preset, "right_crop_percent": args.right_crop_percent, "right_hole_track_max_jump_px": args.right_hole_track_max_jump_px, "log": str(log_path)}, ensure_ascii=False))
 
     try:
         import agibot_gdk
@@ -202,16 +231,34 @@ def main() -> int:
         sequence = 0
         last_print = 0.0
         with log_path.open("a", encoding="utf-8") as log:
-            log.write(json.dumps({"event": "start", "utc": datetime.now(timezone.utc).isoformat(), "stage": "post_p4_detection", "camera": "right_hand_color", "model": str(model_path), "premove": None if args.skip_premove else args.right_preset}, ensure_ascii=False) + "\n")
+            log.write(json.dumps({"event": "start", "utc": datetime.now(timezone.utc).isoformat(), "stage": "post_p4_detection", "camera": "right_hand_color", "model": str(model_path), "premove": None if args.skip_premove else args.right_preset, "right_crop_percent": args.right_crop_percent, "right_hole_track_max_jump_px": args.right_hole_track_max_jump_px}, ensure_ascii=False) + "\n")
             log.flush()
+            previous_right_hole_px: tuple[float, float] | None = None
             while args.max_frames == 0 or sequence < args.max_frames:
                 started = time.monotonic()
                 image = camera.get_latest_image(color_type, 1000.0)
                 color_rgb = decode_color_rgb(image, agibot_gdk)
                 frame_bgr = cv2.cvtColor(color_rgb, cv2.COLOR_RGB2BGR)
-                detections = infer_detection(model, frame_bgr, confidence=args.confidence, iou=args.iou, imgsz=args.imgsz, device=args.device)
+                infer_frame_bgr, crop_offset = center_crop(frame_bgr, args.right_crop_percent)
+                crop_detections = infer_detection(model, infer_frame_bgr, confidence=args.confidence, iou=args.iou, imgsz=args.imgsz, device=args.device)
+                detections = [translate_detection(item, crop_offset) for item in crop_detections]
+                all_holes = [item for item in detections if item.class_name == "hole"]
+                selected_hole, lock_reason = select_locked_hole(
+                    all_holes,
+                    previous_right_hole_px,
+                    max_jump_px=args.right_hole_track_max_jump_px,
+                )
+                if selected_hole is not None:
+                    previous_right_hole_px = selected_hole.center_px
                 selected = best_per_class(detections)
-                status = pair_status(detections, selected)
+                if selected_hole is None:
+                    selected.pop("hole", None)
+                else:
+                    selected["hole"] = selected_hole
+                status_detections = ([selected_hole] if selected_hole is not None else []) + [
+                    item for item in detections if item.class_name == "target"
+                ]
+                status = pair_status(status_detections, selected)
                 sequence += 1
                 record = {
                     "event": "frame",
@@ -220,15 +267,35 @@ def main() -> int:
                     "state": status,
                     "inference_ms": round((time.monotonic() - started) * 1000.0, 1),
                     "detections": [{"class": item.class_name, "confidence": round(item.confidence, 4), "center_px": [round(value, 1) for value in item.center_px], "xyxy": [round(value, 1) for value in item.xyxy]} for item in detections],
+                    "right_hole_lock": {"reason": lock_reason, "candidate_count": len(all_holes), "locked": selected_hole is not None, "center_px": None if selected_hole is None else [round(value, 1) for value in selected_hole.center_px]},
                 }
                 if set(selected) == {"hole", "target"}:
                     record["center_error_target_minus_hole_px"] = [round(selected["target"].center_px[i] - selected["hole"].center_px[i], 1) for i in range(2)]
                 log.write(json.dumps(record, ensure_ascii=False) + "\n")
                 log.flush()
                 overlay = draw_overlay(frame_bgr, detections, selected, status)
+                crop_x0, crop_y0 = crop_offset
+                crop_x1 = crop_x0 + int(infer_frame_bgr.shape[1]) - 1
+                crop_y1 = crop_y0 + int(infer_frame_bgr.shape[0]) - 1
+                cv2.rectangle(overlay, (crop_x0, crop_y0), (crop_x1, crop_y1), (0, 165, 255), 3, cv2.LINE_AA)
+                cv2.putText(
+                    overlay,
+                    f"INFERENCE ROI {args.right_crop_percent:.0f}%",
+                    (crop_x0 + 8, max(24, crop_y0 + 24)),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.60,
+                    (0, 165, 255),
+                    2,
+                    cv2.LINE_AA,
+                )
+                if selected_hole is not None:
+                    lock_x = int(round(selected_hole.center_px[0]))
+                    lock_y = int(round(selected_hole.center_px[1]))
+                    cv2.circle(overlay, (lock_x, lock_y), 10, (255, 255, 255), 2, cv2.LINE_AA)
+                    cv2.putText(overlay, "LOCKED HOLE", (max(8, lock_x - 55), max(24, lock_y - 14)), cv2.FONT_HERSHEY_SIMPLEX, 0.58, (255, 255, 255), 2, cv2.LINE_AA)
                 ok, encoded = cv2.imencode(".jpg", overlay, [cv2.IMWRITE_JPEG_QUALITY, 82])
                 if shared is not None and ok:
-                    shared.update(encoded.tobytes(), {"state": status, "sequence": sequence, "camera": "right_hand_color", "detections": record["detections"], "center_error_target_minus_hole_px": record.get("center_error_target_minus_hole_px"), "inference_ms": record["inference_ms"], "motion": "none; detection-only"})
+                    shared.update(encoded.tobytes(), {"state": status, "sequence": sequence, "camera": "right_hand_color", "detections": record["detections"], "right_hole_lock": record["right_hole_lock"], "center_error_target_minus_hole_px": record.get("center_error_target_minus_hole_px"), "inference_ms": record["inference_ms"], "motion": "none; detection-only"})
                 now = time.monotonic()
                 if now - last_print >= 1.0:
                     print(f"frame={sequence} pair={status} detections={len(detections)} inference_ms={record['inference_ms']:.1f}", flush=True)

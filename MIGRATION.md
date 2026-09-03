@@ -93,15 +93,15 @@ G2 原图比例并由 YOLO 内部 letterbox；实时验证时传入
 - `g2_adapter/record_pose.py`：只读记录左手 P2/P3/P4；
 - `g2_adapter/run_preset.py`：只读预检或执行一个已记录预设；
 - `g2_adapter/run_left_premove_sequence.py`：按到位确认顺序执行左 P2→P3，P3 为最终检测位；
-- `g2_adapter/run_left_post_grasp_sequence.py`：抓取确认后先在 `base_link +Z` 实测上抬 100 mm，再按到位确认执行左 P4，并保持夹爪状态；
+- `g2_adapter/run_left_post_grasp_sequence.py`：抓取确认后先在 `base_link +Z` 实测上抬 150 mm，再按到位确认执行左 P4，并保持夹爪状态；
 - `g2_adapter/probe_left_xy_mapping.py`：从 P3 在 `base_link` 的单一 X 或 Y 轴发送一次 1 mm 位置伺服，并测量同一 SAM3 目标的像素变化；
-- `g2_adapter/run_bilateral_alignment_gdk.py`：P4 后右臂固定观察、左臂按双相机三维误差做受限 XY mode-1 伺服。direct 模式由右相机提供固定 `hole`、左 D405 的 `shaft`（关联唯一 hinge 后取远端轴尖）提供被夹持 `target`，并接入左右官方 RGB-D 外参与动态 `base_link←arm_*_end_link` TF，默认只读；旧 `off/veto` 仅保留单右图 pixel-J 诊断路径。真实 direct 运动必须显式 `--allow-motion --approve-rgbd-direct-motion`；不包含下探、力控、插入或夹爪动作；
+- `g2_adapter/run_bilateral_alignment_gdk.py`：P4 后右臂固定观察、左臂按双相机三维误差做受限 XY mode-1 伺服。direct 模式由右相机提供固定 `hole`、左 D405 在当前画面选择并锁定的 hinge 关联 `shaft`（取远端轴尖）提供被夹持 `target`，网页同时显示左手 hinge/shaft 检测；首帧默认选深度最近 hinge，也可用 `--left-selection` 选择面积最大或左右排序，后续只按上一帧位置跟踪，不读取抓取日志；旧 `off/veto` 仅保留单右图 pixel-J 诊断路径。真实 direct 运动必须显式 `--allow-motion --approve-rgbd-direct-motion`；不包含下探、力控、插入或夹爪动作；
 - `g2_adapter/inspect_cameras.py`：只读检查实际相机流和 binding；
 - `g2_adapter/workcell.example.json`：待填充工位配置。
 - `g2_adapter/left_grasp_gdk.py`：最终检测位的左手 D405/SAM3 视觉抓取状态机；默认只读，
   通过唯一 `--allow-motion` 参数且完成 G2 实测标定后才会调用 GDK 运动/夹爪接口。加 `--full-cycle`
-  后同一进程只初始化一次 GDK、只加载一次 SAM3，依次完成 P2→P3、抓取、`base_link +Z` 上抬 100 mm、P4。图像对心仍为
-  GDK mode 1 的直接末端位姿控制；接近和闭爪全程不切换 GDK control mode。抓取后会持续监控同一锁定实例：上抬或 P4 请求前掉件会张爪并回到视觉重抓；P4 请求发出后若掉件、形态异常或观测陈旧，则停止发送后续命令并报错，不在运动中自动重抓。
+  后同一进程只初始化一次 GDK、只加载一次 SAM3，依次完成 P2→P3、抓取、`base_link +Z` 上抬 150 mm、P4。图像对心仍为
+  GDK mode 1 的直接末端位姿控制；接近和闭爪全程不切换 GDK control mode。抓取后会持续监控同一锁定实例：150 mm 上抬和 P4 请求前掉件会张爪并回到视觉重抓；P4 预设运动期间不消费视觉结果，只保持夹爪闭合并轮询实际关节到位，避免快速运动造成几何误报。
 - `g2_adapter/inspect_force_control.py`、`g2_adapter/probe_left_cartesian_contact.py`：仅为后续力控排障
   保留，当前正式抓取流程不调用。
 
@@ -177,11 +177,11 @@ GDK 左手 RGB-D 外参以 `arm_l_end_link` 为终点；视觉 FK、Jacobian、I
 避免与 `gripper_l_base_link` 的固定额外旋转混用。
 
 默认入口不控制 P2/P3，也不猜测最终检测位：操作员先完成预移动并确认已经处于
-最终检测位，再启动抓取状态机。若全部 P2/P3/P4 已记录，可在同一入口追加 `--full-cycle`，由单一 GDK/SAM3 进程完成整条流程。左 Omnipicker 的机械行程已实测为最大张开 `-0.785 rad`、全闭合 `0.0 rad`；当前运行时张开目标设为经操作员确认的 75%（`-0.58875 rad`），以避免碰到周围铰链。夹紧不再依赖固定绝对角度：它先测出当前铰链位置的稳定卡住角度，再从该角度额外闭合 `0.03 rad`；
+最终检测位，再启动抓取状态机。若全部 P2/P3/P4 已记录，可在同一入口追加 `--full-cycle`，由单一 GDK/SAM3 进程完成整条流程。左 Omnipicker 的机械行程已实测为最大张开 `-0.785 rad`、全闭合 `0.0 rad`；当前运行时张开目标设为经操作员确认的 65%（`-0.51025 rad`），以避免碰到周围铰链。夹紧不再依赖固定绝对角度：它先测出当前铰链位置的稳定卡住角度，再从该角度额外闭合 `0.03 rad`；
 `g2_adapter/left_grasp.example.json` 的 `target_pixel_px` 必须在夹爪将要下探的位置实测，表示视觉伺服的
 抓取参考像素。视觉深度仅用于筛除无效目标，**不再用于决定垂直下探距离**；不同铰链的绝对相机深度不能作为公共高度参考。XY 连续对准后，
-`approach.final_descent_speed_mps=0.01` 与 `approach.final_descent_duration_s=25.0` 定义一个最多 250 mm 的、受相对力优先保护的接触搜索行程。每次搜索前读取 20 帧新鲜基线；加 `--final-descent-visual-servo` 时，最终下探会仅对下探前锁定的同一目标按实测像素 Jacobian 做实时 XY 复位：单次最多 1 mm，默认不设累计 XY 上限（`--final-descent-visual-max-total-m` 设为正值时才重新启用）；相对力达到接触阈值 50% 即冻结视觉修正。视觉不会改变 Z 向下探距离。相对力首次达到 2 N 即停止向下。接触时相对力不超过 3 N 则保持当前位置直接闭爪；仅超过 3 N 才最多上提 15 mm，且相对力连续 3 帧降至或等于 3 N 后才闭爪。250 mm 和 15 mm 均为操作员确认的故障兜底上限。YOLO 以最左视觉候选为优先；对齐深度只记录诊断，不再筛掉最左目标或决定垂直下探。G2 基座方向经操作员确认：`+X` 前、`+Y` 左、`+Z` 上。完整抓取在文件未完成标定时会拒绝执行。
-完整抓取在 P3 会先以 `left_end_state` 确认左 Omnipicker 的实际角度已到配置的 75% 张开目标 `-0.58875 rad` 附近；若 6 秒内没有这一反馈，流程停止且绝不开始视觉伺服或下探。
+`approach.final_descent_speed_mps=0.01` 与 `approach.final_descent_duration_s=25.0` 定义一个最多 250 mm 的、受相对力优先保护的接触搜索行程。每次搜索前读取 20 帧新鲜基线；加 `--final-descent-visual-servo` 时，最终下探会仅对下探前锁定的同一目标按实测像素 Jacobian 做实时 XY 复位：单次最多 1 mm，默认不设累计 XY 上限（`--final-descent-visual-max-total-m` 设为正值时才重新启用）；相对力达到接触阈值 50% 即冻结视觉修正。视觉不会改变 Z 向下探距离。相对力首次达到 2 N 即停止向下。接触时相对力不超过 2 N 则保持当前位置直接闭爪；仅超过 2 N 才最多上提 15 mm，且相对力连续 3 帧降至或等于 2 N 后才闭爪。250 mm 和 15 mm 均为操作员确认的故障兜底上限。YOLO 以最左视觉候选为优先；对齐深度只记录诊断，不再筛掉最左目标或决定垂直下探。G2 基座方向经操作员确认：`+X` 前、`+Y` 左、`+Z` 上。完整抓取在文件未完成标定时会拒绝执行。
+完整抓取在 P3 会先以 `left_end_state` 确认左 Omnipicker 的实际角度已到配置的 65% 张开目标 `-0.51025 rad` 附近；若 6 秒内没有这一反馈，流程停止且绝不开始视觉伺服或下探。
 只读观察可由操作员运行：
 
 ```bash
@@ -250,9 +250,14 @@ binding 实际公开的参数方法，请由操作员运行：
 ```
 
 该脚本只读取每路一帧，不保存图像、不发送控制命令。得到输出后即可确认深度单位、
-彩色/深度对齐关系及标定参数入口。右手官方外参现已由
-`run_bilateral_alignment_gdk.py --geometry-mode direct` 接入 GDK 帧；首次只读验证必须先确认
-`geometry_error_m`、深度支持率和 `right_tf_timestamp_ns` 稳定，再允许真实 XY 运动。
+彩色/深度对齐关系及标定参数入口。右手孔的机器人坐标由
+`p_base=T_base_arm_r_end(T_arm_r_end_right_rgbd p_right_color)` 计算：前一项来自
+GDK `kRightHandRGBDToArmREndLink`，后一项来自带图像时间戳的
+`lookup_transform("base_link", "arm_r_end_link", timestamp_ns)`。日志会分别记录
+`right_hole_xyz_color_camera_m`、`right_hole_xyz_right_end_link_m` 和
+`right_hole_xyz_base_link_m`，以及 `right_tf_lookup_mode/right_tf_age_ms`。首次只读验证必须先确认
+`geometry_error_m`、深度支持率、坐标方向和 TF 时间戳稳定，再允许真实 XY 运动；URDF 只用于校验
+`base_link` 到 `arm_r_end_link` 的父子链，不拼接 `gripper_r_camera_link`。
 
 实时查看胸口和双手六路图像时，使用项目自带的只读网页查看器：
 

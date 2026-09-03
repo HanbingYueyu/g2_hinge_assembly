@@ -154,15 +154,21 @@ h1 { margin:0; font-size:18px; } #notice { color:#93c5fd; margin-top:5px; }
 const order = ['head_color','head_depth','left_color','left_depth','right_color','right_depth'];
 const labels = {head_color:'胸口彩色',head_depth:'胸口深度',left_color:'左手彩色',left_depth:'左手深度',right_color:'右手彩色',right_depth:'右手深度'};
 const depth = new Set(['head_depth','left_depth','right_depth']);
-const seen = {}; const depthFrames = {}; const grid = document.getElementById('grid');
+const seen = {}; const depthFrames = {}; const depthPointers = {}; const grid = document.getElementById('grid');
 for (const name of order) { const card=document.createElement('section'); card.className='card'; card.innerHTML=`<div class="title">${labels[name]}<span class="meta" id="m-${name}"></span></div><div id="v-${name}" class="error">等待图像……</div>`; grid.append(card); }
+function updateDepthReadout(name, x, y) { const frame=depthFrames[name]; if(!frame)return; x=Math.max(0,Math.min(frame.width-1,Math.floor(x))); y=Math.max(0,Math.min(frame.height-1,Math.floor(y))); const z=frame.values[y*frame.width+x]; document.getElementById(`m-${name}`).textContent=`${frame.width}×${frame.height} · ${z ? (z/1000).toFixed(3)+' m' : '无深度'} @ (${x},${y})`; }
+function depthPixelFromPointer(name, canvas, event) { const frame=depthFrames[name]; if(!frame)return null; const rect=canvas.getBoundingClientRect(); const scale=Math.min(rect.width/frame.width,rect.height/frame.height); const drawWidth=frame.width*scale, drawHeight=frame.height*scale; const offsetX=(rect.width-drawWidth)/2, offsetY=(rect.height-drawHeight)/2; const x=(event.clientX-rect.left-offsetX)/scale, y=(event.clientY-rect.top-offsetY)/scale; if(x<0 || y<0 || x>=frame.width || y>=frame.height)return null; return {x,y}; }
 function renderDepth(name, info) { const url=`/frame/${name}?s=${info.sequence}`; fetch(url).then(r=>{if(!r.ok)throw new Error('读取深度帧失败'); return r.arrayBuffer();}).then(buffer=>{
   const values=new Uint16Array(buffer); const pixels=info.width*info.height; if(values.length<pixels)throw new Error('深度帧大小异常');
-  let canvas=document.getElementById(`i-${name}`); if(!canvas){canvas=document.createElement('canvas');canvas.id=`i-${name}`;canvas.addEventListener('mousemove', event => {const frame=depthFrames[name];if(!frame)return;const rect=canvas.getBoundingClientRect();const x=Math.max(0,Math.min(frame.width-1,Math.floor((event.clientX-rect.left)*frame.width/rect.width)));const y=Math.max(0,Math.min(frame.height-1,Math.floor((event.clientY-rect.top)*frame.height/rect.height)));const z=frame.values[y*frame.width+x];document.getElementById(`m-${name}`).textContent=`${frame.width}×${frame.height} · ${z ? (z/1000).toFixed(3)+' m' : '无深度'} @ (${x},${y})`;});document.getElementById(`v-${name}`).replaceWith(canvas);}
-  canvas.width=info.width; canvas.height=info.height; const out=canvas.getContext('2d').createImageData(info.width,info.height); const near=200, far=2000;
+  let canvas=document.getElementById(`i-${name}`); if(!canvas){canvas=document.createElement('canvas');canvas.id=`i-${name}`;canvas.addEventListener('mousemove', event => {const pointer=depthPixelFromPointer(name,canvas,event);if(!pointer)return;depthPointers[name]=pointer;updateDepthReadout(name,pointer.x,pointer.y);});document.getElementById(`v-${name}`).replaceWith(canvas);}
+  canvas.width=info.width; canvas.height=info.height; const ctx=canvas.getContext('2d'); const out=ctx.createImageData(info.width,info.height); const near=200, far=2000;
   depthFrames[name]={values,width:info.width,height:info.height};
   for(let i=0;i<pixels;i++){const z=values[i]; const p=i*4; if(z===0){out.data[p+3]=255;continue;} const t=Math.max(0,Math.min(1,(z-near)/(far-near))); const hue=(1-t)*240; const x=1-Math.abs((hue/60)%2-1); let r=0,g=0,b=0; if(hue<60){r=1;g=x;}else if(hue<120){r=x;g=1;}else if(hue<180){g=1;b=x;}else{g=x;b=1;} out.data[p]=r*255;out.data[p+1]=g*255;out.data[p+2]=b*255;out.data[p+3]=255;}
-  canvas.getContext('2d').putImageData(out,0,0);
+  ctx.putImageData(out,0,0);
+  const centerX=Math.floor(info.width/2), centerY=Math.floor(info.height/2);
+  ctx.strokeStyle='#ffffff'; ctx.lineWidth=Math.max(2,Math.round(info.width/640)); ctx.beginPath(); ctx.moveTo(centerX-12,centerY); ctx.lineTo(centerX+12,centerY); ctx.moveTo(centerX,centerY-12); ctx.lineTo(centerX,centerY+12); ctx.stroke();
+  const pointer=depthPointers[name];
+  updateDepthReadout(name,pointer ? pointer.x : centerX,pointer ? pointer.y : centerY);
 }).catch(err=>showError(name,err.message)); }
 function renderColor(name, info) { if(!/JPEG|PNG/.test(info.encoding)){showError(name,`不支持的彩色编码：${info.encoding}`);return;} let image=document.getElementById(`i-${name}`); if(!image){image=document.createElement('img');image.id=`i-${name}`;document.getElementById(`v-${name}`).replaceWith(image);} image.src=`/frame/${name}?s=${info.sequence}`; }
 function showError(name, message){const old=document.getElementById(`i-${name}`); if(old){const d=document.createElement('div');d.id=`v-${name}`;d.className='error';old.replaceWith(d);} const holder=document.getElementById(`v-${name}`);if(holder)holder.textContent=message;}

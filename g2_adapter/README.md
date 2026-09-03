@@ -16,11 +16,37 @@
 
 `right_hole_target_detect_gdk.py` 用训练好的 `hole/target` YOLO 框检测模型读取右手彩色相机。它假设前序左手抓取、上抬和 P4 已完成；带 `--allow-motion` 时只把右臂移动到记录的 `right_post_grasp` 姿态，随后持续输出同一帧中的 `hole`（固定工装孔）和 `target`（被夹铰链销轴）框、置信度和中心误差。当前阶段不执行 XY 对孔、下探、力控或释放夹爪。
 
-`run_bilateral_alignment_gdk.py` 是独立的 P4 后定位入口：右臂预移动一次后固定观察，左臂通过 GDK mode-1 50 Hz 末端位姿流逐步做 XY 对孔。正确的双相机定义是：右手相机只识别固定工装 `hole`，左手 D405 的 `hinge/shaft` 模型把 `shaft` 作为被夹持的 `target`。默认 `--geometry-mode off` 保留旧的单右图 pixel-J 诊断路径；`--geometry-mode direct` 同时打开左右 RGB-D，接入左右官方深度→彩色、RGB-D→各自末端外参与动态 `base_link←arm_*_end_link` TF，把两点都变换到 `base_link` 后计算三维 XY 误差。direct 默认仍只读，真实运动必须同时显式提供 `--allow-motion --approve-rgbd-direct-motion`。
+`run_bilateral_alignment_gdk.py` 是独立的 P4 后定位入口：右臂预移动一次后固定观察，左臂通过 GDK mode-1 50 Hz 末端位姿流逐步做 XY 对孔。正确的双相机定义是：右手相机只识别固定工装 `hole`，左手 D405 在当前 P4 画面中优先选择深度最近的 `hinge`（可选面积最大或左右排序），再把其关联 `shaft` 作为被夹持的 `target`。网页同时显示左手全部 `hinge/shaft` 检测。选中后只在上一帧位置附近跟踪该铰链，不从日志读取目标。默认 `--geometry-mode off` 保留旧的单右图 pixel-J 诊断路径；`--geometry-mode direct` 同时打开左右 RGB-D，接入左右官方深度→彩色、RGB-D→各自末端外参与动态 `base_link←arm_*_end_link` TF，把两点都变换到 `base_link` 后计算三维 XY 误差。direct 默认仍只读，真实运动必须同时显式提供 `--allow-motion --approve-rgbd-direct-motion`。
 
-建议先用 direct 只读观察日志和网页中的 `geometry_error_m`、`hole_base_m`、`target_base_m`。确认左右深度、时间同步、左侧 shaft 关联和坐标方向稳定后，再讨论 direct 真实运动。原有 `--geometry-mode veto` 仅适用于旧的“右图同时有 hole/target” pixel-J 诊断路径；跨左右相机时不能相减像素坐标。程序不会在两套控制律之间自动切换；任何缺失、多候选、跳变、深度噪声、时间戳偏差或右臂漂移都会保持最后目标。完成定位后不下探、不力控、不操作夹爪。
+帧状态默认以一行摘要在交互终端原地刷新；需要逐行 JSON 输出时使用 `--terminal-output json`。无论终端显示方式如何，完整紧凑帧记录仍写入 JSONL 日志。
+终端每帧优先显示 `hole_cam=(X,Y,Z)mm`、相机到孔的距离和可用的
+`hole_base=(X,Y,Z)mm`；JSONL 同时记录右彩色、右末端和 `base_link` 三套坐标。该显示不等待多帧窗口，
+多帧窗口只用于后续运动安全判定。
 
-检测模型只有 2D 框/分割，不能直接把框中心当作可靠深度。direct 模式对右 hole 取框内环带；左侧要求唯一 hinge 和关联 shaft，沿 shaft 掩膜主轴取远离 hinge 主体的一端作为配合端点，再在该端点邻域取稳健深度。两侧点分别用各自 RGB-D 外参与动态 TF 统一到 base；有效像素比例和 MAD 用于过滤遮挡/背景深度。左图若无唯一 hinge/shaft、关联不明确或端点深度无效，整帧会进入 `geometry_hold`。`paired` 仅表示右 hole 与左 target 在同一控制周期都可用；它不是运动许可。
+建议先用 direct 只读观察日志和网页中的 `geometry_error_m`、`hole_base_m`、`target_base_m`。右孔坐标链固定为：
+`p_right_color = backproject(color_pixel, registered/reprojected_depth, K_color)` →
+`p_arm_r_end = T_arm_r_end_right_rgbd · p_right_color`（GDK
+`kRightHandRGBDToArmREndLink`）→
+`p_base = T_base_arm_r_end · p_arm_r_end`（GDK
+`lookup_transform("base_link", "arm_r_end_link", image_timestamp_ns)`）。
+JSONL/网页还记录 `right_hole_xyz_color_camera_m`、`right_hole_xyz_right_end_link_m`、
+`right_hole_xyz_base_link_m` 及 TF 时间戳来源。URDF 只用于确认
+`base_link → arm_base_link → arm_r_link1..7 → arm_r_end_link` 父子链；不再拼接
+`gripper_r_camera_link` 或 `gripper_r_base_link`，避免重复偏移。确认左右深度、时间同步、左侧
+shaft 关联和坐标方向稳定后，再讨论 direct 真实运动。原有 `--geometry-mode veto` 仅适用于旧的
+“右图同时有 hole/target” pixel-J 诊断路径；跨左右相机时不能相减像素坐标。程序不会在两套控制律
+之间自动切换；任何缺失、多候选、跳变、深度噪声、时间戳偏差或右臂漂移都会保持最后目标。
+完成定位后不下探、不力控、不操作夹爪。
+
+需要单独核验当前 GDK 外参、动态 TF 和 URDF 链时，运行只读探针（`--point` 单位米）：
+
+```bash
+cd /home/flyfuture/traditional_auto_flow_g2_migration && \
+./scripts/run_gdk_sam3_python.sh g2_adapter/inspect_right_camera_to_base_gdk.py \
+  --point 0.0123,-0.0456,0.2090
+```
+
+检测模型只有 2D 框/分割，不能直接把框中心当作可靠深度。direct 模式对右 hole 取框内环带；左侧先按抓取流程选中并锁定 hinge，再在锁定 hinge 附近关联最近 shaft，沿 shaft 掩膜主轴取远离 hinge 主体的一端作为配合端点，再在该端点邻域取稳健深度。两侧点分别用各自 RGB-D 外参与动态 TF 统一到 base；有效像素比例和 MAD 用于过滤遮挡/背景深度。左图若锁定 hinge 丢失、无关联 shaft 或端点深度无效，整帧会进入 `geometry_hold`。`paired` 仅表示右 hole 与左 target 在同一控制周期都可用；它不是运动许可。
 
 如果需要先验证 SAM3 是否能理解这两个物体，可运行 `right_hole_target_sam3_preview.py`。它在同一右手彩色帧上分别使用 `the exposed cylindrical metal pin at the end of the hinge` 和 `the white circular opening in the fixture` 两个文本提示，只读显示掩膜，不接入动作状态机。SAM3 的英文提示应描述可见外观和用途；“axis”容易被理解成数学轴，优先使用 `pin`、`shaft`、`cylindrical metal pin`。
 
@@ -50,6 +76,14 @@
 主机上，操作员可自行指定机器人网卡地址，例如 `--host 192.168.x.x`；该模式没有鉴权，勿
 绑定至公网地址。`--browser-fps` 默认是 4，可按设备负载降低。
 鼠标悬停在任一深度图上可实时读取该像素的 Z16 深度（米）。
+
+右手 RGB-D 诊断默认使用 `--depth-registration reproject`：按 GDK 的
+`kRightHandDepthToRightHandColor` 和两套内参把原始深度投影到右彩色图网格。
+当前这台 G2 实测两路尺寸同为 `1280×1056`，但两套内参不同，因此尺寸相等本身不是注册证明；
+只有已单独确认 GDK 输出已经注册到彩色网格时，才可使用 `registered_same_pixel`，不能把深度内参
+直接套在彩色像素上。
+该模式必须先只读验证；接入 direct 运动时还必须额外提供
+`--approve-registered-depth-motion`，不能在未确认注册语义前直接用于运动。
 
 默认 GDK Python binding 使用官方 Python 3.10。若已执行
 `scripts/build_gdk_py312.sh`，可用 `scripts/run_gdk_sam3_python.sh` 在同一 Python 3.12
@@ -156,7 +190,7 @@ cd /home/flyfuture/traditional_auto_flow_g2_migration
 `native` 会将完整 G2 图交给 YOLO，由 `imgsz=640` 的内部 letterbox 保持比例。旧模型若仍需对比，
 保留默认的 `aspect-crop`。两种模式均只读，均不接入抓取状态机。
 
-左手 P2/P3 是预移动路径点，不是检测工位；抓取确认后的运输流程会先在 `base_link +Z` 上抬 100 mm，随后运行 P4（后续工位点）。机器人由操作员完成预移动并到达最终
+左手 P2/P3 是预移动路径点，不是检测工位；抓取确认后的运输流程会先在 `base_link +Z` 上抬 150 mm，随后运行 P4（后续工位点）。机器人由操作员完成预移动并到达最终
 检测位后，再采集一组可供视觉定位复现的 GDK RGB-D 数据：
 
 ```bash
@@ -257,10 +291,10 @@ python3 g2_adapter/derive_left_xy_mapping.py \
 1. 默认仅在操作员已到达**最终检测位**后运行；带 `--full-cycle` 时，同一进程会在 YOLO/SAM3 预加载完成后执行 P2→P3；
 2. 默认使用新训练的 G2 原生 YOLO 选择具有足够对齐深度的视觉最左目标；同一目标必须通过 SAM3 低频复核才会交给 XY 状态机。复核未通过、过期或目标缺少深度时不发送运动；
 3. 连续对心确认后，锁定 `arm_l_end_link` 法兰姿态；视觉深度仅用于确认目标可用，不能请求额外下探；
-4. 以 50 Hz、固定法兰姿态进行最多 250 mm 的力优先接触搜索。追加 `--final-descent-visual-servo` 后，会仅对下探前锁定的同一实例做实时 XY 复位：每次最多 1 mm，默认不设累计 XY 上限（可用 `--final-descent-visual-max-total-m` 设正值重新启用上限）；相对力达到接触阈值的 50% 即冻结视觉修正。视觉绝不改变 Z 向下探距离。相对力首次达到 2 N 都会停止向下；目标真正连续丢失仍会停止并进入安全恢复。接触力 ≤3 N 时保持当前位置直接闭爪；仅接触力 >3 N 才最多上提 15 mm，并在相对力连续 3 帧 ≤3 N 后闭爪。未触发接触或未能卸力均拒绝闭爪；
-5. Omnipicker 先向 `0 rad` 收拢以测得本次铰链的卡住角度；角度稳定 0.5 秒（变化 ≤0.005 rad）后，仅从该角度再闭合 0.03 rad。随后先以 `base_link +Z` 上抬 20 mm，并连续比较同一 YOLO 实例的像素中心和掩膜面积：若它未随夹爪移动，则张爪、回到视觉对准并重新抓取；验证通过后，`--full-cycle` 会持续锁定并监控该同一实例完成 100 mm 上抬，且必须取得一帧新的健康观测才会请求 P4。P4 请求前掉件会张爪并重新抓取；观测暂时陈旧时保持闭爪并等待，只有新鲜观测确认实例丢失或形态异常才进入恢复；P4 请求已发出后若确认异常，程序停止发送后续命令并报错，**不会**在运动中的机械臂上自动重抓（当前 GDK 没有经验证的规划运动抢占接口）。
+4. 以 50 Hz、固定法兰姿态进行最多 250 mm 的力优先接触搜索。追加 `--final-descent-visual-servo` 后，会仅对下探前锁定的同一实例做实时 XY 复位：每次最多 1 mm，默认不设累计 XY 上限（可用 `--final-descent-visual-max-total-m` 设正值重新启用上限）；相对力达到接触阈值的 50% 即冻结视觉修正。视觉绝不改变 Z 向下探距离。相对力首次达到 2 N 都会停止向下；目标真正连续丢失仍会停止并进入安全恢复。接触力 ≤2 N 时保持当前位置直接闭爪；仅接触力 >2 N 才最多上提 15 mm，并在相对力连续 3 帧 ≤2 N 后闭爪。未触发接触或未能卸力均拒绝闭爪；
+5. Omnipicker 先向 `0 rad` 收拢以测得本次铰链的卡住角度；角度稳定 0.5 秒（变化 ≤0.005 rad）后，仅从该角度再闭合 0.03 rad。随后先以 `base_link +Z` 上抬 20 mm，并连续比较同一 YOLO 实例的像素中心和掩膜面积：若它未随夹爪移动，则张爪、回到视觉对准并重新抓取；验证通过后，`--full-cycle` 会持续锁定并监控该同一实例完成 150 mm 上抬，且必须取得一帧新的健康观测才会请求 P4。P4 请求前掉件会张爪并重新抓取；P4 预设运动期间不消费视觉结果，只保持夹爪闭合并轮询实际关节到位，避免快速运动造成几何误报；P4 到位后按现有流程结束，当前阶段不会在 P4 运动中自动重抓。
 
-完整抓取先以 GDK `left_end_state` 确认左 Omnipicker 已张开至配置的 `-0.58875 rad`（机械最大张开量的 75%）附近，才允许开始视觉伺服；单次 GDK 接口调用成功不再被视为张开成功。若 6 秒内未收到符合容差的反馈，流程在 P3 停止，不会下探或闭爪。
+完整抓取先以 GDK `left_end_state` 确认左 Omnipicker 已张开至配置的 `-0.51025 rad`（机械最大张开量的 65%）附近，才允许开始视觉伺服；单次 GDK 接口调用成功不再被视为张开成功。若 6 秒内未收到符合容差的反馈，流程在 P3 停止，不会下探或闭爪。
 
 受看护的 `--stop-after xy` 与 `--stop-after descend` 不会改变夹爪状态；只有完整且已标定的抓取流程才会先张开夹爪。
 
@@ -268,7 +302,7 @@ python3 g2_adapter/derive_left_xy_mapping.py \
 不得改用带固定额外旋转的 `gripper_l_base_link`。
 
 其中所有物理量必须为 G2 实测值，不能复制 OpenArm 的值。左 Omnipicker 已实测为
-**机械最大张开 `-0.785 rad`、机械全闭合 `0.0 rad`**；当前运行时张开目标为 **75% (`-0.58875 rad`)**，以避开周围铰链。配置不再包含固定 `close_rad`。实际夹紧角度由每次闭合的稳定卡住角度加 `0.03 rad` 得出。配置中的 `target_pixel_px`
+**机械最大张开 `-0.785 rad`、机械全闭合 `0.0 rad`**；当前运行时张开目标为 **65% (`-0.51025 rad`)**，以避开周围铰链。配置不再包含固定 `close_rad`。实际夹紧角度由每次闭合的稳定卡住角度加 `0.03 rad` 得出。配置中的 `target_pixel_px`
 必须在“夹爪将要最终下探”的实际姿态读取，它是目标在左 D405 图像中的中心（视觉伺服的抓取参考点）。
 `pre_descent_*` 为兼容旧配置保留，不参与竖直运动决策；G2 基座坐标为 `+X` 前、`+Y` 左、`+Z` 上。完整抓取仅当这些值已实测且
 `calibrated=true` 后，`--allow-motion` 才会被接受。
