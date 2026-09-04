@@ -35,6 +35,52 @@ def intrinsic_to_dict(intrinsic, *, width: int, height: int) -> dict[str, float 
     }
 
 
+def rescale_intrinsic_to_image(
+    intrinsic: dict,
+    *,
+    calibration_width: int,
+    calibration_height: int,
+    image_width: int,
+    image_height: int,
+) -> dict[str, float | int | list[float]]:
+    """Express a calibration matrix in the pixel grid of an image stream.
+
+    This is only valid when the caller has independently verified that the
+    reported calibration belongs to a different native resolution.  It is
+    deliberately opt-in: equal color/depth array shapes do not prove that a
+    scale is required.  Scaling the focal lengths and principal point is the
+    only operation; Brown-Conrady distortion coefficients are dimensionless
+    and are kept unchanged.  The returned mapping is a copy and never mutates
+    the GDK metadata held by the caller.
+    """
+    try:
+        calibration_width = int(calibration_width)
+        calibration_height = int(calibration_height)
+        image_width = int(image_width)
+        image_height = int(image_height)
+    except (TypeError, ValueError) as exc:
+        raise CameraError("intrinsic calibration/image sizes must be integers") from exc
+    if min(calibration_width, calibration_height, image_width, image_height) <= 0:
+        raise CameraError("intrinsic calibration/image sizes must be positive")
+    scale_x = float(image_width) / float(calibration_width)
+    scale_y = float(image_height) / float(calibration_height)
+    result = dict(intrinsic)
+    for key in ("fx", "fy", "ppx", "ppy"):
+        try:
+            value = float(intrinsic[key])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise CameraError(f"intrinsic is missing finite {key}") from exc
+        if not np.isfinite(value):
+            raise CameraError(f"intrinsic {key} must be finite")
+    result["fx"] = float(intrinsic["fx"]) * scale_x
+    result["fy"] = float(intrinsic["fy"]) * scale_y
+    result["ppx"] = float(intrinsic["ppx"]) * scale_x
+    result["ppy"] = float(intrinsic["ppy"]) * scale_y
+    result["width"] = image_width
+    result["height"] = image_height
+    return result
+
+
 def transform_to_dict(transform) -> dict[str, list[float]]:
     """Return a GDK Transform as JSON-friendly translation and quaternion data."""
     return {
@@ -237,13 +283,15 @@ def depth_on_color_grid(
     color_intrinsic: dict,
     depth_to_color: dict | None,
     depth_scale_m: float = 0.001,
+    depth_calibration_size: tuple[int, int] | None = None,
 ) -> np.ndarray:
     """Return a depth image whose pixels can be indexed by color detections.
 
-    ``registered_same_pixel`` is intentionally explicit: it is for GDK streams
-    that already publish depth on the color image grid.  Equal array shapes are
-    checked, but are not treated as proof of registration by this helper.  The
-    caller must select the mode only after a read-only registration check.
+    ``registered_same_pixel`` is intentionally explicit and is only for a
+    stream that has been independently verified to be registered.  Equal array
+    shapes are checked, but are not treated as proof of registration.  When
+    ``depth_calibration_size`` is supplied for ``reproject``, the raw depth
+    calibration is first expressed in the raw depth array's pixel domain.
     """
     if registration_mode == "registered_same_pixel":
         if depth_u16.dtype != np.uint16 or depth_u16.ndim != 2:
@@ -263,6 +311,20 @@ def depth_on_color_grid(
     if registration_mode == "reproject":
         if depth_to_color is None:
             raise CameraError("reproject mode requires a depth_to_color transform")
+        if depth_calibration_size is not None:
+            try:
+                calibration_width, calibration_height = depth_calibration_size
+            except (TypeError, ValueError) as exc:
+                raise CameraError(
+                    "depth_calibration_size must be (width, height)"
+                ) from exc
+            depth_intrinsic = rescale_intrinsic_to_image(
+                depth_intrinsic,
+                calibration_width=calibration_width,
+                calibration_height=calibration_height,
+                image_width=int(depth_u16.shape[1]),
+                image_height=int(depth_u16.shape[0]),
+            )
         return align_depth_to_color(
             depth_u16,
             depth_intrinsic=depth_intrinsic,

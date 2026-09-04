@@ -31,6 +31,14 @@ except ImportError:
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_MODEL = PROJECT_ROOT / "models" / "hole_target_det_v2" / "best.pt"
+# GDK returns intrinsics in the pixel domain used by the published depth
+# frame.  Do not infer a 640x480 source mode from fx/cx alone: the current
+# hand-depth packet is 1280x1056 and an invented scale produces visible global
+# RGB/depth mis-registration.  An explicit CLI value remains available for a
+# separately verified stream.
+DEFAULT_DEPTH_CALIBRATION_SIZE = None
+DEPTH_DISPLAY_MIN_M = 0.03
+DEPTH_DISPLAY_MAX_M = 2.0
 
 
 def parse_args() -> argparse.Namespace:
@@ -49,7 +57,14 @@ def parse_args() -> argparse.Namespace:
         "--depth-registration",
         choices=("reproject", "registered_same_pixel"),
         default="reproject",
-        help="深度坐标模式；registered_same_pixel 直接按 RGB 框同像素取样",
+        help="深度坐标模式；reproject=按官方外参与深度内参重投影（默认），registered_same_pixel=仅用于对比诊断",
+    )
+    parser.add_argument(
+        "--depth-calibration-size",
+        type=_parse_depth_calibration_size,
+        default=DEFAULT_DEPTH_CALIBRATION_SIZE,
+        metavar="WIDTHxHEIGHT",
+        help="仅在已确认内参属于另一分辨率时指定原生标定尺寸；默认直接使用 GDK 内参",
     )
     parser.add_argument(
         "--depth-region",
@@ -58,6 +73,20 @@ def parse_args() -> argparse.Namespace:
         help="孔深度采样区域；box 使用检测框内全部有效像素",
     )
     return parser.parse_args()
+
+
+def _parse_depth_calibration_size(value: str) -> tuple[int, int]:
+    import re
+
+    match = re.fullmatch(r"\s*(\d+)\s*[xX,; ]\s*(\d+)\s*", value or "")
+    if match is None:
+        raise argparse.ArgumentTypeError(
+            "--depth-calibration-size 必须是 WIDTHxHEIGHT，例如 640x480"
+        )
+    width, height = (int(item) for item in match.groups())
+    if width <= 0 or height <= 0:
+        raise argparse.ArgumentTypeError("--depth-calibration-size 必须为正整数")
+    return width, height
 
 
 def _depth_summary(depth_u16: np.ndarray) -> dict:
@@ -78,20 +107,29 @@ def _depth_summary(depth_u16: np.ndarray) -> dict:
 def _local_depth_stats(depth_u16: np.ndarray, center_px: tuple[float, float] | None) -> dict:
     depth = np.asarray(depth_u16)
     if center_px is None:
-        return {"center_px": None, "nearest_nonzero": None, "radius_counts": {}}
+        return {"center_px": None, "nearest_nonzero": None, "nearest_in_range": None, "radius_counts": {}}
     cx, cy = (float(center_px[0]), float(center_px[1]))
-    rows, cols = np.nonzero(depth > 0)
-    nearest = None
-    if rows.size:
+    yy, xx = np.mgrid[: depth.shape[0], : depth.shape[1]]
+    distance_sq = (xx - cx) ** 2 + (yy - cy) ** 2
+
+    def nearest_depth(mask: np.ndarray) -> dict | None:
+        rows, cols = np.nonzero(mask)
+        if not rows.size:
+            return None
         distances = (cols.astype(np.float64) - cx) ** 2 + (rows.astype(np.float64) - cy) ** 2
         index = int(np.argmin(distances))
-        nearest = {
+        return {
             "px": [int(cols[index]), int(rows[index])],
             "distance_px": round(float(math.sqrt(float(distances[index]))), 2),
             "depth_m": round(float(depth[rows[index], cols[index]]) * 0.001, 4),
         }
-    yy, xx = np.mgrid[: depth.shape[0], : depth.shape[1]]
-    distance_sq = (xx - cx) ** 2 + (yy - cy) ** 2
+
+    nearest = nearest_depth(depth > 0)
+    nearest_in_range = nearest_depth(
+        (depth > 0)
+        & (depth >= DEPTH_DISPLAY_MIN_M * 1000.0)
+        & (depth <= DEPTH_DISPLAY_MAX_M * 1000.0)
+    )
     radius_counts = {
         str(radius): int(np.count_nonzero((distance_sq <= float(radius * radius)) & (depth > 0)))
         for radius in (16, 32, 64, 128, 256, 400)
@@ -99,6 +137,7 @@ def _local_depth_stats(depth_u16: np.ndarray, center_px: tuple[float, float] | N
     return {
         "center_px": [round(cx, 1), round(cy, 1)],
         "nearest_nonzero": nearest,
+        "nearest_in_range": nearest_in_range,
         "radius_counts": radius_counts,
     }
 
@@ -117,15 +156,35 @@ def _tile_valid_counts(depth_u16: np.ndarray, tiles: int = 8) -> list[list[int]]
     return result
 
 
-def _overlay(frame_bgr: np.ndarray, aligned_depth: np.ndarray, hole, diagnostic: dict) -> np.ndarray:
+def _overlay(frame_bgr: np.ndarray, raw_depth: np.ndarray, hole, diagnostic: dict) -> np.ndarray:
+    """Show RGB and the raw depth frame directly overlaid, pixel-for-pixel.
+
+    This image is intentionally independent of the geometry path: no
+    reproject, intrinsic scaling, resize, or fixed offset is applied. The
+    saved overlay answers only whether the two GDK arrays are already in the
+    same pixel grid.
+    """
     image = frame_bgr.copy()
-    valid = aligned_depth > 0
+    depth = np.asarray(raw_depth)
+    if depth.ndim != 2 or depth.shape[:2] != image.shape[:2]:
+        cv2.putText(image, "RAW DEPTH SIZE MISMATCH (NO RESIZE)", (10, 112), cv2.FONT_HERSHEY_SIMPLEX, 0.60, (0, 0, 255), 2, cv2.LINE_AA)
+        return image
+    depth_float = depth.astype(np.float32)
+    valid = (
+        (depth > 0)
+        & (depth_float >= DEPTH_DISPLAY_MIN_M * 1000.0)
+        & (depth_float <= DEPTH_DISPLAY_MAX_M * 1000.0)
+    )
     if np.any(valid):
-        depth_view = np.zeros_like(aligned_depth, dtype=np.uint8)
-        valid_values = aligned_depth[valid].astype(np.float32)
-        low, high = np.percentile(valid_values, [2.0, 98.0])
-        high = max(high, low + 1.0)
-        depth_view[valid] = np.clip((valid_values - low) * 255.0 / (high - low), 0.0, 255.0).astype(np.uint8)
+        depth_view = np.zeros_like(depth, dtype=np.uint8)
+        valid_values = depth[valid].astype(np.float32)
+        depth_view[valid] = np.clip(
+            (valid_values - DEPTH_DISPLAY_MIN_M * 1000.0)
+            * 255.0
+            / ((DEPTH_DISPLAY_MAX_M - DEPTH_DISPLAY_MIN_M) * 1000.0),
+            0.0,
+            255.0,
+        ).astype(np.uint8)
         depth_color = cv2.applyColorMap(depth_view, cv2.COLORMAP_TURBO)
         image[valid] = cv2.addWeighted(image[valid], 0.45, depth_color[valid], 0.55, 0.0)
     if hole is not None:
@@ -134,10 +193,11 @@ def _overlay(frame_bgr: np.ndarray, aligned_depth: np.ndarray, hole, diagnostic:
         cx, cy = (int(round(value)) for value in hole.center_px)
         cv2.drawMarker(image, (cx, cy), (255, 255, 255), cv2.MARKER_CROSS, 20, 2, cv2.LINE_AA)
         cv2.putText(image, "LOCKED HOLE", (max(8, x0), max(24, y0 - 10)), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
-    cv2.putText(image, f"aligned valid={diagnostic['aligned_depth']['valid_pixels']}", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
-    if diagnostic["local_depth"]["nearest_nonzero"] is not None:
-        distance = diagnostic["local_depth"]["nearest_nonzero"]["distance_px"]
-        cv2.putText(image, f"nearest depth={distance:.1f}px", (10, 58), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+    cv2.putText(image, "RGB + RAW DEPTH (SAME PIXEL)", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+    nearest = diagnostic["local_depth"].get("nearest_in_range")
+    if nearest is not None:
+        distance = nearest["distance_px"]
+        cv2.putText(image, f"nearest valid depth={distance:.1f}px", (10, 58), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
     return image
 
 
@@ -192,6 +252,7 @@ def main() -> int:
                 depth_intrinsic=depth_intrinsic,
                 color_intrinsic=color_intrinsic,
                 depth_to_color=depth_to_color,
+                depth_calibration_size=args.depth_calibration_size,
             )
             crop, offset = center_crop(frame_bgr, args.right_crop_percent)
             detections = [translate_detection(item, offset) for item in infer_detection(model, crop, confidence=args.confidence, iou=args.iou, imgsz=args.imgsz, device=args.device)]
@@ -245,13 +306,14 @@ def main() -> int:
             cv2.imwrite(str(prefix.with_name(prefix.name + "_color.jpg")), frame_bgr)
             cv2.imwrite(str(prefix.with_name(prefix.name + "_depth_raw_u16.png")), depth_u16)
             cv2.imwrite(str(prefix.with_name(prefix.name + "_depth_aligned_u16.png")), aligned_depth)
-            cv2.imwrite(str(prefix.with_name(prefix.name + "_overlay.jpg")), _overlay(frame_bgr, aligned_depth, hole, diagnostic))
+            cv2.imwrite(str(prefix.with_name(prefix.name + "_overlay.jpg")), _overlay(frame_bgr, depth_u16, hole, diagnostic))
             reports.append(diagnostic)
         report = {
             "event": "right_rgbd_hole_diagnostic",
             "captured_at_utc": datetime.now(timezone.utc).isoformat(),
             "model": str(model_path),
             "depth_registration": args.depth_registration,
+            "depth_calibration_size": None if args.depth_calibration_size is None else list(args.depth_calibration_size),
             "depth_region": args.depth_region,
             "right_crop_percent": args.right_crop_percent,
             "color_intrinsic": color_intrinsic,

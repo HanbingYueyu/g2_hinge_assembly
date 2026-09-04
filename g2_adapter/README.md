@@ -77,13 +77,16 @@ cd /home/flyfuture/traditional_auto_flow_g2_migration && \
 绑定至公网地址。`--browser-fps` 默认是 4，可按设备负载降低。
 鼠标悬停在任一深度图上可实时读取该像素的 Z16 深度（米）。
 
-右手 RGB-D 诊断默认使用 `--depth-registration reproject`：按 GDK 的
-`kRightHandDepthToRightHandColor` 和两套内参把原始深度投影到右彩色图网格。
-当前这台 G2 实测两路尺寸同为 `1280×1056`，但两套内参不同，因此尺寸相等本身不是注册证明；
-只有已单独确认 GDK 输出已经注册到彩色网格时，才可使用 `registered_same_pixel`，不能把深度内参
-直接套在彩色像素上。
-该模式必须先只读验证；接入 direct 运动时还必须额外提供
-`--approve-registered-depth-motion`，不能在未确认注册语义前直接用于运动。
+右手 RGB-D 诊断默认使用 `--depth-registration reproject`：先使用 GDK 返回的右手深度内参
+和 `kRightHandDepthToRightHandColor` 外参，把深度点重投影到彩色网格。虽然当前两路数组均为
+`1280×1056`，不能仅凭 `fx/cx` 推断深度来自 `640×480`，也不能擅自按比例放大内参；这种
+未验证的缩放会造成明显的全局错位。只有确认某个数据流的内参确实属于另一分辨率时，才显式
+传入 `--depth-calibration-size WIDTHxHEIGHT`。`--depth-registration registered_same_pixel`
+仅保留作对比诊断，不得用于真实运动。
+开启 `--depth-overlay` 时，网页右手画面只把原始深度帧按同一像素直接叠加到 RGB，
+不使用外参、内参缩放、重投影或固定偏移；该叠加仅用于判断 GDK 两路图像是否原生对齐，
+不代表几何计算使用的深度图。
+接入 direct 运动时仍必须先只读验证，并提供 `--approve-rgbd-direct-motion`。
 
 默认 GDK Python binding 使用官方 Python 3.10。若已执行
 `scripts/build_gdk_py312.sh`，可用 `scripts/run_gdk_sam3_python.sh` 在同一 Python 3.12

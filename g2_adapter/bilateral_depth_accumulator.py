@@ -9,9 +9,9 @@ from dataclasses import dataclass
 import numpy as np
 
 try:
-    from .bilateral_rgbd_geometry import hole_ring_depth_support
+    from .bilateral_rgbd_geometry import hole_box_depth_support, hole_ring_depth_support
 except ImportError:
-    from bilateral_rgbd_geometry import hole_ring_depth_support
+    from bilateral_rgbd_geometry import hole_box_depth_support, hole_ring_depth_support
 
 
 @dataclass(frozen=True)
@@ -38,6 +38,7 @@ class FreshHoleDepthAccumulator:
         admission_min_depth_m: float = 0.03,
         admission_max_depth_m: float = 2.0,
         admission_depth_scale_m: float = 0.001,
+        sampling_region: str = "ring",
     ) -> None:
         if window_frames < 1 or min_temporal_hits < 1 or min_temporal_hits > window_frames:
             raise ValueError("invalid temporal depth window size")
@@ -57,6 +58,8 @@ class FreshHoleDepthAccumulator:
             raise ValueError("admission depth range is invalid")
         if not math.isfinite(admission_depth_scale_m) or admission_depth_scale_m <= 0.0:
             raise ValueError("admission_depth_scale_m must be positive and finite")
+        if sampling_region not in {"ring", "box"}:
+            raise ValueError("sampling_region must be 'ring' or 'box'")
         self.window_frames = int(window_frames)
         self.min_temporal_hits = int(min_temporal_hits)
         self.max_window_ms = float(max_window_ms)
@@ -68,6 +71,7 @@ class FreshHoleDepthAccumulator:
         self.admission_min_depth_m = float(admission_min_depth_m)
         self.admission_max_depth_m = float(admission_max_depth_m)
         self.admission_depth_scale_m = float(admission_depth_scale_m)
+        self.sampling_region = str(sampling_region)
         self._samples: list[tuple[int, tuple[float, float, float, float], np.ndarray]] = []
         self._shape: tuple[int, int] | None = None
         self._last_reset_reason: str | None = None
@@ -131,11 +135,15 @@ class FreshHoleDepthAccumulator:
             diagnostics["reason"] = reason
         if support is not None:
             diagnostics.update({
-                "frame_ring_pixels": support["ring_pixels"],
+                "frame_depth_region": self.sampling_region,
                 "frame_raw_valid_pixels": support["raw_valid_pixels"],
                 "frame_valid_pixels": support["valid_pixels"],
                 "frame_support_fraction": round(float(support["support_fraction"]), 4),
             })
+            if self.sampling_region == "box":
+                diagnostics["frame_box_pixels"] = support["box_pixels"]
+            else:
+                diagnostics["frame_ring_pixels"] = support["ring_pixels"]
         return diagnostics
 
     def add(
@@ -163,13 +171,22 @@ class FreshHoleDepthAccumulator:
             self.reset("hole_box_unstable_reset")
         if self._samples and timestamp - self._samples[0][0] > int(self.max_window_ms * 1_000_000.0):
             self.reset("hole_depth_window_stale")
-        support = hole_ring_depth_support(
-            depth,
-            box,
-            depth_scale_m=self.admission_depth_scale_m,
-            min_depth_m=self.admission_min_depth_m,
-            max_depth_m=self.admission_max_depth_m,
-        )
+        if self.sampling_region == "box":
+            support = hole_box_depth_support(
+                depth,
+                box,
+                depth_scale_m=self.admission_depth_scale_m,
+                min_depth_m=self.admission_min_depth_m,
+                max_depth_m=self.admission_max_depth_m,
+            )
+        else:
+            support = hole_ring_depth_support(
+                depth,
+                box,
+                depth_scale_m=self.admission_depth_scale_m,
+                min_depth_m=self.admission_min_depth_m,
+                max_depth_m=self.admission_max_depth_m,
+            )
         if (
             int(support["valid_pixels"]) < self.admission_min_valid_pixels
             or float(support["support_fraction"]) < self.admission_min_support_fraction

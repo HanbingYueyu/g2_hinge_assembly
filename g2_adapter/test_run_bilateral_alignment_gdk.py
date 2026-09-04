@@ -8,10 +8,12 @@ from control import CartesianPoseTarget
 from run_bilateral_alignment_gdk import (
     compact_frame,
     can_accumulate_hole_depth,
+    draw_registered_depth_overlay,
     emit_terminal_record,
     infer_left_target_boxes,
     left_target_from_offset,
     parse_depth_scales,
+    parse_depth_calibration_size,
     parse_jacobian,
     terminal_summary,
 )
@@ -72,6 +74,12 @@ class BilateralRunnerPureTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             parse_depth_scales("1.5,1.25")
 
+    def test_parse_depth_calibration_size(self):
+        self.assertEqual(parse_depth_calibration_size("640x480"), (640, 480))
+        self.assertEqual(parse_depth_calibration_size("640, 480"), (640, 480))
+        with self.assertRaises(ValueError):
+            parse_depth_calibration_size("1280x")
+
     def test_left_target_preserves_z_and_orientation(self):
         initial = CartesianPoseTarget((0.4, -0.2, 0.8), (0.1, 0.2, 0.3, 0.9))
         target = left_target_from_offset(initial, (0.001, -0.002, 0.0))
@@ -88,6 +96,29 @@ class BilateralRunnerPureTests(unittest.TestCase):
         self.assertNotIn("image", compact)
         self.assertNotIn("masks", compact)
         self.assertEqual(compact["state"], "hold")
+
+    def test_registered_depth_overlay_keeps_invalid_rgb_and_marks_valid_depth(self):
+        frame = np.zeros((4, 5, 3), dtype=np.uint8)
+        depth = np.zeros((4, 5), dtype=np.uint16)
+        depth[1, 2] = 500
+        overlay = draw_registered_depth_overlay(frame, depth)
+        np.testing.assert_array_equal(overlay[0, 0], frame[0, 0])
+        self.assertFalse(np.array_equal(overlay[1, 2], frame[1, 2]))
+
+    def test_registered_depth_overlay_hides_through_hole_background(self):
+        frame = np.zeros((2, 3, 3), dtype=np.uint8)
+        depth = np.zeros((2, 3), dtype=np.uint16)
+        depth[0, 0] = 500
+        depth[0, 1] = 4300
+        overlay = draw_registered_depth_overlay(frame, depth)
+        self.assertFalse(np.array_equal(overlay[0, 0], frame[0, 0]))
+        np.testing.assert_array_equal(overlay[0, 1], frame[0, 1])
+
+    def test_registered_depth_overlay_reports_empty_depth_without_changing_rgb(self):
+        frame = np.full((20, 30, 3), 17, dtype=np.uint8)
+        overlay = draw_registered_depth_overlay(frame, np.zeros((20, 30), dtype=np.uint16))
+        self.assertEqual(overlay.shape, frame.shape)
+        self.assertTrue(np.array_equal(overlay, frame))
 
     def test_terminal_summary_prioritizes_right_hole_camera_xyz(self):
         summary = terminal_summary({

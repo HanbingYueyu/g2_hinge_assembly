@@ -4,7 +4,7 @@ import unittest
 
 import numpy as np
 
-from camera import CameraError, align_depth_to_color, decode_depth_u16, depth_on_color_grid
+from camera import CameraError, align_depth_to_color, decode_depth_u16, depth_on_color_grid, rescale_intrinsic_to_image
 
 
 INTRINSIC = {"fx": 1.0, "fy": 1.0, "ppx": 0.0, "ppy": 0.0, "width": 3, "height": 2}
@@ -12,6 +12,62 @@ IDENTITY = {"translation_m": [0.0, 0.0, 0.0], "rotation_xyzw": [0.0, 0.0, 0.0, 1
 
 
 class CameraAlignmentTests(unittest.TestCase):
+    def test_rescale_intrinsic_to_image_scales_both_axes(self) -> None:
+        intrinsic = {
+            "fx": 395.0,
+            "fy": 396.0,
+            "ppx": 317.0,
+            "ppy": 243.0,
+            "width": 640,
+            "height": 480,
+            "distortion": [0.1, -0.2, 0.0, 0.0],
+        }
+        actual = rescale_intrinsic_to_image(
+            intrinsic,
+            calibration_width=640,
+            calibration_height=480,
+            image_width=1280,
+            image_height=1056,
+        )
+        self.assertEqual(actual["width"], 1280)
+        self.assertEqual(actual["height"], 1056)
+        self.assertEqual(actual["fx"], 790.0)
+        self.assertEqual(actual["fy"], 871.2)
+        self.assertEqual(actual["ppx"], 634.0)
+        self.assertEqual(actual["ppy"], 534.6)
+        self.assertEqual(actual["distortion"], intrinsic["distortion"])
+        self.assertEqual(intrinsic["fx"], 395.0)
+
+    def test_reproject_can_use_depth_calibration_size(self) -> None:
+        depth = np.array([[1000]], dtype=np.uint16)
+        depth_intrinsic = {
+            "fx": 1.0,
+            "fy": 1.0,
+            "ppx": 0.0,
+            "ppy": 0.0,
+            "width": 1,
+            "height": 1,
+        }
+        color_intrinsic = {
+            "fx": 1.0,
+            "fy": 1.0,
+            "ppx": 0.0,
+            "ppy": 0.0,
+            "width": 2,
+            "height": 2,
+        }
+        actual = depth_on_color_grid(
+            depth,
+            registration_mode="reproject",
+            depth_intrinsic=depth_intrinsic,
+            color_intrinsic=color_intrinsic,
+            depth_to_color=IDENTITY,
+            depth_calibration_size=(1, 1),
+        )
+        self.assertEqual(int(actual[0, 0]), 1000)
+        self.assertEqual(int(actual[0, 1]), 0)
+        self.assertEqual(int(actual[1, 0]), 0)
+
     def test_raw_z16_depth_does_not_need_opencv(self) -> None:
         class Encoding:
             PNG = "png"

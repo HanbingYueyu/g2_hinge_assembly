@@ -317,6 +317,49 @@ def hole_ring_depth_support(
     }
 
 
+def hole_box_depth_support(
+    depth_u16: np.ndarray,
+    xyxy: Sequence[float],
+    *,
+    depth_scale_m: float = 0.001,
+    min_depth_m: float = 0.03,
+    max_depth_m: float = 2.0,
+) -> dict[str, float | int]:
+    """Summarize valid depth in every pixel of a detector box.
+
+    A registered/reprojected depth image is commonly sparse at the color
+    pixel grid.  For a hole box, the useful samples are therefore all valid
+    pixels in the box; the center does not need to contain a depth sample.
+    ``support_fraction`` is retained for diagnostics, but callers should use
+    the valid-pixel count as the admission gate for this sparse region.
+    """
+    depth = np.asarray(depth_u16)
+    if depth.ndim != 2 or depth.dtype != np.uint16:
+        raise ValueError("depth_u16 must be a two-dimensional uint16 image")
+    if not math.isfinite(depth_scale_m) or depth_scale_m <= 0.0:
+        raise ValueError("depth_scale_m must be positive and finite")
+    if not math.isfinite(min_depth_m) or not math.isfinite(max_depth_m) or min_depth_m <= 0.0 or max_depth_m < min_depth_m:
+        raise ValueError("depth range is invalid")
+    x0, y0, x1, y1 = _as_vector(xyxy, 4, "xyxy")
+    left = max(0, int(math.floor(x0)))
+    top = max(0, int(math.floor(y0)))
+    right = min(depth.shape[1], int(math.ceil(x1)) + 1)
+    bottom = min(depth.shape[0], int(math.ceil(y1)) + 1)
+    if right <= left or bottom <= top:
+        raise ValueError("xyxy does not intersect the image")
+    patch = depth[top:bottom, left:right]
+    raw_valid = patch[patch > 0]
+    values_m = raw_valid.astype(np.float64) * float(depth_scale_m)
+    valid = values_m[(values_m >= float(min_depth_m)) & (values_m <= float(max_depth_m))]
+    box_area = max(1, int(patch.size))
+    return {
+        "box_pixels": box_area,
+        "raw_valid_pixels": int(raw_valid.size),
+        "valid_pixels": int(valid.size),
+        "support_fraction": float(valid.size / box_area),
+    }
+
+
 def _robust_depth(values_m: np.ndarray, *, max_mad_m: float) -> tuple[float, float, float]:
     values = np.asarray(values_m, dtype=np.float64)
     if values.size == 0 or not np.all(np.isfinite(values)):

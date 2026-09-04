@@ -45,7 +45,7 @@ try:
         MetricAlignmentPolicy,
         metric_and_pixel_corrections_agree,
     )
-    from .camera import align_depth_to_color, decode_color_rgb, decode_depth_u16, depth_on_color_grid, intrinsic_to_dict, transform_to_dict
+    from .camera import align_depth_to_color, decode_color_rgb, decode_depth_u16, depth_on_color_grid, intrinsic_to_dict, rescale_intrinsic_to_image, transform_to_dict
     from .control import CartesianPoseTarget, G2Controller
     from .hole_target_detector import (
         BoxDetection,
@@ -70,7 +70,7 @@ except ImportError:
         MetricAlignmentPolicy,
         metric_and_pixel_corrections_agree,
     )
-    from camera import align_depth_to_color, decode_color_rgb, decode_depth_u16, depth_on_color_grid, intrinsic_to_dict, transform_to_dict
+    from camera import align_depth_to_color, decode_color_rgb, decode_depth_u16, depth_on_color_grid, intrinsic_to_dict, rescale_intrinsic_to_image, transform_to_dict
     from control import CartesianPoseTarget, G2Controller
     from hole_target_detector import (
         BoxDetection,
@@ -93,6 +93,15 @@ LEFT_END_LINK = "arm_l_end_link"
 LEFT_HINGE_CLASS_ID = 0
 LEFT_SHAFT_CLASS_ID = 1
 DEFAULT_LEFT_TRACK_MAX_JUMP_PX = 120.0
+# Use GDK's intrinsics in the published depth-frame pixel domain by default.
+# A 640x480 scale inferred from fx/cx is not verified for this 1280x1056
+# packet and causes a large RGB/depth overlay shift.
+DEFAULT_DEPTH_CALIBRATION_SIZE = None
+# Match the depth range used by the hole geometry estimator.  Values outside
+# this range are usually invalid/through-hole background for the workcell and
+# should not dominate the registration inspection overlay.
+DEPTH_OVERLAY_MIN_M = 0.03
+DEPTH_OVERLAY_MAX_M = 2.0
 
 
 def parse_jacobian(value: str | None) -> list[list[float]] | None:
@@ -117,6 +126,17 @@ def parse_depth_scales(value: str) -> tuple[float, ...]:
     if any(scales[index] > scales[index + 1] for index in range(len(scales) - 1)):
         raise ValueError("--hole-depth-scales 必须按递增顺序填写")
     return scales
+
+
+def parse_depth_calibration_size(value: str) -> tuple[int, int]:
+    """Parse the native depth calibration size used by GDK's D405 intrinsics."""
+    match = re.fullmatch(r"\s*(\d+)\s*[xX,; ]\s*(\d+)\s*", value or "")
+    if match is None:
+        raise ValueError("--depth-calibration-size 必须是 WIDTHxHEIGHT，例如 640x480")
+    width, height = (int(item) for item in match.groups())
+    if width <= 0 or height <= 0:
+        raise ValueError("--depth-calibration-size 必须为正整数")
+    return width, height
 
 
 def can_accumulate_hole_depth(
@@ -473,6 +493,90 @@ def draw_alignment_overlay(
     return image
 
 
+def draw_raw_depth_overlay(
+    frame_bgr,
+    raw_depth,
+    *,
+    min_depth_m: float = DEPTH_OVERLAY_MIN_M,
+    max_depth_m: float = DEPTH_OVERLAY_MAX_M,
+):
+    """Blend the raw depth frame onto RGB at the same pixel indices.
+
+    This is deliberately a display-only diagnostic. It does not call the
+    depth-to-color extrinsic, rescale intrinsics, resize either image, or add a
+    pixel offset. It is therefore the literal RGB/raw-depth overlay requested
+    for checking whether the two GDK streams are already registered.
+    """
+    image = np.asarray(frame_bgr).copy()
+    if raw_depth is None:
+        return image
+    depth = np.asarray(raw_depth)
+    if depth.ndim != 2 or depth.shape[:2] != image.shape[:2]:
+        cv2.putText(
+            image,
+            "RAW DEPTH SIZE MISMATCH (NO RESIZE)",
+            (10, 112),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.60,
+            (0, 0, 255),
+            2,
+            cv2.LINE_AA,
+        )
+        return image
+    if (
+        not math.isfinite(float(min_depth_m))
+        or not math.isfinite(float(max_depth_m))
+        or float(min_depth_m) <= 0.0
+        or float(max_depth_m) < float(min_depth_m)
+    ):
+        return image
+    depth_float = depth.astype(np.float32)
+    valid = (
+        (depth > 0)
+        & (depth_float >= float(min_depth_m) * 1000.0)
+        & (depth_float <= float(max_depth_m) * 1000.0)
+    )
+    if not np.any(valid):
+        cv2.putText(
+            image,
+            "RAW DEPTH: NO VALID PIXELS (0.03-2.0m)",
+            (10, 112),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.60,
+            (0, 0, 255),
+            2,
+            cv2.LINE_AA,
+        )
+        return image
+    values = depth[valid].astype(np.float32)
+    low, high = np.percentile(values, [2.0, 98.0])
+    high = max(float(high), float(low) + 1.0)
+    depth_view = np.zeros(depth.shape, dtype=np.uint8)
+    depth_view[valid] = np.clip(
+        (values - float(low)) * 255.0 / (float(high) - float(low)),
+        0.0,
+        255.0,
+    ).astype(np.uint8)
+    depth_color = cv2.applyColorMap(depth_view, cv2.COLORMAP_TURBO)
+    image[valid] = cv2.addWeighted(image[valid], 0.45, depth_color[valid], 0.55, 0.0)
+    cv2.putText(
+        image,
+        "RGB + RAW DEPTH (SAME PIXEL)",
+        (10, 112),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.60,
+        (255, 255, 255),
+        2,
+        cv2.LINE_AA,
+    )
+    return image
+
+
+# Backward-compatible import name for existing tests/tools. The display path
+# now intentionally uses the raw same-pixel overlay above.
+draw_registered_depth_overlay = draw_raw_depth_overlay
+
+
 def compact_frame(record: dict) -> dict:
     keys = (
         "event", "frame", "utc", "state", "reason", "motion_enabled",
@@ -487,7 +591,7 @@ def compact_frame(record: dict) -> dict:
         "right_tf_lookup_error", "right_transform_chain",
         "right_color_timestamp_ns", "right_depth_timestamp_ns", "right_rgbd_skew_ms",
         "hole_depth_support", "hole_depth_stats", "target_depth_support", "left_tf_timestamp_ns", "geometry_agrees",
-        "right_depth_registration", "hole_depth_region",
+        "right_depth_registration", "depth_calibration_size", "hole_depth_region",
         "requested_delta_m", "accepted_delta_m", "cumulative_offset_m",
         "cumulative_distance_m", "step_index", "p4_verified", "gripper_verified",
         "left_start_precondition_enforced", "right_fixed",
@@ -745,7 +849,14 @@ def main() -> int:
         "--right-depth-registration",
         choices=("reproject", "registered_same_pixel"),
         default="reproject",
-        help="右手深度坐标模式：reproject=按官方外参重投影；registered_same_pixel=GDK 已注册到右彩色网格时直接同像素取样",
+        help="右手深度坐标模式：reproject=按官方深度→彩色外参与内参重投影（默认）；registered_same_pixel=仅用于对比诊断",
+    )
+    parser.add_argument(
+        "--depth-calibration-size",
+        type=parse_depth_calibration_size,
+        default=DEFAULT_DEPTH_CALIBRATION_SIZE,
+        metavar="WIDTHxHEIGHT",
+        help="仅在已确认内参属于另一分辨率时指定原生标定尺寸；默认直接使用 GDK 内参",
     )
     parser.add_argument(
         "--geometry-mode",
@@ -806,6 +917,11 @@ def main() -> int:
     parser.add_argument("--max-duration-s", type=float, default=0.0, help="单次定位最长运行时间；0 表示持续运行")
     parser.add_argument("--web-host", default="127.0.0.1")
     parser.add_argument("--web-port", type=int, default=8776, help="0 表示关闭网页")
+    parser.add_argument(
+        "--depth-overlay",
+        action="store_true",
+        help="网页右手画面直接叠加原始深度伪彩（同像素，不重投影/缩放），保留 YOLO 框用于核对",
+    )
     parser.add_argument("--log", type=Path, default=None)
     parser.add_argument(
         "--terminal-output",
@@ -941,6 +1057,7 @@ def main() -> int:
         "hole_depth_scales": depth_scales,
         "hole_depth_region": args.hole_depth_region,
         "right_depth_registration": args.right_depth_registration,
+        "depth_calibration_size": None if args.depth_calibration_size is None else list(args.depth_calibration_size),
         "right_point_frame": "right_hand_color_optical_assumed",
         "right_transform_chain": "P_base=T_base_arm_r_end(T_arm_r_end_right_rgbd P_right_color)",
         "right_tf_static_fallback_max_gap_ms": args.right_tf_static_fallback_max_gap_ms,
@@ -1103,6 +1220,9 @@ def main() -> int:
         previous_left_target_px: tuple[float, float] | None = None
         previous_left_hinge_px: tuple[float, float] | None = None
         previous_right_hole_px: tuple[float, float] | None = None
+        hole_depth_min_support = (
+            0.0 if args.hole_depth_region == "box" else args.min_depth_support
+        )
         hole_depth_accumulator = FreshHoleDepthAccumulator(
             window_frames=args.hole_depth_window_frames,
             min_temporal_hits=args.hole_depth_min_temporal_hits,
@@ -1111,7 +1231,11 @@ def main() -> int:
             max_size_change_fraction=args.hole_depth_max_size_change_fraction,
             max_temporal_mad_mm=args.hole_depth_max_temporal_mad_mm,
             admission_min_valid_pixels=args.min_depth_pixels,
-            admission_min_support_fraction=args.min_depth_support,
+            # Reprojected D405 depth is sparse on the color grid. In box
+            # mode, valid-pixel count is the admission gate; requiring 20%
+            # of the detector box would reject usable sparse depth.
+            admission_min_support_fraction=hole_depth_min_support,
+            sampling_region=args.hole_depth_region,
         )
         with log_path.open("a", encoding="utf-8") as log:
             log_record(log, {
@@ -1135,7 +1259,7 @@ def main() -> int:
                 "hole_depth_min_temporal_hits": args.hole_depth_min_temporal_hits,
                 "hole_depth_max_temporal_mad_mm": args.hole_depth_max_temporal_mad_mm,
                 "hole_depth_admission_min_valid_pixels": args.min_depth_pixels,
-                "hole_depth_admission_min_support_fraction": args.min_depth_support,
+                "hole_depth_admission_min_support_fraction": hole_depth_min_support,
                 "max_duration_s": args.max_duration_s,
                 "right_premove": None if args.skip_right_premove else args.right_preset,
                 "right_fixed": True, "pixel_jacobian": jacobian,
@@ -1200,6 +1324,7 @@ def main() -> int:
                     break
 
                 aligned_depth = None
+                raw_right_depth = None
                 depth_timestamp = None
                 geometry_reason = geometry_startup_error
                 right_end_to_base = None
@@ -1223,6 +1348,9 @@ def main() -> int:
                         frame_record["right_depth_timestamp_ns"] = depth_timestamp
                         frame_record["right_rgbd_skew_ms"] = abs(depth_timestamp - camera_timestamp) / 1_000_000.0
                         depth_u16 = decode_depth_u16(depth_image, agibot_gdk)
+                        # Keep the unmodified depth frame for the diagnostic
+                        # overlay; geometry continues to use aligned_depth.
+                        raw_right_depth = depth_u16
                         if color_intrinsic is None:
                             color_intrinsic = intrinsic_to_dict(
                                 camera.get_camera_intrinsic(color_type),
@@ -1241,6 +1369,7 @@ def main() -> int:
                             depth_intrinsic=depth_intrinsic,
                             color_intrinsic=color_intrinsic,
                             depth_to_color=depth_to_color,
+                            depth_calibration_size=args.depth_calibration_size,
                         )
                         try:
                             right_end_to_base, tf_timestamp, right_tf_info = transform_to_base_at_with_info(
@@ -1296,9 +1425,19 @@ def main() -> int:
                             )
                         if left_depth_to_color is None or left_rgbd_to_end is None:
                             raise RuntimeError("official_left_rgbd_calibration_unavailable")
+                        if args.depth_calibration_size is None:
+                            left_depth_intrinsic_for_projection = left_depth_intrinsic
+                        else:
+                            left_depth_intrinsic_for_projection = rescale_intrinsic_to_image(
+                                left_depth_intrinsic,
+                                calibration_width=args.depth_calibration_size[0],
+                                calibration_height=args.depth_calibration_size[1],
+                                image_width=int(left_depth_u16.shape[1]),
+                                image_height=int(left_depth_u16.shape[0]),
+                            )
                         left_aligned_depth = align_depth_to_color(
                             left_depth_u16,
-                            depth_intrinsic=left_depth_intrinsic,
+                            depth_intrinsic=left_depth_intrinsic_for_projection,
                             color_intrinsic=left_color_intrinsic,
                             depth_to_color=left_depth_to_color,
                         )
@@ -1372,8 +1511,12 @@ def main() -> int:
                             min_valid_pixels=1,
                             min_support_fraction=0.0,
                             min_covered_sectors=1,
-                            max_mad_m=args.max_depth_mad_mm / 1000.0,
-                            sampling_region="box",
+                            # This is display-only single-frame XYZ. Do not
+                            # let the temporal/motion noise threshold hide a
+                            # usable sparse sample; the multi-frame window
+                            # below remains the safety gate for motion.
+                            max_mad_m=0.20,
+                            sampling_region=args.hole_depth_region,
                         )
                         right_hole_xyz_preview = preview_depth.point_color_m
                     except Exception:
@@ -1522,6 +1665,10 @@ def main() -> int:
                 )
                 frame_record["geometry_mode"] = args.geometry_mode
                 frame_record["right_depth_registration"] = args.right_depth_registration
+                frame_record["depth_calibration_size"] = (
+                    None if args.depth_calibration_size is None
+                    else list(args.depth_calibration_size)
+                )
                 frame_record["hole_depth_region"] = args.hole_depth_region
                 frame_record["right_transform_chain"] = "P_base=T_base_arm_r_end(T_arm_r_end_right_rgbd P_right_color)"
                 if geometry_reason:
@@ -1572,7 +1719,7 @@ def main() -> int:
                             guard_xyxy=right_crop_guard,
                             max_padding_px=args.hole_depth_max_padding_px,
                             min_valid_pixels=args.min_depth_pixels,
-                            min_support_fraction=args.min_depth_support,
+                            min_support_fraction=hole_depth_min_support,
                             min_covered_sectors=args.hole_depth_min_covered_sectors,
                             max_mad_m=args.max_depth_mad_mm / 1000.0,
                             sampling_region=args.hole_depth_region,
@@ -1773,8 +1920,13 @@ def main() -> int:
                 elif decision is not None and decision.state == "aligned":
                     aligned = True
 
+                right_display_frame = (
+                    draw_raw_depth_overlay(frame_bgr, raw_right_depth)
+                    if args.depth_overlay
+                    else frame_bgr
+                )
                 right_overlay = draw_alignment_overlay(
-                    frame_bgr,
+                    right_display_frame,
                     detections,
                     {},
                     frame_record.get("state", last_state),

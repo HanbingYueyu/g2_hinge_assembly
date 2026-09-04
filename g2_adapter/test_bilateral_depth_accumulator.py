@@ -31,6 +31,28 @@ class FreshHoleDepthAccumulatorTests(unittest.TestCase):
         self.assertEqual(result.diagnostics["frame_raw_valid_pixels"], 1)
         self.assertEqual(result.diagnostics["window_frames"], 0)
 
+    def test_box_admission_uses_box_pixels_not_ring(self):
+        accumulator = FreshHoleDepthAccumulator(
+            window_frames=2,
+            min_temporal_hits=1,
+            admission_min_valid_pixels=1,
+            admission_min_support_fraction=0.0,
+            sampling_region="box",
+        )
+        depth = np.zeros((80, 80), dtype=np.uint16)
+        # The valid sample is in the box center, which is deliberately
+        # excluded by the hole ring mask.
+        depth[50, 50] = 500
+        box = (40.0, 40.0, 60.0, 60.0)
+        first = accumulator.add(depth, 1_000_000_000, box)
+        self.assertIsNone(first.depth_u16)
+        self.assertEqual(first.diagnostics["frame_depth_region"], "box")
+        self.assertEqual(first.diagnostics["frame_box_pixels"], 441)
+        self.assertEqual(first.diagnostics["frame_valid_pixels"], 1)
+        self.assertEqual(first.diagnostics["window_frames"], 1)
+        second = accumulator.add(depth, 1_100_000_000, box)
+        self.assertIsNotNone(second.depth_u16)
+
     def test_stale_window_resets_even_when_current_frame_is_skipped(self):
         accumulator = FreshHoleDepthAccumulator(window_frames=3, max_window_ms=500.0)
         box = (40.0, 40.0, 60.0, 60.0)
