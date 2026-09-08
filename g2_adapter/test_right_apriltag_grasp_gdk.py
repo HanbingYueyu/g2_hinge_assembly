@@ -12,15 +12,20 @@ from unittest.mock import Mock
 
 
 class ManualFinishTests(unittest.TestCase):
-    def test_facing_distance_preserves_grasp_and_orientation(self):
-        from right_apriltag_grasp_gdk import facing_distance_targets
+    def test_facing_distance_aligns_red_center_in_base_frame(self):
+        from right_apriltag_grasp_gdk import facing_distance_targets, RED_GRIP_CENTER_M
         from apriltag_workpiece import GraspTargets
         grasp = np.eye(4)
-        original = grasp.copy()
+        grasp[:3, :3] = [[0, 0, 1], [1, 0, 0], [0, 1, 0]]
+        workpiece = np.eye(4)
+        workpiece[:3, :3] = [[0, -1, 0], [1, 0, 0], [0, 0, 1]]
+        workpiece[:3, 3] = [0.5, -0.3, 0.8]
+        center = workpiece[:3, :3] @ RED_GRIP_CENTER_M + workpiece[:3, 3]
         for distance in (10, 100, 300):
-            result = facing_distance_targets(GraspTargets(np.eye(4), grasp, grasp), distance)
-            self.assertAlmostEqual(result.base_from_pregrasp_end[2, 3], -distance / 1000)
-            self.assertTrue(np.array_equal(result.base_from_grasp_end, original))
+            result = facing_distance_targets(GraspTargets(workpiece, grasp, grasp), distance)
+            np.testing.assert_allclose(result.base_from_pregrasp_end[:3, 3] + grasp[:3, 2] * distance / 1000, center)
+            np.testing.assert_allclose(result.base_from_grasp_end[:3, 3], center)
+            np.testing.assert_allclose(result.base_from_pregrasp_end[:3, :3], grasp[:3, :3])
         for distance in (0, 301, float("nan")):
             with self.assertRaises(ValueError):
                 facing_distance_targets(GraspTargets(np.eye(4), grasp, grasp), distance)

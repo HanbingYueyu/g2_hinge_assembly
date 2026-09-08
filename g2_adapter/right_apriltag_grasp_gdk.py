@@ -764,10 +764,16 @@ def horizontal_grasp_targets(targets, right_end_from_tcp):
     return GraspTargets(targets.base_from_workpiece, pregrasp, grasp)
 
 
+# STEP red planar faces #201/#2010, midpoint of their eight vertices (mm → m).
+RED_GRIP_CENTER_M = np.array([0.0, -0.039665062887915, -0.0413136150943175])
+
+
 def facing_distance_targets(targets, distance_mm):
     if not math.isfinite(distance_mm) or not 10 <= distance_mm <= 300:
-        raise ValueError("正对距离必须在 10–300 mm 之间（相对标定抓取点）")
+        raise ValueError("正对距离必须在 10–300 mm 之间（末端原点到红色夹取中心）")
     grasp = np.asarray(targets.base_from_grasp_end).copy()
+    workpiece = np.asarray(targets.base_from_workpiece)
+    grasp[:3, 3] = workpiece[:3, :3] @ RED_GRIP_CENTER_M + workpiece[:3, 3]
     pre = grasp.copy()
     pre[:3, 3] -= grasp[:3, 2] * (distance_mm / 1000.0)
     return GraspTargets(targets.base_from_workpiece, pre, grasp)
@@ -1025,6 +1031,7 @@ def execute_live_autonomous_pregrasp(
     config: dict,
     *,
     shared: SharedView | None = None,
+    face_distance_mm: float | None = None,
 ):
     """Receding-horizon visual servo with a bounded hold/reacquire state.
 
@@ -1145,7 +1152,13 @@ def execute_live_autonomous_pregrasp(
     locked_rotation = np.asarray(first_targets.base_from_pregrasp_end, dtype=np.float64)[:3, :3].copy()
     orientation_candidate = None
     orientation_candidate_count = 0
-    latest_targets = targets_with_locked_orientation(first_targets, locked_rotation)
+    def locked_targets(targets):
+        result = targets_with_locked_orientation(targets, locked_rotation)
+        if face_distance_mm is not None:
+            result = facing_distance_targets(result, face_distance_mm)
+        return result
+
+    latest_targets = locked_targets(first_targets)
     pending_lock = first_lock
     jump_candidate = None
     jump_candidate_count = 0
@@ -1223,7 +1236,7 @@ def execute_live_autonomous_pregrasp(
         else:
             orientation_candidate = None
             orientation_candidate_count = 0
-        return targets_with_locked_orientation(raw_targets, locked_rotation)
+        return locked_targets(raw_targets)
 
     try:
         while motion_steps < max_iterations:
@@ -2008,6 +2021,7 @@ def main() -> int:
                             while True:
                                 execute_live_autonomous_pregrasp(
                                     controller, latest[0], acquire_live_lock, config, shared=shared,
+                                    face_distance_mm=args.face_distance_mm,
                                 )
                                 print(json.dumps({"event": "right_facing_distance_reached", "distance_mm": args.face_distance_mm}), flush=True)
                                 time.sleep(0.10)

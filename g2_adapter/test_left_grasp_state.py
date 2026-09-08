@@ -1,4 +1,5 @@
 import unittest
+from dataclasses import replace
 
 from left_grasp_state import GraspParameters, GraspPhase, LeftGraspState, Observation, requires_calibrated_config
 
@@ -22,6 +23,21 @@ class LeftGraspStateTests(unittest.TestCase):
             final_descent_speed_mps=0.03,
             final_descent_duration_s=0.1,
         )
+
+    def test_coarse_completion_never_requests_descent(self):
+        fine = replace(self.parameters, target_u_px=380)
+        machine = LeftGraspState(fine, self.parameters)
+        for frame in range(3):
+            step = machine.update(observation(), now=frame)
+        self.assertEqual(step.reason, "coarse_xy_complete_wait_step")
+        self.assertEqual(step.phase, GraspPhase.ALIGN_XY)
+        self.assertIsNone(step.base_delta_m)
+        self.assertFalse(machine.coarse_active)
+        self.assertEqual(machine.parameters.target_u_px, 380)
+        self.assertEqual(machine.update(observation(), now=4).reason, "xy_correction")
+        machine.reset_for_regrasp()
+        self.assertTrue(machine.coarse_active)
+        self.assertEqual(machine.parameters.target_u_px, 320)
 
     def test_xy_then_force_guarded_descent_then_grasp(self):
         machine = LeftGraspState(self.parameters)

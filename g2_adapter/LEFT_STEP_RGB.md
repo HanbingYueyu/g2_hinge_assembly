@@ -1,0 +1,93 @@
+# 左手铰链 STEP + RGB 定位与抓取
+
+闭爪后的反馈确认不再经过 STEP 孔位门槛，避免夹爪遮孔阻塞上抬。下探和闭爪阶段的只读视觉监控检查整件目标是否丢失，不要求孔位持续可见；夹爪反馈、抓取验证及搬运监控仍保留。
+
+最终下探阶段固定 XY，不再根据视觉误差横向修正；所有 XY 对准在下探前完成。`--final-descent-visual-servo` 兼容保留为下探视觉监控入口，仍检查目标丢失，力反馈停止与卸力逻辑保持。下探引起的像素位置变化不会再触发横向追踪。
+
+启用 STEP 的流程现在先用原 YOLO/SAM 分割中心和原配置像素基准做水平粗对准，粗对准不要求孔位匹配。到达后切换 STEP 精定位；STEP 未通过时等待，不下探。两阶段均保留小步移动及实际到位等待。日志 `alignment_stage` 为 `coarse_yolo` 或 `fine_step`；粗对准完成显示 `coarse_xy_complete_wait_step`。`--stop-after xy` 等待精对准完成才结束，重抓从粗对准重新开始。原命令无需增加参数。
+
+## 近似夹持中心直接 XY 对准
+
+此模式不需要 `--step-reference`。每帧利用图像时间的 GDK TF，将 STEP 抓取点与近似夹持中心转换到 base_link，计算 XY 偏差；不改变 Z 和姿态。TF 不可用或匹配失败时不提交新修正。
+
+`--step-tcp-end-mm` 是夹持中心相对 `arm_l_end_link` 的 XYZ 估计，默认 `0,0,145` mm 为可调初值，并非从精确闭环求得。`--step-compensation-xy-mm` 是 base_link 下附加到抓取目标的 X/Y 补偿；正 X 向前，正 Y 向左。视觉仅观察工件，TCP 固定误差需要用这些参数调整。
+
+```bash
+cd /home/flyfuture/traditional_auto_flow_g2_migration && \
+./scripts/run_gdk_sam3_python.sh g2_adapter/left_grasp_gdk.py \
+  --step-profile g2_adapter/left_step_profile.json \
+  --step-metric-xy \
+  --step-tcp-end-mm=0,0,145 \
+  --step-compensation-xy-mm=0,0 \
+  --step-xy-tolerance-mm 2 \
+  --yolo-model models/left_d405_hinge_shaft_yolo/best.pt \
+  --selection leftmost --stop-after xy --speed-mm-s 5 \
+  --web-port 8767 --allow-motion
+```
+
+每步最多沿用配置中的 2 mm，实际到位后再计算下一步。对准满意后，将 `--stop-after xy` 换成 `--full-cycle` 执行完整左手流程。未做真机验证。
+
+## URDF 夹持中心核验
+
+只读命令：`./scripts/run_gdk_sam3_python.sh g2_adapter/inspect_left_gripper_urdf.py --opening-rad=-0.51025`。
+输出各 link 相对 `arm_l_end_link` 的变换，以及两处 `loop_joint` 的连接点距离。
+按当前 URDF 的 mimic 系数计算，闭合时残差约 0.572 mm；65% 开度时外侧约 26.142 mm、内侧约 23.593 mm。
+这些是模型闭环约束不一致的残差，不是实测 TCP 误差。不能由此把网格接触面的 FK 中点当成准确 TCP。
+网格位于 `/home/flyfuture/agi/G2_crsB_omnipicker/genie_robot_description_210/meshes/gripper/omnipicker/`。
+精确的闭环夹持中心仍未求得；上面的近似模式使用显式可调 TCP，不能把它当成已验证的 URDF 几何中心。
+
+入口 `run_left_step_rgb.py` 只打开左彩色相机，使用 YOLO 铰链分割区域内的 RGB 孔轮廓估计 STEP 相对相机的位姿。此入口没有运动接口。`left_grasp_gdk.py` 和双手串联入口现已支持显式选择 STEP 目标，必须使用新采集的对准基准。
+
+## 模型准备
+
+`extract_left_step_profile.py` 从 `models/顶铰链.stp` 提取七个孔位，保留源文件 SHA256 和圆柱面实体编号。长圆孔使用两端轴线的中点，孔位高度取模型上侧孔口。原导出的轴线坐标只用于识别孔面，实际几何从新文件重新读取，不依赖旧 STEP 文件。
+
+新文件中红色面 `#14000`、`#14073` 对应两侧夹持区域。取每个面顶点范围的中心，再取两中心的中点作为对称抓取基准：`(-264.678065, 1323.880548, 18.774347) mm`。这是模型坐标，不是机器人坐标，也不是曲面面积重心。配置已生成，可直接运行预览；重新导出模型后可运行下面的提取命令更新。
+
+```bash
+cd /home/flyfuture/traditional_auto_flow_g2_migration
+./scripts/run_gdk_sam3_python.sh g2_adapter/extract_left_step_profile.py \
+  --step models/顶铰链.stp \
+  --output g2_adapter/left_step_profile.json
+
+./scripts/run_gdk_sam3_python.sh g2_adapter/run_left_step_rgb.py \
+  --profile g2_adapter/left_step_profile.json \
+  --web-host 0.0.0.0 --web-port 8777
+```
+
+网页 `http://127.0.0.1:8777`：黄色圆点为候选孔中心，绿色数字为模型孔编号，红十字为模型抓取点投影。JSON 输出 `camera_from_model`、`grasp_xyz_camera_m`、`grasp_pixel_px` 和重投影误差。`accepted=true` 仅表示本帧通过几何拟合，并不代表可以运动。
+
+## 限制与后续接入条件
+
+- 首次至少匹配六孔，优先七孔；锁定后可用至少四个分散孔续跟（`reason=occlusion_tracked`）。通过上一帧位姿预测和双向唯一对应匹配，拒绝拥挤、歧义和跳变，不将四孔作为新目标初始化。不再按失配时长清锁，也不要求定期六孔重新确认；缺失检测时保留历史锁，恢复后仍需通过位置关联和几何检查。没有有效匹配时不提交新运动目标。候选孔不等于已确认孔位。
+- JSON 的 `matched_count` 表示实际匹配孔数，`matched_model_indices` 是模型孔编号；网页绿色编号也保持模型编号，不因缺孔重新编号。
+- 使用相机内参与 OpenCV 畸变参数，平均重投影误差上限 2 px，单点上限 4 px；多解无法区分时拒绝。
+- 金属反光、长圆孔轮廓不完整及透视下椭圆中心偏差会影响精度。必须先用真实相机画面核对拟合；合成测试不能替代现场精度验证。
+- 自动流程使用 STEP 抓取点的图像投影做水平像素伺服，沿用实测像素到 base XY 的局部映射，不把 PnP XYZ 直接作为机器人目标。保留连续帧对准确认和力反馈下探；下探期间丢失 STEP 匹配会触发现有视觉保护。搬运监控仍跟踪整件分割目标。
+- 当前程序没有 `--allow-motion`，不会发出下探或闭爪指令。
+
+离线图像也可使用 `--image image.jpg --intrinsics intrinsics.json --output outputs/left_step/rgb_preview.jpg`；内参必须包含 `fx,fy,ppx,ppy,width,height,distortion`，图像分辨率必须一致。
+
+## 新目标标定与实机测试
+
+先人工把张开的左夹爪对准红色夹持区域，并停在最终下探前的高度。视野内只保留一个可识别铰链，保持机器人和工件静止。停止其他相机预览后采集 20 帧基准（只读，不发运动）：
+
+```bash
+./scripts/run_gdk_sam3_python.sh g2_adapter/run_left_step_rgb.py \
+  --profile g2_adapter/left_step_profile.json \
+  --save-reference g2_adapter/left_step_reference.json \
+  --web-port 8777
+```
+
+首次先做 XY 对准测试，不进入下探：
+
+```bash
+./scripts/run_gdk_sam3_python.sh g2_adapter/left_grasp_gdk.py \
+  --step-profile g2_adapter/left_step_profile.json \
+  --step-reference g2_adapter/left_step_reference.json \
+  --yolo-model models/left_d405_hinge_shaft_yolo/best.pt \
+  --selection leftmost --stop-after xy --speed-mm-s 5 \
+  --web-port 8767 --allow-motion
+```
+
+完整左手流程将 `--stop-after xy` 替换成 `--full-cycle`。串联命令追加 `--left-step-profile g2_adapter/left_step_profile.json --left-step-reference g2_adapter/left_step_reference.json`。省略 STEP 参数仍使用原流程。修改 STEP/抓取点或相机内参后必须重新采集基准，启动会核对它们。

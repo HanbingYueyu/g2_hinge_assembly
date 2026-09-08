@@ -55,6 +55,8 @@ class Observation:
     fy: float
     ppx: float
     ppy: float
+    base_xy_error_m: tuple[float, float] | None = None
+    xy_tolerance_m: float = 0.002
 
 
 @dataclass(frozen=True)
@@ -71,8 +73,11 @@ class Step:
 class LeftGraspState:
     """Preserve the OpenArm sequence without assuming its hardware values."""
 
-    def __init__(self, parameters: GraspParameters) -> None:
-        self.parameters = parameters
+    def __init__(self, parameters: GraspParameters, coarse_parameters: GraspParameters | None = None) -> None:
+        self.fine_parameters = parameters
+        self.coarse_parameters = coarse_parameters
+        self.coarse_active = coarse_parameters is not None
+        self.parameters = coarse_parameters or parameters
         self.phase = GraspPhase.ALIGN_XY
         self.centered_frames = 0
 
@@ -93,6 +98,20 @@ class LeftGraspState:
             return Step(self.phase, None, reason="terminal_hold")
 
         if self.phase == GraspPhase.ALIGN_XY:
+            if observation.base_xy_error_m is not None:
+                error = np.asarray(observation.base_xy_error_m, dtype=float)
+                if not np.isfinite(error).all():
+                    self.centered_frames = 0
+                    return Step(self.phase, None, reason="invalid_metric_xy")
+                if np.linalg.norm(error) <= observation.xy_tolerance_m:
+                    self.centered_frames += 1
+                    if self.centered_frames >= p.center_confirmations:
+                        self.phase = GraspPhase.FINAL_DESCENT
+                    return Step(self.phase, None, reason="metric_xy_centered")
+                self.centered_frames = 0
+                # Runtime dispatches XY corrections through the same bounded
+                # stream path; the vector is already in base coordinates.
+                return Step(self.phase, tuple(self._bounded(np.r_[error, 0.0], p.max_xy_step_m)), reason="metric_xy_correction")
             pixel_error = np.asarray(
                 (observation.center_px[0] - p.target_u_px, observation.center_px[1] - p.target_v_px),
                 dtype=np.float64,
@@ -100,6 +119,11 @@ class LeftGraspState:
             if float(np.max(np.abs(pixel_error))) <= p.pixel_tolerance:
                 self.centered_frames += 1
                 if self.centered_frames >= p.center_confirmations:
+                    if self.coarse_active:
+                        self.coarse_active = False
+                        self.parameters = self.fine_parameters
+                        self.centered_frames = 0
+                        return Step(self.phase, None, reason="coarse_xy_complete_wait_step")
                     self.phase = GraspPhase.FINAL_DESCENT
                     return Step(self.phase, None, reason="xy_centered_force_primary_descent")
                 return Step(self.phase, None, reason="xy_center_confirmation")
@@ -162,5 +186,7 @@ class LeftGraspState:
         open, so it is safe to leave the terminal closure phase and reacquire
         the next visible instance.
         """
+        self.coarse_active = self.coarse_parameters is not None
+        self.parameters = self.coarse_parameters or self.fine_parameters
         self.phase = GraspPhase.ALIGN_XY
         self.centered_frames = 0

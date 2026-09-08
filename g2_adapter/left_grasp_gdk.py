@@ -31,6 +31,10 @@ from sam3.model.sam3_image_processor import Sam3Processor
 from sam3.model_builder import build_sam3_image_model
 
 try:
+    from .left_step_xy import xy_error, bounded_xy
+    from .left_step_rgb import OcclusionTrackerPool
+    from .apriltag_workpiece import transform_from_dict
+    from .left_step_rgb import load_profile, load_alignment_reference, detect_hole_centres, match_holes, servo_pixel
     from .camera import align_depth_to_color, decode_color_rgb, decode_depth_u16, intrinsic_to_dict, transform_to_dict
     from .contact_detection import ForceContactDetector, ForceContactParameters
     from .control import CartesianPoseTarget, G2Controller, LeftEndEffectorPositionStream
@@ -52,6 +56,10 @@ try:
     from .spacemouse_takeover import AdvanceRightRequested, MotionPauseGate, SpaceMouseTakeoverWorker
     from .spacemouse_teleop import TeleopConfig
 except ImportError:
+    from left_step_xy import xy_error, bounded_xy
+    from left_step_rgb import OcclusionTrackerPool
+    from apriltag_workpiece import transform_from_dict
+    from left_step_rgb import load_profile, load_alignment_reference, detect_hole_centres, match_holes, servo_pixel
     from camera import align_depth_to_color, decode_color_rgb, decode_depth_u16, intrinsic_to_dict, transform_to_dict
     from contact_detection import ForceContactDetector, ForceContactParameters
     from control import CartesianPoseTarget, G2Controller, LeftEndEffectorPositionStream
@@ -345,6 +353,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--sam-review-interval-s", type=float, default=0.50)
     parser.add_argument("--sam-review-ttl-s", type=float, default=1.50)
     parser.add_argument("--sam-review-max-pixel-error", type=float, default=80.0)
+    parser.add_argument("--step-profile", type=Path, help="Use RGB STEP grasp point for XY alignment")
+    parser.add_argument("--step-reference", type=Path, help="New manually aligned STEP pixel reference")
+    parser.add_argument("--step-metric-xy", action="store_true", help="Use approximate TCP and image-time TF for base XY servo")
+    parser.add_argument("--step-tcp-end-mm", default="0,0,145", help="Approximate TCP XYZ in arm_l_end_link, mm; not a calibrated TCP")
+    parser.add_argument("--step-compensation-xy-mm", default="0,0", help="Base X,Y target compensation, mm")
+    parser.add_argument("--step-xy-tolerance-mm", type=float, default=2.0)
     parser.add_argument("--sam-review-max-depth-error-m", type=float, default=0.05)
     parser.add_argument("--min-area", type=int, default=1)
     parser.add_argument("--min-valid-depth-pixels", type=int, default=50)
@@ -690,7 +704,8 @@ def compact_record(record: dict) -> dict:
             "event", "frame", "utc", "state", "reason", "error",
             "command_source", "motion_command_sent", "regrasp_attempt", "test_stop",
             "post_grasp_verify", "perception_gate", "tracking", "selected_mask_index",
-            "tracking_lock_reset",
+            "tracking_lock_reset", "step_pose", "pixel_error_px", "delta_base_m", "alignment_stage",
+            "actual_xy_error_m", "end_link_target_before_base_link", "end_link_target_after_base_link",
         )
         if key in record
     }
@@ -1007,21 +1022,34 @@ class PersistentPerception:
 
     def _run(self) -> None:
         color_intrinsic = depth_intrinsic = depth_to_color = end_link_transform = None
+        previous_step_timestamp = None
+        step_trackers = OcclusionTrackerPool()
         last_sam_review_at = float("-inf")
         sam_review: dict = {"accepted": False, "fresh": False, "reason": "awaiting_first_sam_review"}
         try:
             while not self._stop.is_set():
                 started = time.monotonic()
                 color = self.camera.get_latest_image(self.color_type, 1000.0)
-                depth = self.camera.get_nearest_image(self.depth_type, int(color.timestamp_ns), 1000.0)
                 color_rgb = decode_color_rgb(color, self.gdk)
-                depth_u16 = decode_depth_u16(depth, self.gdk)
+                use_step = getattr(self.args, "step_profile", None) is not None
+                if use_step:
+                    if color.timestamp_ns == previous_step_timestamp:
+                        time.sleep(.01)
+                        continue
+                    previous_step_timestamp = color.timestamp_ns
+                if not use_step:
+                    depth = self.camera.get_nearest_image(self.depth_type, int(color.timestamp_ns), 1000.0)
+                    depth_u16 = decode_depth_u16(depth, self.gdk)
                 if color_intrinsic is None:
                     color_intrinsic = intrinsic_to_dict(self.camera.get_camera_intrinsic(self.color_type), width=int(color.width), height=int(color.height))
-                    depth_intrinsic = intrinsic_to_dict(self.camera.get_camera_intrinsic(self.depth_type), width=int(depth.width), height=int(depth.height))
-                    depth_to_color = transform_to_dict(self.tf.get_tf_from_sensor(self.gdk.SensorExtrinsicType.kLeftHandDepthToLeftHandColor))
+                    if not use_step:
+                        depth_intrinsic = intrinsic_to_dict(self.camera.get_camera_intrinsic(self.depth_type), width=int(depth.width), height=int(depth.height))
+                        depth_to_color = transform_to_dict(self.tf.get_tf_from_sensor(self.gdk.SensorExtrinsicType.kLeftHandDepthToLeftHandColor))
+                    else:
+                        if not self.args.step_metric_xy and color_intrinsic != self.args.step_alignment["intrinsic"]:
+                            raise RuntimeError("STEP reference camera calibration differs; recapture reference")
                     end_link_transform = transform_to_dict(self.tf.get_tf_from_sensor(self.gdk.SensorExtrinsicType.kLeftHandRGBDToArmLEndLink))
-                aligned_depth = align_depth_to_color(depth_u16, depth_intrinsic=depth_intrinsic, color_intrinsic=color_intrinsic, depth_to_color=depth_to_color, depth_scale_m=DEPTH_SCALE_M)
+                aligned_depth = np.zeros(color_rgb.shape[:2], dtype=np.uint16) if use_step else align_depth_to_color(depth_u16, depth_intrinsic=depth_intrinsic, color_intrinsic=color_intrinsic, depth_to_color=depth_to_color, depth_scale_m=DEPTH_SCALE_M)
                 crop_bounds = center_crop_bounds(color_rgb.shape)
                 roi = intersect_roi(parse_roi(self.args.roi, color_rgb.shape[:2]), crop_bounds)
                 if self.args.detector == "sam3":
@@ -1092,6 +1120,26 @@ class PersistentPerception:
                         last_sam_review_at = now
                     age = None if "timestamp_monotonic" not in sam_review else now - float(sam_review["timestamp_monotonic"])
                     sam_review = {**sam_review, "fresh": age is not None and age <= self.args.sam_review_ttl_s, "age_s": None if age is None else round(max(age, 0.0), 3)}
+                if use_step:
+                    bgr = cv2.cvtColor(color_rgb, cv2.COLOR_RGB2BGR)
+                    base_end = None
+                    if self.args.step_metric_xy:
+                        try:
+                            raw = self.tf.lookup_transform("base_link", "arm_l_end_link", int(color.timestamp_ns))
+                            base_end = np.linalg.inv(transform_from_dict(transform_to_dict(raw)))
+                        except Exception:
+                            pass
+                    tracked_poses = step_trackers.update(self.args.step_geometry,
+                        [detect_hole_centres(bgr, masks[index]) for index in candidates],
+                        [statistics[index]["center_px"] for index in candidates], color_intrinsic)
+                    for index, tracked_pose in zip(candidates, tracked_poses):
+                        statistics[index]["step_pose"] = dict(tracked_pose)
+                        pose = statistics[index]["step_pose"]
+                        if self.args.step_metric_xy:
+                            if base_end is None:
+                                pose.update(accepted=False, reason="image_time_tf_unavailable")
+                            elif pose.get("accepted"):
+                                pose["base_xy_error_m"] = xy_error(base_end, transform_from_dict(end_link_transform), pose["grasp_xyz_camera_m"], self.args.step_tcp_m, self.args.step_compensation_m)
                 selected = choose_candidate(statistics, candidates, self.args.selection)
                 shaft_association = associate_shaft_to_hinge(
                     statistics,
@@ -1109,6 +1157,8 @@ class PersistentPerception:
                     self._condition.notify_all()
                 if self.shared is not None:
                     overlay = draw_crop_box(draw_overlay(cv2.cvtColor(color_rgb, cv2.COLOR_RGB2BGR), masks, statistics, selected), crop_bounds)
+                    if use_step and selected is not None and statistics[selected].get("step_pose", {}).get("accepted"):
+                        cv2.drawMarker(overlay, tuple(np.round(servo_pixel(statistics[selected])).astype(int)), (0, 0, 255), cv2.MARKER_CROSS, 22, 2)
                     ok, encoded = cv2.imencode(".jpg", overlay, [cv2.IMWRITE_JPEG_QUALITY, 82])
                     if ok:
                         self.shared.update(encoded.tobytes(), {"state": phase["state"], "sequence": self._sequence, "selected_mask_index": selected, "selected": None if selected is None else statistics[selected], "shaft_association": shaft_association, "detector": self.args.detector, "inference_ms": round(snapshot["inference_ms"], 1), "grasp_reason": phase["reason"], "safety": "常驻感知线程独占相机、YOLO/SAM3 与网页更新；动作状态机仅消费最新快照。"})
@@ -1123,7 +1173,7 @@ class SnapshotVisualMailbox:
 
     def __init__(self, perception: PersistentPerception, *, initial_center_px, track_max_distance_px,
                  target_lost_frames, target_pixel_px=None, pixel_jacobian=None,
-                 pixel_tolerance_px=0.0, max_xy_step_m=0.0):
+                 pixel_tolerance_px=0.0, max_xy_step_m=0.0, allow_xy_correction=True):
         self.perception = perception
         self.center = np.asarray(initial_center_px, dtype=np.float64)
         self.track_max_distance_px = track_max_distance_px
@@ -1131,6 +1181,7 @@ class SnapshotVisualMailbox:
         self.target_pixel_px, self.pixel_jacobian = target_pixel_px, pixel_jacobian
         self.pixel_tolerance_px, self.max_xy_step_m = pixel_tolerance_px, max_xy_step_m
         self.lost_frames = 0
+        self.allow_xy_correction = allow_xy_correction
 
     def newer_than(self, sequence: int) -> dict | None:
         snapshot = self.perception.newer_than(sequence, timeout_s=0.0)
@@ -1153,10 +1204,21 @@ class SnapshotVisualMailbox:
             }
         self.lost_frames = 0
         item = snapshot["statistics"][selected]
+        if self.allow_xy_correction and self.target_pixel_px is not None and "step_pose" in item and not item["step_pose"].get("accepted"):
+            return {"sequence": snapshot["sequence"], "valid": False, "reason": "step_pose_lost"}
         self.center = np.asarray(item["center_px"], dtype=np.float64)
         result = {"sequence": snapshot["sequence"], "valid": True, "selected_mask_index": selected, "center_px": self.center.tolist(), "area_px": int(item["area_px"]), "sam3_confidence": item.get("sam3_confidence"), "yolo_confidence": item.get("yolo_confidence")}
+        if not self.allow_xy_correction:
+            return result
         if self.target_pixel_px is not None and self.pixel_jacobian is not None:
-            error = self.center - np.asarray(self.target_pixel_px, dtype=np.float64)
+            metric = item.get("step_pose", {}).get("base_xy_error_m")
+            if metric is not None:
+                if np.linalg.norm(metric) > self.perception.args.step_xy_tolerance_mm / 1000:
+                    result["delta_base_m"] = bounded_xy(metric, self.max_xy_step_m).tolist()
+                    result["pixel_error_px"] = [0.0, 0.0]
+                    result["base_xy_error_m"] = metric
+                return result
+            error = np.asarray(servo_pixel(item)) - np.asarray(self.target_pixel_px, dtype=np.float64)
             result["pixel_error_px"] = error.tolist()
             if float(np.linalg.norm(error)) > self.pixel_tolerance_px:
                 result["delta_base_m"] = empirical_horizontal_base_delta_from_pixel_error(error, self.pixel_jacobian, max_step_m=self.max_xy_step_m).tolist()
@@ -1409,6 +1471,21 @@ def main() -> int:
                 stop_after=args.stop_after,
             ),
         )
+        if args.step_profile is not None:
+            if (not args.step_metric_xy and args.step_reference is None) or parameters is None or args.detector != "yolo-sam":
+                raise ValueError("STEP mode requires --step-reference, calibrated config and yolo-sam detector")
+            args.step_geometry = load_profile(args.step_profile)
+            args.final_descent_visual_servo = True
+            if args.step_metric_xy:
+                args.step_tcp_m = np.asarray([float(x) for x in args.step_tcp_end_mm.split(",")]) / 1000
+                args.step_compensation_m = np.asarray([float(x) for x in args.step_compensation_xy_mm.split(",")]) / 1000
+                if args.step_tcp_m.shape != (3,) or args.step_compensation_m.shape != (2,) or not np.isfinite(args.step_tcp_m).all() or not np.isfinite(args.step_compensation_m).all() or not 0 < args.step_xy_tolerance_mm <= 10:
+                    raise ValueError("invalid approximate TCP / XY compensation / tolerance")
+            else:
+                args.step_alignment = load_alignment_reference(args.step_reference, args.step_geometry)
+                parameters = replace(parameters, target_u_px=args.step_alignment["target_pixel_px"][0], target_v_px=args.step_alignment["target_pixel_px"][1])
+        elif args.step_metric_xy:
+            raise ValueError("--step-metric-xy requires --step-profile")
     except Exception as exc:
         print(f"抓取配置无效：{exc}", file=sys.stderr)
         return 2
@@ -1552,7 +1629,7 @@ def main() -> int:
             takeover_worker.start()
         camera_type = agibot_gdk.CameraType.kHandLeftColor
         depth_type = agibot_gdk.CameraType.kHandLeftDepth
-        camera = agibot_gdk.Camera([camera_type, depth_type])
+        camera = agibot_gdk.Camera([camera_type] if args.step_profile is not None else [camera_type, depth_type])
         tf = agibot_gdk.TF()
         model = build_sam3_image_model(checkpoint_path=str(checkpoint), load_from_HF=False)
         processor = Sam3Processor(model, confidence_threshold=args.threshold)
@@ -1568,13 +1645,19 @@ def main() -> int:
             args=args, shared=web_shared, yolo_model_path=yolo_model_path,
         )
         perception.start()
-        state = None if parameters is None else LeftGraspState(parameters)
+        coarse_parameters = None
+        if args.step_profile is not None and parameters is not None:
+            coarse_parameters = replace(parameters,
+                target_u_px=float(config["alignment"]["target_pixel_px"][0]),
+                target_v_px=float(config["alignment"]["target_pixel_px"][1]))
+        state = None if parameters is None else LeftGraspState(parameters, coarse_parameters)
         color_intrinsic = depth_intrinsic = depth_to_color = end_link_transform = None
         tracked_center: np.ndarray | None = None
         tracked_depth_m: float | None = None
         missed_frames = 0
         regrasp_attempts = 0
         last_end_link_target: CartesianPoseTarget | None = None
+        step_xy_pending = None
         gripper_sent_at: float | None = None
         adaptive_hold_target_rad: float | None = None
         adaptive_hold_sent_at: float | None = None
@@ -2213,6 +2296,11 @@ def main() -> int:
                         ),
                     })
                     if selected is None:
+                        if args.step_profile is not None and step_xy_pending is not None:
+                            actual = measured_left_end_link_pose(controller)
+                            last_end_link_target = CartesianPoseTarget(actual.position_m, last_end_link_target.orientation_xyzw)
+                            position_stream.update_target(last_end_link_target)
+                            step_xy_pending = None
                         # FINAL_DESCENT here means that XY centering has just
                         # completed; the synchronous force descent has not
                         # been commanded yet.  A transient YOLO depth/SAM
@@ -2241,8 +2329,42 @@ def main() -> int:
                         print_compact_record(record)
                         continue
                     item = statistics[selected]
+                    coarse_active = state is not None and state.coarse_active
+                    gripper_closing = state is not None and state.phase == GraspPhase.GRASPED
+                    if state is not None:
+                        parameters = state.parameters
+                    if coarse_active or gripper_closing:
+                        item = dict(item)
+                        item.pop("step_pose", None)
+                    record["alignment_stage"] = "coarse_yolo" if coarse_active else "fine_step"
+                    if args.step_profile is not None and not gripper_closing:
+                        record["step_pose"] = item.get("step_pose", {})
+                        if not coarse_active and not item.get("step_pose", {}).get("accepted"):
+                            if step_xy_pending is not None:
+                                actual = measured_left_end_link_pose(controller)
+                                last_end_link_target = CartesianPoseTarget(actual.position_m, last_end_link_target.orientation_xyzw)
+                                position_stream.update_target(last_end_link_target)
+                                step_xy_pending = None
+                            if state is not None:
+                                state.reset_alignment()
+                            record.update(state="waiting_for_step_pose", reason="STEP correspondence unavailable; no new target")
+                            json_record(log, record)
+                            print_compact_record(record)
+                            continue
+                        if step_xy_pending is not None:
+                            actual = measured_left_end_link_pose(controller)
+                            error = float(np.linalg.norm(np.asarray(actual.position_m) - step_xy_pending[0]))
+                            record["actual_xy_error_m"] = error
+                            if time.monotonic() > step_xy_pending[1]:
+                                raise SafetyError("STEP XY 单步实际到位超时；不累加后续目标")
+                            if position_stream.is_target_reached() and error <= 0.0005:
+                                last_end_link_target = CartesianPoseTarget(actual.position_m, last_end_link_target.orientation_xyzw)
+                                step_xy_pending = None
+                            record.update(state="waiting_for_step_xy_feedback", reason="wait_actual_arrival_then_fresh_visual_frame")
+                            json_record(log, record)
+                            continue
                     if single_xy_verification is not None:
-                        post_center = np.asarray(item["center_px"], dtype=np.float64)
+                        post_center = np.asarray(servo_pixel(item), dtype=np.float64)
                         pre_center = np.asarray(single_xy_verification["before_center_px"], dtype=np.float64)
                         record.update({
                             "state": "single_xy_post_motion_measurement",
@@ -2269,13 +2391,15 @@ def main() -> int:
                         state.reset_alignment()
                         record["target_reacquired_reset_to_xy_alignment"] = True
                     observation = Observation(
-                        tuple(float(value) for value in item["center_px"]),
+                        tuple(float(value) for value in servo_pixel(item)),
                         # The empirical pixel Jacobian below is the only XY
                         # controller.  Depth is diagnostic/optional and no
                         # longer filters out the visually leftmost hinge.
                         float(item["depth_median_m"] if item.get("depth_median_m") is not None else 1.0),
                         float(color_intrinsic["fx"]), float(color_intrinsic["fy"]),
                         float(color_intrinsic["ppx"]), float(color_intrinsic["ppy"]),
+                        base_xy_error_m=item.get("step_pose", {}).get("base_xy_error_m"),
+                        xy_tolerance_m=args.step_xy_tolerance_mm / 1000,
                     )
                     step = state.update(observation, now=time.monotonic())
                     record.update({"state": step.phase.value, "reason": step.reason, "camera_delta_m": step.camera_delta_m, "base_delta_m": step.base_delta_m})
@@ -2291,13 +2415,18 @@ def main() -> int:
                             if empirical_pixel_jacobian is None:
                                 raise SafetyError("视觉 XY 修正缺少实测 pixel_jacobian_px_per_m")
                             pixel_error = np.asarray((
-                                float(item["center_px"][0]) - parameters.target_u_px,
-                                float(item["center_px"][1]) - parameters.target_v_px,
+                                float(servo_pixel(item)[0]) - parameters.target_u_px,
+                                float(servo_pixel(item)[1]) - parameters.target_v_px,
                             ), dtype=np.float64)
                             delta_base = empirical_horizontal_base_delta_from_pixel_error(
                                 pixel_error, empirical_pixel_jacobian, max_step_m=parameters.max_xy_step_m,
                             )
+                            if args.step_metric_xy and not coarse_active:
+                                delta_base = bounded_xy(item["step_pose"]["base_xy_error_m"], parameters.max_xy_step_m)
                             command_source = "gdk_end_effector_pose_mode1_empirical_visual_xy"
+                            if args.step_metric_xy and not coarse_active:
+                                command_source = "gdk_end_effector_pose_mode1_step_metric_xy"
+                                record["base_xy_error_m"] = item["step_pose"]["base_xy_error_m"]
                             record["pixel_error_px"] = [float(value) for value in pixel_error]
                             record["pixel_jacobian_px_per_m"] = empirical_pixel_jacobian.tolist()
                         else:
@@ -2347,6 +2476,9 @@ def main() -> int:
                             }
                         if last_end_link_target is None:
                             last_end_link_target = measured_left_end_link_pose(controller)
+                        if args.step_profile is not None and step.camera_delta_m is not None and args.allow_motion:
+                            actual = measured_left_end_link_pose(controller)
+                            last_end_link_target = CartesianPoseTarget(actual.position_m, last_end_link_target.orientation_xyzw)
                         target = CartesianPoseTarget(
                             base_position_after_delta(last_end_link_target.position_m, delta_base),
                             last_end_link_target.orientation_xyzw,
@@ -2371,6 +2503,8 @@ def main() -> int:
                                 )
                             position_stream.update_target(target)
                             last_end_link_target = target
+                            if args.step_profile is not None and step.camera_delta_m is not None and not args.single_xy_step:
+                                step_xy_pending = (np.asarray(target.position_m), time.monotonic() + max(2.0, float(np.linalg.norm(delta_base)) / parameters.final_descent_speed_mps + 1.0))
                             if step.is_final_descent:
                                 assert step.motion_duration_s is not None
                                 force_contact_detected = False
@@ -2390,6 +2524,7 @@ def main() -> int:
                                         pixel_jacobian=empirical_pixel_jacobian,
                                         pixel_tolerance_px=parameters.pixel_tolerance,
                                         max_xy_step_m=args.final_descent_visual_max_step_m,
+                                        allow_xy_correction=False,
                                     ) if args.final_descent_visual_servo else None)
                                     # Start after the frame used to initiate
                                     # descent; an old frame must not count as
@@ -2789,7 +2924,7 @@ def main() -> int:
                             actual_end_link = measured_left_end_link_pose(controller)
                             actual_delta = np.asarray(actual_end_link.position_m) - np.asarray(record["end_link_target_before_base_link"])
                             single_xy_verification = {
-                                "before_center_px": [float(value) for value in item["center_px"]],
+                                "before_center_px": [float(value) for value in servo_pixel(item)],
                                 "commanded_delta_base_m": [float(value) for value in delta_base],
                                 "stream_target_reached": True,
                                 "actual_end_link_after_base_link": list(actual_end_link.position_m),

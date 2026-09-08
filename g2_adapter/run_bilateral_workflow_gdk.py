@@ -44,6 +44,8 @@ def parse_args(argv=None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="左手视觉流程完成后串联右手视觉流程，并支持 SpaceMouse 临时接管")
     parser.add_argument("--device", required=True, help="SpaceMouse Compact 的 /dev/hidrawN 路径或 udev 固定别名")
     parser.add_argument("--left-config", type=Path, default=PROJECT_ROOT / "g2_adapter" / "left_grasp.example.json")
+    parser.add_argument("--left-step-profile", type=Path)
+    parser.add_argument("--left-step-reference", type=Path)
     parser.add_argument("--right-config", type=Path, default=PROJECT_ROOT / "g2_adapter" / "right_apriltag_grasp.example.json")
     parser.add_argument("--poses", type=Path, default=PROJECT_ROOT / "g2_adapter" / "recorded_poses.json")
     parser.add_argument("--checkpoint", type=Path, default=PROJECT_ROOT / "checkpoints" / "sam3.1_multiplex.pt")
@@ -120,9 +122,14 @@ def wait_for_right_advance(
 
 def build_stage_commands(args: argparse.Namespace) -> tuple[list[str], list[str]]:
     python = sys.executable
+    step_profile = getattr(args, "left_step_profile", None)
+    step_reference = getattr(args, "left_step_reference", None)
+    if bool(step_profile) != bool(step_reference):
+        raise ValueError("--left-step-profile and --left-step-reference must be supplied together")
     left = [
         python, str(PROJECT_ROOT / "g2_adapter" / "left_grasp_gdk.py"),
         "--config", str(Path(args.left_config).expanduser()),
+        *(["--step-profile", str(step_profile), "--step-reference", str(step_reference)] if step_profile else []),
         "--checkpoint", str(Path(args.checkpoint).expanduser()),
         "--yolo-model", str(Path(args.yolo_model).expanduser()),
         "--poses", str(Path(args.poses).expanduser()),
