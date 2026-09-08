@@ -36,7 +36,7 @@ def parse_args() -> argparse.Namespace:
         help="按全闭合 0%%、最大张开 100%% 设置张开程度。",
     )
     parser.add_argument("--allow-motion", action="store_true", help="唯一动作确认参数；未指定时严格只读。")
-    parser.add_argument("--settle-s", type=float, default=0.8, help="发命令后等待反馈的时间。")
+    parser.add_argument("--settle-s", type=float, default=0.8, help="以约 100 ms 周期重复发命令并等待反馈的时间。")
     return parser.parse_args()
 
 
@@ -94,9 +94,18 @@ def main() -> int:
             print(json.dumps(result, ensure_ascii=False))
             return 0
 
-        controller.move_gripper(args.side, desired)
-        time.sleep(args.settle_s)
+        attempts = 0
+        deadline = time.monotonic() + args.settle_s
+        while True:
+            controller.move_gripper(args.side, desired)
+            attempts += 1
+            if not args.settle_s:
+                break
+            time.sleep(min(0.10, max(0.0, deadline - time.monotonic())))
+            if time.monotonic() >= deadline:
+                break
         result["command_sent"] = True
+        result["command_attempts"] = attempts
         result["after_position_rad"] = controller.read_gripper_position(args.side)
         print(json.dumps(result, ensure_ascii=False))
         return 0

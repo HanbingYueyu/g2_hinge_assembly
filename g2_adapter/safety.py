@@ -43,6 +43,10 @@ class SafetyError(RuntimeError):
     """A command or current robot state failed a mandatory safety check."""
 
 
+class AdvanceRightRequested(SafetyError):
+    """Cancel automatic motion for an operator-requested stage transition."""
+
+
 def finite_vector(values: Iterable[float], size: int, label: str) -> tuple[float, ...]:
     result = tuple(float(value) for value in values)
     if len(result) != size:
@@ -122,4 +126,3 @@ def clamp_omnipicker(value: float) -> float:
     if not math.isfinite(value):
         raise SafetyError("Omnipicker target contains NaN or Inf")
     return min(OMNIPICKER_MAX, max(OMNIPICKER_MIN, value))
-

@@ -3,9 +3,9 @@ import unittest
 import numpy as np
 
 try:
-    from .yolo_hinge import associate_shaft_to_hinge, infer_yolo_masks, resize_masks_to_full_image, review_matches, split_yolo_candidates
+    from .yolo_hinge import associate_shaft_to_hinge, infer_yolo_masks, resize_masks_to_full_image, review_matches, reviewed_target_matches_selected, split_yolo_candidates
 except ImportError:
-    from yolo_hinge import associate_shaft_to_hinge, infer_yolo_masks, resize_masks_to_full_image, review_matches, split_yolo_candidates
+    from yolo_hinge import associate_shaft_to_hinge, infer_yolo_masks, resize_masks_to_full_image, review_matches, reviewed_target_matches_selected, split_yolo_candidates
 
 
 class _FakeTensor:
@@ -147,6 +147,24 @@ class YoloReviewTests(unittest.TestCase):
         )
         self.assertFalse(accepted)
         self.assertEqual(detail["reason"], "selected_target_disagreement")
+
+    def test_review_association_reports_distance_without_accepting_other_hinge(self):
+        same, distance = reviewed_target_matches_selected(
+            {"center_px": [650.0, 480.0]},
+            {"yolo_center_px": [500.0, 400.0], "accepted": True, "fresh": True},
+            max_distance_px=120.0,
+        )
+        self.assertFalse(same)
+        self.assertAlmostEqual(distance, np.hypot(150.0, 80.0))
+
+    def test_review_association_accepts_current_candidate(self):
+        same, distance = reviewed_target_matches_selected(
+            {"center_px": [505.0, 404.0]},
+            {"yolo_center_px": [500.0, 400.0]},
+            max_distance_px=10.0,
+        )
+        self.assertTrue(same)
+        self.assertAlmostEqual(distance, np.hypot(5.0, 4.0))
 
     def test_resize_mask_to_full_image_uses_nearest_neighbor(self):
         mask = np.array([[True, False], [False, True]])

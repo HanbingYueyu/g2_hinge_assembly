@@ -5,7 +5,9 @@
     "left_p2": null,
     "left_p3": null,
     "left_p4": null,
-    "right_post_grasp": null
+    "right_post_grasp": null,
+    "right_pr1": null,
+    "right_pr2": null
   },
   "camera": {
     "source": "agibot_gdk.Camera",

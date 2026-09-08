@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
-"""Read and optionally save the current G2 pose; never sends a command."""
+"""Read and optionally save the current G2 pose; never sends a command.
+
+The recorded ``right_pr1`` and ``right_pr2`` poses are consumed by the right
+AprilTag pre-move and post-grasp transport sequence.
+"""
 
 from __future__ import annotations
 
@@ -31,10 +35,15 @@ except ImportError:
     )
 
 POSE_NAMES = (
+    "left_p1",
     "left_p2",
     "left_p3",
     "left_p4",
+    "left_handoff_1",
+    "left_handoff_2",
     "right_post_grasp",
+    "right_pr1",
+    "right_pr2",
 )
 DEFAULT_OUTPUT = Path(__file__).resolve().parent / "recorded_poses.json"
 

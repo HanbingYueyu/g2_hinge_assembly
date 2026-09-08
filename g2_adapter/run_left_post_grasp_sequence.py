@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Lift a held object, then move the left arm to its recorded P4 pose.
+"""Lift a held object, then move the left arm to its recorded P3 then P4 poses.
 
 P4 is a deliberately operator-recorded workcell pose.  This program never
 opens, closes, or otherwise commands the Omnipicker.  It first makes one
@@ -26,7 +26,7 @@ except ImportError:
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-PRESETS = ("left_p4",)
+PRESETS = ("left_p3", "left_p4")
 LEFT_END_LINK = "arm_l_end_link"
 PRE_P4_LIFT_M = 0.15
 PRE_P4_LIFT_SPEED_MPS = 0.01
@@ -34,7 +34,7 @@ PRE_P4_LIFT_TOLERANCE_M = 0.01
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="上抬后移动已夹住物体的左臂至 P4；不操作夹爪")
+    parser = argparse.ArgumentParser(description="上抬后移动已夹住物体的左臂至 P3→P4；不操作夹爪")
     parser.add_argument("--poses", type=Path, default=DEFAULT_OUTPUT)
     parser.add_argument("--velocity-rad-s", type=float, default=0.08)
     parser.add_argument("--arrival-tolerance-rad", type=float, default=0.03)
@@ -124,7 +124,7 @@ def main() -> int:
     try:
         presets = load_presets(args.poses)
     except Exception as exc:
-        print(f"读取 P4 姿态失败：{exc}", file=sys.stderr)
+        print(f"读取 P3/P4 姿态失败：{exc}", file=sys.stderr)
         return 2
     log_path = args.log or PROJECT_ROOT / "logs" / f"left_post_grasp_{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}.jsonl"
     log_path = log_path.expanduser().resolve()
@@ -172,7 +172,7 @@ def main() -> int:
             lift_event = lift_before_p4(controller)
             lift_event["utc"] = datetime.now(timezone.utc).isoformat()
             write_log(log, lift_event)
-            print("P4 前已实测上抬 150 mm；开始请求 P4，夹爪未操作。")
+            print("P4 前已实测上抬 150 mm；开始依次请求 P3、P4，夹爪未操作。")
             for name, target in presets:
                 controller.move_preset("left", target, velocity_rad_s=args.velocity_rad_s, life_time_s=args.timeout_per_preset_s, detail=f"traditional held-object {name}")
                 write_log(log, {"event": "request_sent", "preset": name, "utc": datetime.now(timezone.utc).isoformat(), "target_rad": target})
@@ -187,7 +187,7 @@ def main() -> int:
                     time.sleep(0.10)
                 else:
                     raise RuntimeError(f"{name} 在 {args.timeout_per_preset_s:.1f} s 内未到位；停止后续命令，夹爪未操作")
-        print("P4 前已上抬 150 mm，P4 已到位；夹爪状态保持原样，未启动检测或力控。")
+        print("P4 前已上抬 150 mm，P3、P4 已依次到位；夹爪状态保持原样，未启动检测或力控。")
         return 0
     except Exception as exc:
         print(f"左手 P4 运输失败：{exc}", file=sys.stderr)

@@ -10,7 +10,7 @@ class LeftPostGraspSequenceTests(unittest.TestCase):
     def test_pre_p4_lift_is_150_mm(self):
         self.assertAlmostEqual(PRE_P4_LIFT_M, 0.15)
 
-    def test_loads_only_p4_then_p5(self):
+    def test_loads_p3_then_p4(self):
         document = {
             "schema_version": 1,
             "poses": {
@@ -23,7 +23,7 @@ class LeftPostGraspSequenceTests(unittest.TestCase):
             path.write_text(json.dumps(document), encoding="utf-8")
             self.assertEqual(
                 load_presets(path),
-                [("left_p4", [4.0] * 7)],
+                [("left_p3", [3.0] * 7), ("left_p4", [4.0] * 7)],
             )
 
 

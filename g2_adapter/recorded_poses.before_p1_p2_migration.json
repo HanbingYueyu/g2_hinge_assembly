@@ -1,0 +1,589 @@
+{
+  "schema_version": 1,
+  "poses": {
+    "left_p2": {
+      "name": "left_p2",
+      "captured_at_utc": "2026-09-08T06:47:04.273014+00:00",
+      "side": "left",
+      "joint_names": [
+        "idx21_arm_l_joint1",
+        "idx22_arm_l_joint2",
+        "idx23_arm_l_joint3",
+        "idx24_arm_l_joint4",
+        "idx25_arm_l_joint5",
+        "idx26_arm_l_joint6",
+        "idx27_arm_l_joint7"
+      ],
+      "joint_positions_rad": [
+        1.3333319063514824,
+        -1.0446157496778203,
+        -1.9405599988697495,
+        -1.568182087974042,
+        0.9813567788303976,
+        -0.21996685287034828,
+        -0.06094098206622871
+      ],
+      "both_arms_rad": {
+        "idx21_arm_l_joint1": 1.3333319063514824,
+        "idx22_arm_l_joint2": -1.0446157496778203,
+        "idx23_arm_l_joint3": -1.9405599988697495,
+        "idx24_arm_l_joint4": -1.568182087974042,
+        "idx25_arm_l_joint5": 0.9813567788303976,
+        "idx26_arm_l_joint6": -0.21996685287034828,
+        "idx27_arm_l_joint7": -0.06094098206622871,
+        "idx61_arm_r_joint1": -2.3815425240267465,
+        "idx62_arm_r_joint2": -1.1534069454719933,
+        "idx63_arm_r_joint3": 1.6881782144753927,
+        "idx64_arm_r_joint4": -2.0089024382375262,
+        "idx65_arm_r_joint5": -1.1454282480041704,
+        "idx66_arm_r_joint6": 0.002777463964065439,
+        "idx67_arm_r_joint7": -0.20396048240225595
+      },
+      "all_gdk_motor_positions_rad": {
+        "idx01_body_joint1": -0.6943999755851924,
+        "idx02_body_joint2": 1.3447049775688955,
+        "idx03_body_joint3": -0.4551368144779809,
+        "idx04_body_joint4": 0.0,
+        "idx05_body_joint5": 0.0,
+        "idx11_head_joint1": 0.0,
+        "idx12_head_joint2": 0.0,
+        "idx13_head_joint3": 0.41756022827845085,
+        "idx21_arm_l_joint1": 1.3333319063514824,
+        "idx22_arm_l_joint2": -1.0446157496778203,
+        "idx23_arm_l_joint3": -1.9405599988697495,
+        "idx24_arm_l_joint4": -1.568182087974042,
+        "idx25_arm_l_joint5": 0.9813567788303976,
+        "idx26_arm_l_joint6": -0.21996685287034828,
+        "idx27_arm_l_joint7": -0.06094098206622871,
+        "idx61_arm_r_joint1": -2.3815425240267465,
+        "idx62_arm_r_joint2": -1.1534069454719933,
+        "idx63_arm_r_joint3": 1.6881782144753927,
+        "idx64_arm_r_joint4": -2.0089024382375262,
+        "idx65_arm_r_joint5": -1.1454282480041704,
+        "idx66_arm_r_joint6": 0.002777463964065439,
+        "idx67_arm_r_joint7": -0.20396048240225595
+      },
+      "left_omnipicker_names": [
+        "idx31_gripper_l_inner_joint1"
+      ],
+      "left_omnipicker_rad": -0.7835782777777778,
+      "right_omnipicker_names": [
+        "idx71_gripper_r_inner_joint1"
+      ],
+      "right_omnipicker_rad": -0.785,
+      "motion_mode": 1,
+      "motion_error_code": 0
+    },
+    "left_p3": {
+      "name": "left_p3",
+      "captured_at_utc": "2026-09-08T06:48:03.643649+00:00",
+      "side": "left",
+      "joint_names": [
+        "idx21_arm_l_joint1",
+        "idx22_arm_l_joint2",
+        "idx23_arm_l_joint3",
+        "idx24_arm_l_joint4",
+        "idx25_arm_l_joint5",
+        "idx26_arm_l_joint6",
+        "idx27_arm_l_joint7"
+      ],
+      "joint_positions_rad": [
+        0.8999729461309461,
+        -0.8761652846710466,
+        -1.6997115928398094,
+        -1.3169843450003347,
+        0.8932106474910171,
+        -0.27555615946284095,
+        -1.1420856079935684
+      ],
+      "both_arms_rad": {
+        "idx21_arm_l_joint1": 0.8999729461309461,
+        "idx22_arm_l_joint2": -0.8761652846710466,
+        "idx23_arm_l_joint3": -1.6997115928398094,
+        "idx24_arm_l_joint4": -1.3169843450003347,
+        "idx25_arm_l_joint5": 0.8932106474910171,
+        "idx26_arm_l_joint6": -0.27555615946284095,
+        "idx27_arm_l_joint7": -1.1420856079935684,
+        "idx61_arm_r_joint1": -2.381523149529816,
+        "idx62_arm_r_joint2": -1.1533999546741318,
+        "idx63_arm_r_joint3": 1.6881748588924193,
+        "idx64_arm_r_joint4": -2.0090524807333416,
+        "idx65_arm_r_joint5": -1.1454282480041704,
+        "idx66_arm_r_joint6": 0.002777224279567332,
+        "idx67_arm_r_joint7": -0.203960722086754
+      },
+      "all_gdk_motor_positions_rad": {
+        "idx01_body_joint1": -0.6943999755851924,
+        "idx02_body_joint2": 1.3447049775688955,
+        "idx03_body_joint3": -0.4551368144779809,
+        "idx04_body_joint4": 0.0,
+        "idx05_body_joint5": 0.0,
+        "idx11_head_joint1": 0.0,
+        "idx12_head_joint2": 0.0,
+        "idx13_head_joint3": 0.41756022827845085,
+        "idx21_arm_l_joint1": 0.8999729461309461,
+        "idx22_arm_l_joint2": -0.8761652846710466,
+        "idx23_arm_l_joint3": -1.6997115928398094,
+        "idx24_arm_l_joint4": -1.3169843450003347,
+        "idx25_arm_l_joint5": 0.8932106474910171,
+        "idx26_arm_l_joint6": -0.27555615946284095,
+        "idx27_arm_l_joint7": -1.1420856079935684,
+        "idx61_arm_r_joint1": -2.381523149529816,
+        "idx62_arm_r_joint2": -1.1533999546741318,
+        "idx63_arm_r_joint3": 1.6881748588924193,
+        "idx64_arm_r_joint4": -2.0090524807333416,
+        "idx65_arm_r_joint5": -1.1454282480041704,
+        "idx66_arm_r_joint6": 0.002777224279567332,
+        "idx67_arm_r_joint7": -0.203960722086754
+      },
+      "left_omnipicker_names": [
+        "idx31_gripper_l_inner_joint1"
+      ],
+      "left_omnipicker_rad": -0.7835782777777778,
+      "right_omnipicker_names": [
+        "idx71_gripper_r_inner_joint1"
+      ],
+      "right_omnipicker_rad": -0.785,
+      "motion_mode": 1,
+      "motion_error_code": 0
+    },
+    "left_p4": {
+      "name": "left_p4",
+      "captured_at_utc": "2026-09-08T06:48:46.645886+00:00",
+      "side": "left",
+      "joint_names": [
+        "idx21_arm_l_joint1",
+        "idx22_arm_l_joint2",
+        "idx23_arm_l_joint3",
+        "idx24_arm_l_joint4",
+        "idx25_arm_l_joint5",
+        "idx26_arm_l_joint6",
+        "idx27_arm_l_joint7"
+      ],
+      "joint_positions_rad": [
+        1.215768657400752,
+        -1.5412236539442752,
+        -1.0540780142940938,
+        -1.8509515524074172,
+        1.7308346249190205,
+        0.7330810295731142,
+        -0.9934141075076768
+      ],
+      "both_arms_rad": {
+        "idx21_arm_l_joint1": 1.215768657400752,
+        "idx22_arm_l_joint2": -1.5412236539442752,
+        "idx23_arm_l_joint3": -1.0540780142940938,
+        "idx24_arm_l_joint4": -1.8509515524074172,
+        "idx25_arm_l_joint5": 1.7308346249190205,
+        "idx26_arm_l_joint6": 0.7330810295731142,
+        "idx27_arm_l_joint7": -0.9934141075076768,
+        "idx61_arm_r_joint1": -2.381510965567829,
+        "idx62_arm_r_joint2": -1.153402351519113,
+        "idx63_arm_r_joint3": 1.6881736604699287,
+        "idx64_arm_r_joint4": -2.0091519498000556,
+        "idx65_arm_r_joint5": -1.1454280083196722,
+        "idx66_arm_r_joint6": 0.0027779433330616535,
+        "idx67_arm_r_joint7": -0.20395928397976537
+      },
+      "all_gdk_motor_positions_rad": {
+        "idx01_body_joint1": -0.6943999755851924,
+        "idx02_body_joint2": 1.3447049775688955,
+        "idx03_body_joint3": -0.4551368144779809,
+        "idx04_body_joint4": 0.0,
+        "idx05_body_joint5": 0.0,
+        "idx11_head_joint1": 0.0,
+        "idx12_head_joint2": 0.0,
+        "idx13_head_joint3": 0.41756022827845085,
+        "idx21_arm_l_joint1": 1.215768657400752,
+        "idx22_arm_l_joint2": -1.5412236539442752,
+        "idx23_arm_l_joint3": -1.0540780142940938,
+        "idx24_arm_l_joint4": -1.8509515524074172,
+        "idx25_arm_l_joint5": 1.7308346249190205,
+        "idx26_arm_l_joint6": 0.7330810295731142,
+        "idx27_arm_l_joint7": -0.9934141075076768,
+        "idx61_arm_r_joint1": -2.381510965567829,
+        "idx62_arm_r_joint2": -1.153402351519113,
+        "idx63_arm_r_joint3": 1.6881736604699287,
+        "idx64_arm_r_joint4": -2.0091519498000556,
+        "idx65_arm_r_joint5": -1.1454280083196722,
+        "idx66_arm_r_joint6": 0.0027779433330616535,
+        "idx67_arm_r_joint7": -0.20395928397976537
+      },
+      "left_omnipicker_names": [
+        "idx31_gripper_l_inner_joint1"
+      ],
+      "left_omnipicker_rad": -0.785,
+      "right_omnipicker_names": [
+        "idx71_gripper_r_inner_joint1"
+      ],
+      "right_omnipicker_rad": -0.7835782777777778,
+      "motion_mode": 1,
+      "motion_error_code": 0
+    },
+    "right_post_grasp": {
+      "name": "right_post_grasp",
+      "captured_at_utc": "2026-08-31T05:29:44.607267+00:00",
+      "side": "right",
+      "joint_names": [
+        "idx61_arm_r_joint1",
+        "idx62_arm_r_joint2",
+        "idx63_arm_r_joint3",
+        "idx64_arm_r_joint4",
+        "idx65_arm_r_joint5",
+        "idx66_arm_r_joint6",
+        "idx67_arm_r_joint7"
+      ],
+      "joint_positions_rad": [
+        -0.6872136058557612,
+        -1.2838813991245095,
+        0.5546510208557356,
+        -0.8308392283400851,
+        -1.153920509456604,
+        -0.9257272052422229,
+        -0.3079372954726163
+      ],
+      "both_arms_rad": {
+        "idx21_arm_l_joint1": 1.0167188709431314,
+        "idx22_arm_l_joint2": -1.5850431733623842,
+        "idx23_arm_l_joint3": -1.1629429530188509,
+        "idx24_arm_l_joint4": -1.6974389044287579,
+        "idx25_arm_l_joint5": 1.5246927738994918,
+        "idx26_arm_l_joint6": 0.5820531907863314,
+        "idx27_arm_l_joint7": -1.1178460750154962,
+        "idx61_arm_r_joint1": -0.6872136058557612,
+        "idx62_arm_r_joint2": -1.2838813991245095,
+        "idx63_arm_r_joint3": 0.5546510208557356,
+        "idx64_arm_r_joint4": -0.8308392283400851,
+        "idx65_arm_r_joint5": -1.153920509456604,
+        "idx66_arm_r_joint6": -0.9257272052422229,
+        "idx67_arm_r_joint7": -0.3079372954726163
+      },
+      "all_gdk_motor_positions_rad": {
+        "idx01_body_joint1": -0.859564409314249,
+        "idx02_body_joint2": 1.5168670918912321,
+        "idx03_body_joint3": -0.5386296884060183,
+        "idx04_body_joint4": 0.0,
+        "idx05_body_joint5": 0.0,
+        "idx11_head_joint1": 0.0,
+        "idx12_head_joint2": 0.002588183233130894,
+        "idx13_head_joint3": 0.471241065706351,
+        "idx21_arm_l_joint1": 1.0167188709431314,
+        "idx22_arm_l_joint2": -1.5850431733623842,
+        "idx23_arm_l_joint3": -1.1629429530188509,
+        "idx24_arm_l_joint4": -1.6974389044287579,
+        "idx25_arm_l_joint5": 1.5246927738994918,
+        "idx26_arm_l_joint6": 0.5820531907863314,
+        "idx27_arm_l_joint7": -1.1178460750154962,
+        "idx61_arm_r_joint1": -0.6872136058557612,
+        "idx62_arm_r_joint2": -1.2838813991245095,
+        "idx63_arm_r_joint3": 0.5546510208557356,
+        "idx64_arm_r_joint4": -0.8308392283400851,
+        "idx65_arm_r_joint5": -1.153920509456604,
+        "idx66_arm_r_joint6": -0.9257272052422229,
+        "idx67_arm_r_joint7": -0.3079372954726163
+      },
+      "left_omnipicker_names": [
+        "idx31_gripper_l_inner_joint1"
+      ],
+      "left_omnipicker_rad": -0.19297916666666667,
+      "right_omnipicker_names": [
+        "idx71_gripper_r_inner_joint1"
+      ],
+      "right_omnipicker_rad": -0.7835782777777778,
+      "motion_mode": 1,
+      "motion_error_code": 0
+    },
+    "right_pr1": {
+      "name": "right_pr1",
+      "captured_at_utc": "2026-09-08T06:49:29.616613+00:00",
+      "side": "right",
+      "joint_names": [
+        "idx61_arm_r_joint1",
+        "idx62_arm_r_joint2",
+        "idx63_arm_r_joint3",
+        "idx64_arm_r_joint4",
+        "idx65_arm_r_joint5",
+        "idx66_arm_r_joint6",
+        "idx67_arm_r_joint7"
+      ],
+      "joint_positions_rad": [
+        -1.5955275725208355,
+        -1.507915697927736,
+        1.6717363372742395,
+        -1.864699136165348,
+        -1.4664851538496768,
+        0.23537041682570117,
+        0.003942809993862312
+      ],
+      "both_arms_rad": {
+        "idx21_arm_l_joint1": 1.2153198481780463,
+        "idx22_arm_l_joint2": -1.541543033538003,
+        "idx23_arm_l_joint3": -1.0536393916625577,
+        "idx24_arm_l_joint4": -1.8509644953703148,
+        "idx25_arm_l_joint5": 1.7308226406941152,
+        "idx26_arm_l_joint6": 0.7330834264180952,
+        "idx27_arm_l_joint7": -0.9934212980426201,
+        "idx61_arm_r_joint1": -1.5955275725208355,
+        "idx62_arm_r_joint2": -1.507915697927736,
+        "idx63_arm_r_joint3": 1.6717363372742395,
+        "idx64_arm_r_joint4": -1.864699136165348,
+        "idx65_arm_r_joint5": -1.4664851538496768,
+        "idx66_arm_r_joint6": 0.23537041682570117,
+        "idx67_arm_r_joint7": 0.003942809993862312
+      },
+      "all_gdk_motor_positions_rad": {
+        "idx01_body_joint1": -0.6943999755851924,
+        "idx02_body_joint2": 1.3447049775688955,
+        "idx03_body_joint3": -0.4551368144779809,
+        "idx04_body_joint4": 0.0,
+        "idx05_body_joint5": 0.0,
+        "idx11_head_joint1": 0.0,
+        "idx12_head_joint2": 0.0,
+        "idx13_head_joint3": 0.41756022827845085,
+        "idx21_arm_l_joint1": 1.2153198481780463,
+        "idx22_arm_l_joint2": -1.541543033538003,
+        "idx23_arm_l_joint3": -1.0536393916625577,
+        "idx24_arm_l_joint4": -1.8509644953703148,
+        "idx25_arm_l_joint5": 1.7308226406941152,
+        "idx26_arm_l_joint6": 0.7330834264180952,
+        "idx27_arm_l_joint7": -0.9934212980426201,
+        "idx61_arm_r_joint1": -1.5955275725208355,
+        "idx62_arm_r_joint2": -1.507915697927736,
+        "idx63_arm_r_joint3": 1.6717363372742395,
+        "idx64_arm_r_joint4": -1.864699136165348,
+        "idx65_arm_r_joint5": -1.4664851538496768,
+        "idx66_arm_r_joint6": 0.23537041682570117,
+        "idx67_arm_r_joint7": 0.003942809993862312
+      },
+      "left_omnipicker_names": [
+        "idx31_gripper_l_inner_joint1"
+      ],
+      "left_omnipicker_rad": -0.785,
+      "right_omnipicker_names": [
+        "idx71_gripper_r_inner_joint1"
+      ],
+      "right_omnipicker_rad": -0.785,
+      "motion_mode": 1,
+      "motion_error_code": 0
+    },
+    "right_pr2": {
+      "name": "right_pr2",
+      "captured_at_utc": "2026-09-05T09:20:38.223605+00:00",
+      "side": "right",
+      "joint_names": [
+        "idx61_arm_r_joint1",
+        "idx62_arm_r_joint2",
+        "idx63_arm_r_joint3",
+        "idx64_arm_r_joint4",
+        "idx65_arm_r_joint5",
+        "idx66_arm_r_joint6",
+        "idx67_arm_r_joint7"
+      ],
+      "joint_positions_rad": [
+        -1.0007854444572963,
+        -1.6607309439117361,
+        0.8887256711624365,
+        -1.5158731034226436,
+        -1.4138135266526421,
+        0.11163209625540403,
+        0.3712614605035242
+      ],
+      "both_arms_rad": {
+        "idx21_arm_l_joint1": 1.153344228028322,
+        "idx22_arm_l_joint2": -1.3477245609886521,
+        "idx23_arm_l_joint3": -1.6755456430026563,
+        "idx24_arm_l_joint4": -1.777812067494524,
+        "idx25_arm_l_joint5": 1.2134173924217375,
+        "idx26_arm_l_joint6": -0.006103565744298102,
+        "idx27_arm_l_joint7": -0.6916848802205334,
+        "idx61_arm_r_joint1": -1.0007854444572963,
+        "idx62_arm_r_joint2": -1.6607309439117361,
+        "idx63_arm_r_joint3": 0.8887256711624365,
+        "idx64_arm_r_joint4": -1.5158731034226436,
+        "idx65_arm_r_joint5": -1.4138135266526421,
+        "idx66_arm_r_joint6": 0.11163209625540403,
+        "idx67_arm_r_joint7": 0.3712614605035242
+      },
+      "all_gdk_motor_positions_rad": {
+        "idx01_body_joint1": -0.863015320291757,
+        "idx02_body_joint2": 1.5211807306131169,
+        "idx03_body_joint3": -0.5427516098513748,
+        "idx04_body_joint4": 0.0,
+        "idx05_body_joint5": 0.0,
+        "idx11_head_joint1": 0.0,
+        "idx12_head_joint2": 0.0,
+        "idx13_head_joint3": 0.41765608691671496,
+        "idx21_arm_l_joint1": 1.153344228028322,
+        "idx22_arm_l_joint2": -1.3477245609886521,
+        "idx23_arm_l_joint3": -1.6755456430026563,
+        "idx24_arm_l_joint4": -1.777812067494524,
+        "idx25_arm_l_joint5": 1.2134173924217375,
+        "idx26_arm_l_joint6": -0.006103565744298102,
+        "idx27_arm_l_joint7": -0.6916848802205334,
+        "idx61_arm_r_joint1": -1.0007854444572963,
+        "idx62_arm_r_joint2": -1.6607309439117361,
+        "idx63_arm_r_joint3": 0.8887256711624365,
+        "idx64_arm_r_joint4": -1.5158731034226436,
+        "idx65_arm_r_joint5": -1.4138135266526421,
+        "idx66_arm_r_joint6": 0.11163209625540403,
+        "idx67_arm_r_joint7": 0.3712614605035242
+      },
+      "left_omnipicker_names": [
+        "idx31_gripper_l_inner_joint1"
+      ],
+      "left_omnipicker_rad": 0.0,
+      "right_omnipicker_names": [
+        "idx71_gripper_r_inner_joint1"
+      ],
+      "right_omnipicker_rad": -0.7835782777777778,
+      "motion_mode": 1,
+      "motion_error_code": 0
+    },
+    "left_handoff_1": {
+      "name": "left_handoff_1",
+      "captured_at_utc": "2026-09-08T06:35:20.568781+00:00",
+      "side": "left",
+      "joint_names": [
+        "idx21_arm_l_joint1",
+        "idx22_arm_l_joint2",
+        "idx23_arm_l_joint3",
+        "idx24_arm_l_joint4",
+        "idx25_arm_l_joint5",
+        "idx26_arm_l_joint6",
+        "idx27_arm_l_joint7"
+      ],
+      "joint_positions_rad": [
+        1.126682922881375,
+        -1.5178618056508548,
+        -1.1092529063893593,
+        -2.0221124096662026,
+        1.6686515977836007,
+        0.6283899566983946,
+        -1.0788381420020547
+      ],
+      "both_arms_rad": {
+        "idx21_arm_l_joint1": 1.126682922881375,
+        "idx22_arm_l_joint2": -1.5178618056508548,
+        "idx23_arm_l_joint3": -1.1092529063893593,
+        "idx24_arm_l_joint4": -2.0221124096662026,
+        "idx25_arm_l_joint5": 1.6686515977836007,
+        "idx26_arm_l_joint6": 0.6283899566983946,
+        "idx27_arm_l_joint7": -1.0788381420020547,
+        "idx61_arm_r_joint1": -1.241441863204252,
+        "idx62_arm_r_joint2": -1.060673212891426,
+        "idx63_arm_r_joint3": 1.335986532010268,
+        "idx64_arm_r_joint4": -2.115304618744233,
+        "idx65_arm_r_joint5": -1.0189294810691734,
+        "idx66_arm_r_joint6": -0.03006746154954721,
+        "idx67_arm_r_joint7": 0.5263843089404672
+      },
+      "all_gdk_motor_positions_rad": {
+        "idx01_body_joint1": -0.8628236030152288,
+        "idx02_body_joint2": 1.5207014374217962,
+        "idx03_body_joint3": -0.5423681752983185,
+        "idx04_body_joint4": 0.0,
+        "idx05_body_joint5": 0.0,
+        "idx11_head_joint1": 0.0,
+        "idx12_head_joint2": 0.0,
+        "idx13_head_joint3": 0.47085763115329454,
+        "idx21_arm_l_joint1": 1.126682922881375,
+        "idx22_arm_l_joint2": -1.5178618056508548,
+        "idx23_arm_l_joint3": -1.1092529063893593,
+        "idx24_arm_l_joint4": -2.0221124096662026,
+        "idx25_arm_l_joint5": 1.6686515977836007,
+        "idx26_arm_l_joint6": 0.6283899566983946,
+        "idx27_arm_l_joint7": -1.0788381420020547,
+        "idx61_arm_r_joint1": -1.241441863204252,
+        "idx62_arm_r_joint2": -1.060673212891426,
+        "idx63_arm_r_joint3": 1.335986532010268,
+        "idx64_arm_r_joint4": -2.115304618744233,
+        "idx65_arm_r_joint5": -1.0189294810691734,
+        "idx66_arm_r_joint6": -0.03006746154954721,
+        "idx67_arm_r_joint7": 0.5263843089404672
+      },
+      "left_omnipicker_names": [
+        "idx31_gripper_l_inner_joint1"
+      ],
+      "left_omnipicker_rad": -0.04465777777777777,
+      "right_omnipicker_names": [
+        "idx71_gripper_r_inner_joint1"
+      ],
+      "right_omnipicker_rad": -0.7835782777777778,
+      "motion_mode": 1,
+      "motion_error_code": 0
+    },
+    "left_handoff_2": {
+      "name": "left_handoff_2",
+      "captured_at_utc": "2026-09-08T06:35:40.932906+00:00",
+      "side": "left",
+      "joint_names": [
+        "idx21_arm_l_joint1",
+        "idx22_arm_l_joint2",
+        "idx23_arm_l_joint3",
+        "idx24_arm_l_joint4",
+        "idx25_arm_l_joint5",
+        "idx26_arm_l_joint6",
+        "idx27_arm_l_joint7"
+      ],
+      "joint_positions_rad": [
+        2.0136128378365767,
+        -1.2767362044988544,
+        -1.8466703079022277,
+        -2.088429994393971,
+        1.3591503609608353,
+        0.028120744055921087,
+        0.0479980191684436
+      ],
+      "both_arms_rad": {
+        "idx21_arm_l_joint1": 2.0136128378365767,
+        "idx22_arm_l_joint2": -1.2767362044988544,
+        "idx23_arm_l_joint3": -1.8466703079022277,
+        "idx24_arm_l_joint4": -2.088429994393971,
+        "idx25_arm_l_joint5": 1.3591503609608353,
+        "idx26_arm_l_joint6": 0.028120744055921087,
+        "idx27_arm_l_joint7": 0.0479980191684436,
+        "idx61_arm_r_joint1": -1.2415844754806258,
+        "idx62_arm_r_joint2": -1.060599509908258,
+        "idx63_arm_r_joint3": 1.3359817383203059,
+        "idx64_arm_r_joint4": -2.1153532746973487,
+        "idx65_arm_r_joint5": -1.0189469780375353,
+        "idx66_arm_r_joint6": -0.030067701234045317,
+        "idx67_arm_r_joint7": 0.5264063599142931
+      },
+      "all_gdk_motor_positions_rad": {
+        "idx01_body_joint1": -0.8628236030152288,
+        "idx02_body_joint2": 1.5207014374217962,
+        "idx03_body_joint3": -0.5423681752983185,
+        "idx04_body_joint4": 0.0,
+        "idx05_body_joint5": 0.0,
+        "idx11_head_joint1": 0.0,
+        "idx12_head_joint2": 0.0,
+        "idx13_head_joint3": 0.47085763115329454,
+        "idx21_arm_l_joint1": 2.0136128378365767,
+        "idx22_arm_l_joint2": -1.2767362044988544,
+        "idx23_arm_l_joint3": -1.8466703079022277,
+        "idx24_arm_l_joint4": -2.088429994393971,
+        "idx25_arm_l_joint5": 1.3591503609608353,
+        "idx26_arm_l_joint6": 0.028120744055921087,
+        "idx27_arm_l_joint7": 0.0479980191684436,
+        "idx61_arm_r_joint1": -1.2415844754806258,
+        "idx62_arm_r_joint2": -1.060599509908258,
+        "idx63_arm_r_joint3": 1.3359817383203059,
+        "idx64_arm_r_joint4": -2.1153532746973487,
+        "idx65_arm_r_joint5": -1.0189469780375353,
+        "idx66_arm_r_joint6": -0.030067701234045317,
+        "idx67_arm_r_joint7": 0.5264063599142931
+      },
+      "left_omnipicker_names": [
+        "idx31_gripper_l_inner_joint1"
+      ],
+      "left_omnipicker_rad": -0.04062374999999997,
+      "right_omnipicker_names": [
+        "idx71_gripper_r_inner_joint1"
+      ],
+      "right_omnipicker_rad": -0.7835782777777778,
+      "motion_mode": 1,
+      "motion_error_code": 0
+    }
+  }
+}

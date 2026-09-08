@@ -1,0 +1,81 @@
+{
+  "schema_version": 1,
+  "calibrated": true,
+  "right_mode1_probe_verified": true,
+  "description": "OpenArm 右手三张 tagStandard41h12 工件定位迁移至 G2。运动前必须填写实测的 right_end_from_grasp_tcp 并完成右臂 1 mm mode-1 探针。",
+  "tag_sample_count": 20,
+  "max_reprojection_error_px": 3.0,
+  "calibration_max_reprojection_error_px": 3.0,
+  "observation": {
+    "max_sample_age_s": 2.5,
+    "max_end_link_motion_m": 0.001,
+    "max_end_link_rotation_deg": 0.5
+  },
+  "tf": {"max_age_ms": 25.0},
+  "pregrasp_calibration": {
+    "min_distance_m": 0.015,
+    "max_distance_m": 0.050,
+    "max_lateral_error_m": 0.010,
+    "max_orientation_error_deg": 3.0
+  },
+  "right_end_from_grasp_tcp": {
+    "matrix": [
+      [0.011902496, -0.997895061, -0.063747771, -0.001023844],
+      [0.999150804, 0.014384, -0.038610515, 0.028158113],
+      [0.03944619, -0.063234075, 0.997218858, 0.144850634],
+      [0.0, 0.0, 0.0, 1.0]
+    ]
+  },
+  "workpiece_from_pregrasp_end": {
+    "matrix": [
+      [-0.997895061, 0.014384, -0.063234075, 0.010771959],
+      [-0.063747771, -0.038610515, 0.997218857, -0.23054015],
+      [0.011902496, 0.999150804, 0.03944619, -0.05141079],
+      [0.0, 0.0, 0.0, 1.0]
+    ]
+  },
+  "autonomous_approach": {
+    "enabled": true,
+    "max_waypoint_translation_m": 0.005,
+    "max_waypoint_orientation_deg": 2.0,
+    "speed_mps": 0.010,
+    "angular_speed_deg_s": 10.0,
+    "waypoint_timeout_s": 8.0,
+    "actual_position_tolerance_m": 0.002,
+    "actual_orientation_tolerance_deg": 0.5,
+    "stable_samples": 3,
+    "servo_sample_count": 1,
+    "min_visual_lock_inliers": 8,
+    "visual_lock_timeout_s": 3.0,
+    "visual_lock_hold_timeout_s": 30.0,
+    "max_target_delta_m": 0.030,
+    "max_target_delta_deg": 5.0,
+    "jump_reacquire_confirmations": 3,
+    "jump_cluster_delta_m": 0.010,
+    "jump_cluster_delta_deg": 3.0,
+    "orientation_relock_threshold_deg": 2.0,
+    "orientation_relock_confirmations": 3,
+    "orientation_relock_consistency_deg": 3.0,
+    "max_iterations": 80,
+    "max_total_duration_s": 120.0
+  },
+  "local_motion": {
+    "max_initial_pregrasp_error_m": 0.003,
+    "max_initial_orientation_error_deg": 0.5,
+    "max_final_approach_m": 0.050,
+    "final_speed_mps": 0.005,
+    "final_timeout_s": 10.0,
+    "final_actual_position_tolerance_m": 0.0005,
+    "final_actual_orientation_tolerance_deg": 0.5,
+    "final_actual_stable_samples": 10
+  },
+  "gripper": {
+    "open_rad": -0.785,
+    "closed_rad": 0.0,
+    "open_tolerance_rad": 0.05,
+    "open_timeout_s": 3.0,
+    "close_settle_s": 3.0,
+    "close_min_motion_rad": 0.02
+  },
+  "notes": "right_end_from_grasp_tcp 是 T_arm_r_end_link_grasp_tcp：需将 G2 右夹爪按该工件的最终抓取姿态人工放好，再由已验证的 AprilTag 目标和 GDK arm_r_end_link 当前位姿反求/核验。workpiece_from_pregrasp_end 必须由 --calibrate-pregrasp 实测，且只接受同 grasp 朝向、沿 grasp +Z 接近轴后退 15–50 mm、横向偏差不超过 10 mm 的候选值；程序仍会将候选投影到 grasp 接近轴，横向偏差不是被忽略而是被显式限制。不能使用 OpenArm 的 TCP 偏置、夹爪坐标或其未实测 pregrasp 约定。默认只读；--execute 必须同时有 --allow-motion，执行时先将右夹爪打开并确认反馈，视觉伺服连续到达 grasp 后在同一条 50 Hz GDK 位姿流中同步闭合；若闭合反馈完全不动则判定抓取失败。"
+}

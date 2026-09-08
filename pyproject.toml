@@ -10,6 +10,11 @@ vision = [
     "numpy>=1.26,<3",
     "opencv-python-headless>=4.9,<5",
 ]
+tags = [
+    "numpy>=1.26,<3",
+    "opencv-python-headless>=4.9,<5",
+    "pupil-apriltags>=1.0.4",
+]
 
 [tool.uv]
 package = false

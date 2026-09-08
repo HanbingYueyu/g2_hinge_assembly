@@ -3,7 +3,7 @@
 
 By default P2/P3 remain outside this program, so it can be used as a
 final-detection-position-only grasp tool. ``--full-cycle`` makes this the
-single GDK/SAM3 process for P2→P3→grasp→+Z lift→P4: SAM3 is loaded before
+single GDK/SAM3 process for P1→P2→grasp→+Z lift→P4: SAM3 is loaded before
 P2 is requested and GDK is initialized exactly once. Without ``--allow-motion``
 it is still a perception preview: it never changes a GDK control mode or sends
 an arm/Omnipicker request. With that one flag it refuses an uncalibrated
@@ -41,7 +41,7 @@ try:
     from .sam_crop import center_crop_bounds, center_crop_image, draw_crop_box, expand_crop_masks
     from .visual_servo import base_position_after_delta, empirical_horizontal_base_delta_from_pixel_error
     from .xy_mapping import choose_candidate_by_left_rank
-    from .yolo_hinge import associate_shaft_to_hinge, infer_yolo_masks, load_yolo_segmentation_model, review_matches, split_yolo_candidates
+    from .yolo_hinge import associate_shaft_to_hinge, infer_yolo_masks, load_yolo_segmentation_model, review_matches, reviewed_target_matches_selected, split_yolo_candidates
     from .record_pose import DEFAULT_OUTPUT as DEFAULT_POSES_OUTPUT
     from .run_left_premove_sequence import load_presets as load_premove_presets
     from .run_left_post_grasp_sequence import (
@@ -49,6 +49,8 @@ try:
         PRE_P4_LIFT_TOLERANCE_M,
         load_presets as load_post_grasp_presets,
     )
+    from .spacemouse_takeover import AdvanceRightRequested, MotionPauseGate, SpaceMouseTakeoverWorker
+    from .spacemouse_teleop import TeleopConfig
 except ImportError:
     from camera import align_depth_to_color, decode_color_rgb, decode_depth_u16, intrinsic_to_dict, transform_to_dict
     from contact_detection import ForceContactDetector, ForceContactParameters
@@ -60,7 +62,7 @@ except ImportError:
     from sam_crop import center_crop_bounds, center_crop_image, draw_crop_box, expand_crop_masks
     from visual_servo import base_position_after_delta, empirical_horizontal_base_delta_from_pixel_error
     from xy_mapping import choose_candidate_by_left_rank
-    from yolo_hinge import associate_shaft_to_hinge, infer_yolo_masks, load_yolo_segmentation_model, review_matches, split_yolo_candidates
+    from yolo_hinge import associate_shaft_to_hinge, infer_yolo_masks, load_yolo_segmentation_model, review_matches, reviewed_target_matches_selected, split_yolo_candidates
     from record_pose import DEFAULT_OUTPUT as DEFAULT_POSES_OUTPUT
     from run_left_premove_sequence import load_presets as load_premove_presets
     from run_left_post_grasp_sequence import (
@@ -68,6 +70,8 @@ except ImportError:
         PRE_P4_LIFT_TOLERANCE_M,
         load_presets as load_post_grasp_presets,
     )
+    from spacemouse_takeover import AdvanceRightRequested, MotionPauseGate, SpaceMouseTakeoverWorker
+    from spacemouse_teleop import TeleopConfig
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -87,6 +91,7 @@ DEFAULT_G2_NATIVE_YOLO = (
     if _PREFERRED_G2_HINGE_SHAFT_YOLO.is_file()
     else _ROLLBACK_G2_HINGE_YOLO
 )
+EXIT_ADVANCE_RIGHT = 20
 HINGE_CLASS_ID = 0
 SHAFT_CLASS_ID = 1
 
@@ -208,7 +213,7 @@ class NonBlockingLeftPresetSequence:
     """Send one recorded joint target at a time and poll it from the main loop.
 
     Unlike the legacy helper this class never sleeps or waits for an arrival.
-    It lets the web/SAM worker and safety monitor continue while P2/P3/P4
+    It lets the web/SAM worker and safety monitor continue while P1/P2/P3/P4
     targets are in flight.
     """
 
@@ -436,10 +441,21 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--full-cycle",
         action="store_true",
-        help="单进程执行 P2→P3、SAM3 抓取、+Z 上抬 150 mm、P4；要求 --allow-motion，且不能与受看护停止选项合用。",
+        help="单进程执行 P1→P2、SAM3 抓取、+Z 上抬 150 mm、P3→P4；要求 --allow-motion，且不能与受看护停止选项合用。",
     )
-    parser.add_argument("--poses", type=Path, default=DEFAULT_POSES_OUTPUT, help="包含左 P2/P3/P4 的 recorded_poses.json。")
-    parser.add_argument("--preset-velocity-rad-s", type=float, default=0.08, help="全流程 P2/P3/P4 的规划关节速度。")
+    parser.add_argument(
+        "--wait-for-next",
+        action="store_true",
+        help="全流程完成后保持 GDK、SpaceMouse 接管和 Web 服务，等待右按钮长按 2 秒进入右手流程。",
+    )
+    parser.add_argument("--poses", type=Path, default=DEFAULT_POSES_OUTPUT, help="包含左 P1/P2/P3/P4 的 recorded_poses.json。")
+    parser.add_argument("--preset-velocity-rad-s", type=float, default=0.08, help="全流程 P1/P2/P3/P4 的规划关节速度。")
+    parser.add_argument(
+        "--auto-preset-velocity-rad-s",
+        type=float,
+        default=None,
+        help="覆盖全流程 P1/P2/P3/P4 的自动关节速度，单位 rad/s；不随 --speed-mm-s 缩放。",
+    )
     parser.add_argument(
         "--speed-mm-s",
         type=float,
@@ -449,6 +465,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--speed-scale", type=float, default=None, help=argparse.SUPPRESS)
     parser.add_argument("--preset-arrival-tolerance-rad", type=float, default=0.03, help="全流程预设点到位关节容差。")
     parser.add_argument("--preset-timeout-s", type=float, default=25.0, help="全流程每个预设点的到位超时。")
+    parser.add_argument("--spacemouse-device", help="启用 SpaceMouse 临时接管；指定 /dev/hidrawN。")
+    parser.add_argument("--spacemouse-speed-mm-s", type=float, default=10.0, help="SpaceMouse 平移速度上限，单位 mm/s。")
+    parser.add_argument("--spacemouse-rotation-deg-s", type=float, default=10.0, help="SpaceMouse 旋转速度上限，单位 deg/s。")
+    parser.add_argument("--spacemouse-deadzone", type=float, default=0.12, help="SpaceMouse 轴死区。")
     parser.add_argument("--allow-motion", action="store_true", help="唯一运动确认参数；未指定时严格只读。")
     return parser.parse_args()
 
@@ -669,7 +689,8 @@ def compact_record(record: dict) -> dict:
         for key in (
             "event", "frame", "utc", "state", "reason", "error",
             "command_source", "motion_command_sent", "regrasp_attempt", "test_stop",
-            "post_grasp_verify", "perception_gate",
+            "post_grasp_verify", "perception_gate", "tracking", "selected_mask_index",
+            "tracking_lock_reset",
         )
         if key in record
     }
@@ -679,6 +700,17 @@ def compact_record(record: dict) -> dict:
             key: selected[key]
             for key in ("center_px", "depth_median_m", "yolo_confidence")
             if key in selected
+        }
+    review = record.get("sam_review")
+    if isinstance(review, dict):
+        summary["sam_review"] = {
+            key: review[key]
+            for key in (
+                "accepted", "fresh", "reason", "pixel_error", "depth_error_m",
+                "age_s", "yolo_center_px", "current_target_distance_px",
+                "reviewed_same_target",
+            )
+            if key in review
         }
     force = record.get("force_contact")
     if isinstance(force, dict) and "maximum_delta_force_n" in force:
@@ -780,25 +812,29 @@ def open_left_gripper_with_feedback(
     attempts = 0
     deadline = time.monotonic() + timeout_s
     latest: float | None = before
-    while True:
-        controller.move_gripper("left", target_rad)
-        attempts += 1
-        time.sleep(0.10)
-        latest = controller.read_gripper_position("left")
-        if latest is not None and abs(latest - target_rad) <= tolerance_rad:
-            return {
-                "event": "gripper_open_confirmed",
-                "target_rad": target_rad,
-                "before_position_rad": before,
-                "actual_position_rad": latest,
-                "tolerance_rad": tolerance_rad,
-                "attempts": attempts,
-            }
-        if time.monotonic() >= deadline:
-            raise SafetyError(
-                "夹爪张开反馈超时；未进入视觉伺服、下探或后续预设动作："
-                f"target={target_rad:.6f}rad, actual={latest}, attempts={attempts}"
-            )
+    stream = controller.start_left_gripper_position_stream(target_rad)
+    try:
+        while True:
+            stream.raise_if_failed()
+            attempts += 1
+            time.sleep(0.10)
+            latest = controller.read_gripper_position("left")
+            if latest is not None and abs(latest - target_rad) <= tolerance_rad:
+                return {
+                    "event": "gripper_open_confirmed",
+                    "target_rad": target_rad,
+                    "before_position_rad": before,
+                    "actual_position_rad": latest,
+                    "tolerance_rad": tolerance_rad,
+                    "attempts": attempts,
+                }
+            if time.monotonic() >= deadline:
+                raise SafetyError(
+                    "夹爪张开反馈超时；未进入视觉伺服、下探或后续预设动作："
+                    f"target={target_rad:.6f}rad, actual={latest}, attempts={attempts}"
+                )
+    finally:
+        stream.stop()
 
 
 def recover_for_visual_regrasp(
@@ -1339,6 +1375,10 @@ def main() -> int:
         and args.track_hold_frames >= 0
         and 0 <= args.web_port <= 65535
         and 0.0 < args.preset_velocity_rad_s <= 0.15
+        and (
+            args.auto_preset_velocity_rad_s is None
+            or 0.0 < args.auto_preset_velocity_rad_s <= 0.15
+        )
         and 0.001 <= args.preset_arrival_tolerance_rad <= 0.10
         and 1.0 <= args.preset_timeout_s <= 30.0
         and 1.0 <= args.pre_final_settle_timeout_s <= 10.0
@@ -1357,6 +1397,9 @@ def main() -> int:
         return 2
     if args.full_cycle and (not args.allow_motion or args.stop_after != "none" or args.single_xy_step):
         print("--full-cycle 必须同时指定 --allow-motion，且不能与 --stop-after 或 --single-xy-step 合用。", file=sys.stderr)
+        return 2
+    if args.wait_for_next and (not args.full_cycle or not args.spacemouse_device):
+        print("--wait-for-next 必须与 --full-cycle 和 --spacemouse-device 共用。", file=sys.stderr)
         return 2
     try:
         config, parameters, gripper_open, gripper_tolerance, gripper_close_timeout, empirical_pixel_jacobian, contact_parameters, adaptive_gripper = load_config(
@@ -1380,19 +1423,34 @@ def main() -> int:
     if not math.isfinite(speed_mm_s) or not 1.0 <= speed_mm_s <= 18.0:
         print("参数错误：--speed-mm-s 必须在 1～18 mm/s 之间。", file=sys.stderr)
         return 2
+    if (
+        not 1.0 <= args.spacemouse_speed_mm_s <= 30.0
+        or not 1.0 <= args.spacemouse_rotation_deg_s <= 28.6
+        or not 0.0 <= args.spacemouse_deadzone <= 0.5
+    ):
+        print("参数错误：SpaceMouse 速度、旋转速度或死区无效。", file=sys.stderr)
+        return 2
+    if args.spacemouse_device and not args.allow_motion:
+        print("--spacemouse-device 必须与 --allow-motion 共用。", file=sys.stderr)
+        return 2
     speed_scale = speed_mm_s / base_speed_mm_s
-    motion_preset_velocity_rad_s = args.preset_velocity_rad_s * speed_scale
-    motion_preset_timeout_s = args.preset_timeout_s / speed_scale
+    motion_preset_velocity_rad_s = (
+        args.preset_velocity_rad_s
+        if args.auto_preset_velocity_rad_s is None
+        else args.auto_preset_velocity_rad_s
+    )
+    motion_preset_timeout_s = args.preset_timeout_s
     if motion_preset_velocity_rad_s > 0.15:
         print("参数错误：该速度会超过 GDK 预设关节速度上限 0.15 rad/s。", file=sys.stderr)
         return 2
     if parameters is not None:
-        # Keep the configured descent distance unchanged while changing only
-        # its traversal speed: duration is inversely scaled.
+        # The duration encodes the maximum descent distance, not a separate
+        # speed multiplier. Preserve that distance at the explicit speed.
+        descent_distance_m = parameters.final_descent_speed_mps * parameters.final_descent_duration_s
         parameters = replace(
             parameters,
-            final_descent_speed_mps=parameters.final_descent_speed_mps * speed_scale,
-            final_descent_duration_s=parameters.final_descent_duration_s / speed_scale,
+            final_descent_speed_mps=speed_mm_s / 1000.0,
+            final_descent_duration_s=descent_distance_m / (speed_mm_s / 1000.0),
         )
     premove_presets: list[tuple[str, list[float]]] | None = None
     post_grasp_presets: list[tuple[str, list[float]]] | None = None
@@ -1438,9 +1496,9 @@ def main() -> int:
         "preset_timeout_s": motion_preset_timeout_s,
         "poses": None if not args.full_cycle else str(args.poses.expanduser().resolve()),
         "safety": (
-            "single process: preload SAM3, then P2/P3→visual grasp→+Z 150 mm→P4; "
+            "single process: preload SAM3, then P1/P2→visual grasp→+Z 150 mm→P3→P4; "
             "one GDK initialization and no extra gripper command after grasp"
-            if args.full_cycle else "P2/P3/P4 are not commanded by this program"
+            if args.full_cycle else "P1/P2/P3/P4 are not commanded by this program"
         ),
     }, ensure_ascii=False))
 
@@ -1448,11 +1506,15 @@ def main() -> int:
     camera = None
     perception: PersistentPerception | None = None
     position_stream: LeftEndEffectorPositionStream | None = None
+    initial_gripper_open_stream: LeftEndEffectorPositionStream | None = None
+    post_grasp_regrasp_open_stream: LeftEndEffectorPositionStream | None = None
     force_preview_stop: threading.Event | None = None
     force_preview_thread: threading.Thread | None = None
     force_preview_phase: dict[str, str] | None = None
     web_server: ThreadingHTTPServer | None = None
     web_shared: SharedView | None = None
+    motion_gate: MotionPauseGate | None = None
+    takeover_worker: SpaceMouseTakeoverWorker | None = None
     try:
         if args.web_port:
             web_shared = SharedView()
@@ -1464,8 +1526,30 @@ def main() -> int:
         initialized = True
         robot = agibot_gdk.Robot()
         time.sleep(1.0)
-        controller = G2Controller(agibot_gdk, robot, allow_motion=args.allow_motion, control_period_s=args.control_period_s)
+        if args.spacemouse_device:
+            motion_gate = MotionPauseGate()
+        controller = G2Controller(
+            agibot_gdk,
+            robot,
+            allow_motion=args.allow_motion,
+            control_period_s=args.control_period_s,
+            motion_gate=motion_gate,
+        )
         controller.checked_arm_state()
+        if args.spacemouse_device:
+            takeover_worker = SpaceMouseTakeoverWorker(
+                controller,
+                motion_gate,
+                device=args.spacemouse_device,
+                config=TeleopConfig(
+                    side="left",
+                    speed_m_s=args.spacemouse_speed_mm_s / 1000.0,
+                    angular_speed_rad_s=math.radians(args.spacemouse_rotation_deg_s),
+                    deadzone=args.spacemouse_deadzone,
+                ),
+                allow_advance_right=True,
+            )
+            takeover_worker.start()
         camera_type = agibot_gdk.CameraType.kHandLeftColor
         depth_type = agibot_gdk.CameraType.kHandLeftDepth
         camera = agibot_gdk.Camera([camera_type, depth_type])
@@ -1553,11 +1637,43 @@ def main() -> int:
                 )
             if not args.full_cycle and args.allow_motion and args.stop_after == "none":
                 assert gripper_open is not None and gripper_tolerance is not None and gripper_close_timeout is not None
+                initial_gripper_open_stream = controller.start_left_gripper_position_stream(gripper_open)
                 initial_gripper_open = {
                     "deadline": time.monotonic() + gripper_close_timeout,
                     "next_command_at": time.monotonic(), "attempts": 0,
                 }
+
+            def wait_for_manual_next() -> int:
+                if not args.wait_for_next:
+                    return 0
+                if takeover_worker is None:
+                    raise SafetyError("--wait-for-next 需要已启动的 SpaceMouse 接管线程")
+                json_record(log, {
+                    "event": "left_stage_complete_waiting_for_manual_next",
+                    "utc": datetime.now(timezone.utc).isoformat(),
+                    "source": "spacemouse_right_long_press_2s",
+                    "takeover_available": True,
+                })
+                print("左手流程已完成；可双击任一按钮临时接管，右按钮长按 2 秒启动右手流程。", flush=True)
+                while True:
+                    takeover_worker.raise_if_failed()
+                    if takeover_worker.advance_requested:
+                        return EXIT_ADVANCE_RIGHT
+                    time.sleep(0.01)
+
             while args.max_frames == 0 or frame < args.max_frames:
+                if takeover_worker is not None:
+                    takeover_worker.raise_if_failed()
+                    if takeover_worker.advance_requested:
+                        json_record(log, {
+                            "event": "advance_right_requested",
+                            "utc": datetime.now(timezone.utc).isoformat(),
+                            "source": "spacemouse_right_long_press_2s",
+                        })
+                        return EXIT_ADVANCE_RIGHT
+                    if motion_gate is not None and motion_gate.is_paused():
+                        time.sleep(0.01)
+                        continue
                 if post_grasp_verify_motion is not None:
                     assert position_stream is not None
                     verify = post_grasp_verify_motion
@@ -1580,7 +1696,7 @@ def main() -> int:
                         position_stream.stop()
                         position_stream = None
                         assert gripper_open is not None and gripper_close_timeout is not None
-                        controller.move_gripper("left", gripper_open)
+                        post_grasp_regrasp_open_stream = controller.start_left_gripper_position_stream(gripper_open)
                         post_grasp_regrasp_open = {
                             "reason": "post_grasp_verify_lift_target_not_reached",
                             "orientation_xyzw": last_end_link_target.orientation_xyzw,
@@ -1605,12 +1721,14 @@ def main() -> int:
                         json_record(log, {
                             "event": "premove_complete",
                             "utc": datetime.now(timezone.utc).isoformat(),
-                            "final_detection_preset": "left_p3",
+                            "final_detection_preset": "left_p2",
                             "nonblocking": True,
                         })
                         premove_sequence = None
                         if args.allow_motion and args.stop_after == "none":
                             assert gripper_close_timeout is not None
+                            assert gripper_open is not None
+                            initial_gripper_open_stream = controller.start_left_gripper_position_stream(gripper_open)
                             initial_gripper_open = {
                                 "deadline": time.monotonic() + gripper_close_timeout,
                                 "next_command_at": time.monotonic(), "attempts": 0,
@@ -1618,11 +1736,10 @@ def main() -> int:
                     continue
                 if initial_gripper_open is not None:
                     assert gripper_open is not None and gripper_tolerance is not None
+                    assert initial_gripper_open_stream is not None
                     now = time.monotonic()
-                    if now >= initial_gripper_open["next_command_at"]:
-                        controller.move_gripper("left", gripper_open)
-                        initial_gripper_open["attempts"] += 1
-                        initial_gripper_open["next_command_at"] = now + 0.10
+                    initial_gripper_open_stream.raise_if_failed()
+                    initial_gripper_open["attempts"] += 1
                     position = controller.read_gripper_position("left")
                     if position is not None and abs(position - gripper_open) <= gripper_tolerance:
                         json_record(log, {
@@ -1632,20 +1749,29 @@ def main() -> int:
                             "attempts": initial_gripper_open["attempts"],
                             "nonblocking": True,
                         })
+                        initial_gripper_open_stream.stop()
+                        initial_gripper_open_stream = None
                         initial_gripper_open = None
                     elif now > initial_gripper_open["deadline"]:
-                        raise SafetyError("夹爪张开反馈超时；未进入视觉伺服、下探或后续预设动作")
+                        initial_gripper_open_stream.stop()
+                        initial_gripper_open_stream = None
+                        raise SafetyError(
+                            "夹爪张开反馈超时；未进入视觉伺服、下探或后续预设动作："
+                            f"target={gripper_open:.6f}rad, actual={position}, "
+                            f"attempts={initial_gripper_open['attempts']}"
+                        )
                     continue
                 if post_grasp_regrasp_open is not None:
                     assert gripper_open is not None and gripper_tolerance is not None
+                    assert post_grasp_regrasp_open_stream is not None
                     recovery = post_grasp_regrasp_open
                     now = time.monotonic()
-                    if now >= recovery["next_command_at"]:
-                        controller.move_gripper("left", gripper_open)
-                        recovery["attempts"] += 1
-                        recovery["next_command_at"] = now + 0.10
+                    post_grasp_regrasp_open_stream.raise_if_failed()
+                    recovery["attempts"] += 1
                     position = controller.read_gripper_position("left")
                     if position is not None and abs(position - gripper_open) <= gripper_tolerance:
+                        post_grasp_regrasp_open_stream.stop()
+                        post_grasp_regrasp_open_stream = None
                         stop_force_descent_sam_preview(force_preview_stop, force_preview_thread)
                         force_preview_stop = force_preview_thread = None
                         force_preview_phase = None
@@ -1677,7 +1803,12 @@ def main() -> int:
                         })
                         post_grasp_regrasp_open = None
                     elif now > recovery["deadline"]:
-                        raise SafetyError("掉件后夹爪张开反馈超时；停止后续命令并保持当前实测状态")
+                        post_grasp_regrasp_open_stream.stop()
+                        post_grasp_regrasp_open_stream = None
+                        raise SafetyError(
+                            "掉件后夹爪张开反馈超时；停止后续命令并保持当前实测状态："
+                            f"target={gripper_open:.6f}rad, actual={position}, attempts={recovery['attempts']}"
+                        )
                     continue
                 # Once the part has passed the short visual verification,
                 # transport is advanced by polling only.  Do not enter a
@@ -1754,7 +1885,7 @@ def main() -> int:
                         position_stream.stop()
                         position_stream = None
                         assert gripper_open is not None and gripper_tolerance is not None and gripper_close_timeout is not None
-                        controller.move_gripper("left", gripper_open)
+                        post_grasp_regrasp_open_stream = controller.start_left_gripper_position_stream(gripper_open)
                         post_grasp_regrasp_open = {
                             "reason": "held_target_lost_or_changed_during_pre_p4_lift",
                             "monitor": monitor["failure"],
@@ -1886,7 +2017,7 @@ def main() -> int:
                             force_preview_stop = force_preview_thread = None
                             force_preview_phase = None
                             assert gripper_open is not None and gripper_close_timeout is not None
-                            controller.move_gripper("left", gripper_open)
+                            post_grasp_regrasp_open_stream = controller.start_left_gripper_position_stream(gripper_open)
                             post_grasp_regrasp_open = {
                                 "reason": "held_target_lost_or_changed_before_p4",
                                 "monitor": failure,
@@ -1939,8 +2070,8 @@ def main() -> int:
                             "gripper": "preserved after confirmed grasp",
                             "nonblocking": True,
                         })
-                        print("完整流程完成：P2→P3、抓取、受监控 +Z 上抬 150 mm、P4；夹爪保持闭合。")
-                        return 0
+                        print("完整流程完成：P1→P2、抓取、受监控 +Z 上抬 150 mm、P3→P4；夹爪保持闭合。")
+                        return wait_for_manual_next()
                     time.sleep(0.01)
                     continue
                 frame += 1
@@ -2035,14 +2166,24 @@ def main() -> int:
                     if args.detector == "yolo-sam":
                         yolo_sam_review = dict(snapshot["sam_review"])
                         record["sam_review"] = {key: value for key, value in yolo_sam_review.items() if key != "timestamp_monotonic"}
-                        reviewed_same_target = (
-                            selected is not None
-                            and yolo_sam_review.get("yolo_center_px") is not None
-                            and float(np.linalg.norm(np.asarray(statistics[selected]["center_px"], dtype=np.float64) - np.asarray(yolo_sam_review["yolo_center_px"], dtype=np.float64))) <= args.track_max_distance_px
+                        reviewed_same_target, review_distance_px = reviewed_target_matches_selected(
+                            None if selected is None else statistics[selected],
+                            yolo_sam_review,
+                            max_distance_px=args.track_max_distance_px,
                         )
+                        record["sam_review"]["current_target_distance_px"] = review_distance_px
+                        record["sam_review"]["reviewed_same_target"] = reviewed_same_target
                         if not (reviewed_same_target and yolo_sam_review.get("accepted") and yolo_sam_review.get("fresh")):
                             selected = None
                             tracking = "withheld_pending_or_failed_sam_review"
+                            # Do not advance the identity lock with a
+                            # candidate that SAM3 did not review. Otherwise a
+                            # temporary association miss can lock onto an
+                            # unreviewed hinge and fail this gate forever.
+                            tracked_center = None
+                            tracked_depth_m = None
+                            missed_frames = 0
+                            record["tracking_lock_reset"] = True
                     shaft_association = (
                         associate_shaft_to_hinge(
                             statistics,
@@ -2389,9 +2530,36 @@ def main() -> int:
                                                 "consecutive_hits": relief_hits,
                                             }
                                             if not force_relief_completed:
-                                                raise SafetyError(
-                                                    "检测到接触后已达到配置的最大卸力上提量但接触力未降至闭爪阈值；已停止且不闭爪"
+                                                # Return to the pre-descent height before
+                                                # permitting another visual alignment.
+                                                retry_pose = measured_left_end_link_pose(controller)
+                                                retry_z = max(
+                                                    retry_pose.position_m[2],
+                                                    record["end_link_target_before_base_link"][2],
                                                 )
+                                                retry_target = CartesianPoseTarget(
+                                                    (retry_pose.position_m[0], retry_pose.position_m[1], retry_z),
+                                                    last_end_link_target.orientation_xyzw,
+                                                )
+                                                position_stream.update_target(retry_target)
+                                                last_end_link_target = retry_target
+                                                retry_deadline = time.monotonic() + (
+                                                    (retry_z - retry_pose.position_m[2]) / parameters.final_descent_speed_mps + 3.0
+                                                )
+                                                retry_hits = 0
+                                                while time.monotonic() < retry_deadline:
+                                                    position_stream.raise_if_failed()
+                                                    actual_retry = measured_left_end_link_pose(controller)
+                                                    _, retry_force = read_wrench_force(robot, contact_detector.parameters.frame_name)
+                                                    arrived = np.linalg.norm(np.asarray(actual_retry.position_m) - retry_target.position_m) <= 0.005
+                                                    released = np.linalg.norm(retry_force - contact_detector.baseline_force_n) <= contact_detector.parameters.relief_force_delta_threshold_n
+                                                    retry_hits = retry_hits + 1 if arrived and released else 0
+                                                    if retry_hits >= contact_detector.parameters.relief_consecutive_samples:
+                                                        break
+                                                    time.sleep(contact_detector.parameters.sample_period_s)
+                                                else:
+                                                    raise SafetyError("抓取失败后撤回未到位或仍持续受力；停止且不重新下探")
+                                                final_descent_retry_reason = "force_relief_failed_retracted_retry"
                                             break
                                         # Force is the primary guard.  Do not
                                         # accept visual corrections once the
@@ -3074,7 +3242,7 @@ def main() -> int:
                                 # do not wait here.
                                 continue
                             print("抓取已确认；保持当前位置和夹爪状态，未自动回预设位。")
-                            return 0
+                            return wait_for_manual_next()
                         assert gripper_close_timeout is not None
                         if now - gripper_sent_at > gripper_close_timeout:
                             assert position_stream is not None and gripper_open is not None and gripper_tolerance is not None
@@ -3109,6 +3277,8 @@ def main() -> int:
                     record["inference_ms"] = round((time.monotonic() - started) * 1000.0, 1)
                     json_record(log, record)
                     print_compact_record(record)
+                except AdvanceRightRequested:
+                    return EXIT_ADVANCE_RIGHT
                 except Exception as exc:
                     record.update({"state": "error_stop_sending_commands", "error": str(exc)})
                     json_record(log, record)
@@ -3118,15 +3288,23 @@ def main() -> int:
     except KeyboardInterrupt:
         print("收到 Ctrl-C；停止发送后续命令。")
         return 0
+    except AdvanceRightRequested:
+        return EXIT_ADVANCE_RIGHT
     except Exception as exc:
         print(f"左手 G2 抓取流程失败：{exc}", file=sys.stderr)
         return 1
     finally:
+        if takeover_worker is not None:
+            takeover_worker.stop()
         stop_force_descent_sam_preview(force_preview_stop, force_preview_thread)
         if perception is not None:
             perception.stop()
         if position_stream is not None:
             position_stream.stop()
+        if initial_gripper_open_stream is not None:
+            initial_gripper_open_stream.stop()
+        if post_grasp_regrasp_open_stream is not None:
+            post_grasp_regrasp_open_stream.stop()
         if web_server is not None:
             web_server.shutdown()
             web_server.server_close()

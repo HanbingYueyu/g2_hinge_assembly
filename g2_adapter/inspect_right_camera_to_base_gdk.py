@@ -15,9 +15,11 @@ import xml.etree.ElementTree as ET
 from pathlib import Path
 
 try:
+    from .apriltag_workpiece import inverse_transform_dict
     from .bilateral_rgbd_geometry import right_color_point_to_base
     from .camera import intrinsic_to_dict, transform_to_dict
 except ImportError:
+    from apriltag_workpiece import inverse_transform_dict
     from bilateral_rgbd_geometry import right_color_point_to_base
     from camera import intrinsic_to_dict, transform_to_dict
 
@@ -86,21 +88,25 @@ def main() -> int:
         right_end_from_color = transform_to_dict(tf.get_tf_from_sensor(agibot_gdk.SensorExtrinsicType.kRightHandRGBDToArmREndLink))
         color_timestamp = int(color.timestamp_ns)
         latest_transform, latest_timestamp = tf.lookup_transform_latest("base_link", "arm_r_end_link", return_timestamp=True)
+        latest_raw = transform_to_dict(latest_transform)
         latest_timestamp = int(latest_timestamp) if latest_timestamp is not None else None
         tf_mode = "latest_static_fallback"
         tf_error = None
         latest_gap_ms = None if latest_timestamp is None else (latest_timestamp - color_timestamp) / 1_000_000.0
         if latest_timestamp is not None and color_timestamp <= latest_timestamp and latest_gap_ms <= args.tf_static_fallback_max_gap_ms:
             try:
-                base_from_right_end = transform_to_dict(tf.lookup_transform("base_link", "arm_r_end_link", color_timestamp))
+                raw_dynamic = transform_to_dict(tf.lookup_transform("base_link", "arm_r_end_link", color_timestamp))
+                base_from_right_end = inverse_transform_dict(raw_dynamic)
                 tf_mode = "exact_image_time"
                 tf_timestamp = color_timestamp
             except Exception as exc:
                 tf_error = str(exc)
-                base_from_right_end = transform_to_dict(latest_transform)
+                raw_dynamic = latest_raw
+                base_from_right_end = inverse_transform_dict(raw_dynamic)
                 tf_timestamp = latest_timestamp
         else:
-            base_from_right_end = transform_to_dict(latest_transform)
+            raw_dynamic = latest_raw
+            base_from_right_end = inverse_transform_dict(raw_dynamic)
             tf_timestamp = latest_timestamp
             if latest_timestamp is not None:
                 tf_error = (
@@ -136,6 +142,10 @@ def main() -> int:
                 "age_ms": None if tf_timestamp is None else (color_timestamp - tf_timestamp) / 1_000_000.0,
                 "mode": tf_mode,
                 "lookup_error": tf_error,
+                "lookup_arguments": ["base_link", "arm_r_end_link"],
+                "gdk_returned_transform": "T_arm_r_end_link_base_link",
+                "gdk_raw_transform": raw_dynamic,
+                "converted_transform": "T_base_link_arm_r_end_link",
                 "base_from_arm_r_end": base_from_right_end,
             },
             "urdf_chain_to_arm_r_end": urdf_chain(args.urdf.expanduser().resolve(), "arm_r_end_link"),

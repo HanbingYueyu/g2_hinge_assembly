@@ -1,0 +1,18 @@
+{
+  "name": "electric_screwdriver_step_candidate",
+  "tag_family": "tagStandard41h12",
+  "tag_outer_size_m": 0.015,
+  "tag_size_m": 0.008333333333333334,
+  "centers_m": {
+    "0": [0.0, -0.0415, -0.0075],
+    "1": [-0.03475, -0.05148543023, -0.01379941798],
+    "2": [0.03475, -0.05148543023, -0.01379941798]
+  },
+  "u": [1.0, 0.0, 0.0],
+  "v": {
+    "0": [0.0, 0.0, 1.0],
+    "1": [0.0, 0.57746472062681, 0.81641563950687],
+    "2": [0.0, 0.57746472062681, 0.81641563950687]
+  },
+  "source": "models/电批整体.stp black-face centers and side-face vertical direction; candidate geometry, verify physically before motion"
+}

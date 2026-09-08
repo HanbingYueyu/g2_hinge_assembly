@@ -90,10 +90,11 @@ G2 原图比例并由 YOLO 内部 letterbox；实时验证时传入
 - `g2_adapter/control.py`：唯一 GDK 运动调用边界；
 - `g2_adapter/camera.py`：GDK RGB-D 同步读取与解码；
 - `g2_adapter/safety.py`：关节、状态、速度和夹爪安全规则；
-- `g2_adapter/record_pose.py`：只读记录左手 P2/P3/P4；
+- `g2_adapter/record_pose.py`：只读记录左手 P2/P3/P4、右手抓取前 PR1 和抓取后 PR2；
 - `g2_adapter/run_preset.py`：只读预检或执行一个已记录预设；
 - `g2_adapter/run_left_premove_sequence.py`：按到位确认顺序执行左 P2→P3，P3 为最终检测位；
 - `g2_adapter/run_left_post_grasp_sequence.py`：抓取确认后先在 `base_link +Z` 实测上抬 150 mm，再按到位确认执行左 P4，并保持夹爪状态；
+- `g2_adapter/right_post_grasp_sequence.py`：右手抓取确认后保存当前位姿，在 `base_link +Z` 上抬 100 mm，再按到位确认执行右手 PR2；PR1 用于抓取前预移动，并保持夹爪状态；
 - `g2_adapter/probe_left_xy_mapping.py`：从 P3 在 `base_link` 的单一 X 或 Y 轴发送一次 1 mm 位置伺服，并测量同一 SAM3 目标的像素变化；
 - `g2_adapter/run_bilateral_alignment_gdk.py`：P4 后右臂固定观察、左臂按双相机三维误差做受限 XY mode-1 伺服。direct 模式由右相机提供固定 `hole`、左 D405 在当前画面选择并锁定的 hinge 关联 `shaft`（取远端轴尖）提供被夹持 `target`，网页同时显示左手 hinge/shaft 检测；首帧默认选深度最近 hinge，也可用 `--left-selection` 选择面积最大或左右排序，后续只按上一帧位置跟踪，不读取抓取日志；旧 `off/veto` 仅保留单右图 pixel-J 诊断路径。真实 direct 运动必须显式 `--allow-motion --approve-rgbd-direct-motion`；不包含下探、力控、插入或夹爪动作；
 - `g2_adapter/inspect_cameras.py`：只读检查实际相机流和 binding；
@@ -117,6 +118,8 @@ G2 原图比例并由 YOLO 内部 letterbox；实时验证时传入
 ```bash
 /home/flyfuture/traditional_auto_flow_g2_migration/scripts/run_gdk_python.sh g2_adapter/record_pose.py --name left_p2 --save
 /home/flyfuture/traditional_auto_flow_g2_migration/scripts/run_gdk_python.sh g2_adapter/record_pose.py --name left_p3 --save
+/home/flyfuture/traditional_auto_flow_g2_migration/scripts/run_gdk_python.sh g2_adapter/record_pose.py --name right_pr1 --save
+/home/flyfuture/traditional_auto_flow_g2_migration/scripts/run_gdk_python.sh g2_adapter/record_pose.py --name right_pr2 --save
 ```
 
 结果写入 `g2_adapter/recorded_poses.json`。左 P2→P3 是到最终检测位的顺序预移动路径，

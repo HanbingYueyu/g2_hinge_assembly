@@ -5,6 +5,7 @@ from __future__ import annotations
 import math
 import threading
 import time
+from contextlib import nullcontext
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 
@@ -12,6 +13,7 @@ import numpy as np
 
 try:
     from .safety import (
+        AdvanceRightRequested,
         ARM_JOINT_NAMES,
         LEFT_ARM_JOINT_NAMES,
         RIGHT_ARM_JOINT_NAMES,
@@ -23,6 +25,7 @@ try:
     )
 except ImportError:  # Direct script/module use from this directory.
     from safety import (
+        AdvanceRightRequested,
         ARM_JOINT_NAMES,
         LEFT_ARM_JOINT_NAMES,
         RIGHT_ARM_JOINT_NAMES,
@@ -36,6 +39,55 @@ except ImportError:  # Direct script/module use from this directory.
 
 class MotionDisabledError(SafetyError):
     pass
+
+
+_FIXED_ORIENTATION_TOLERANCE_DEG = 0.01
+
+
+def quaternion_slerp(
+    first: Sequence[float], second: Sequence[float], fraction: float,
+) -> tuple[float, float, float, float]:
+    """Interpolate two XYZW quaternions along the shortest unit arc."""
+    if not math.isfinite(float(fraction)) or not 0.0 <= float(fraction) <= 1.0:
+        raise ValueError("quaternion interpolation fraction must be in [0, 1]")
+    q0 = np.asarray(tuple(float(value) for value in first), dtype=np.float64)
+    q1 = np.asarray(tuple(float(value) for value in second), dtype=np.float64)
+    if q0.shape != (4,) or q1.shape != (4,):
+        raise ValueError("quaternion interpolation requires two XYZW quaternions")
+    n0 = float(np.linalg.norm(q0))
+    n1 = float(np.linalg.norm(q1))
+    if n0 <= 1e-12 or n1 <= 1e-12:
+        raise ValueError("quaternion interpolation cannot use a zero quaternion")
+    q0 /= n0
+    q1 /= n1
+    dot = float(np.dot(q0, q1))
+    if dot < 0.0:
+        q1 = -q1
+        dot = -dot
+    dot = min(1.0, max(-1.0, dot))
+    t = float(fraction)
+    if dot > 0.9995:
+        result = q0 + t * (q1 - q0)
+        result /= np.linalg.norm(result)
+        return tuple(float(value) for value in result)
+    theta = math.acos(dot)
+    sin_theta = math.sin(theta)
+    result = (math.sin((1.0 - t) * theta) * q0 + math.sin(t * theta) * q1) / sin_theta
+    return tuple(float(value) for value in result)
+
+
+def quaternion_angle_deg(first: Sequence[float], second: Sequence[float]) -> float:
+    """Return the shortest rotational distance between two XYZW quaternions."""
+    q0 = np.asarray(tuple(float(value) for value in first), dtype=np.float64)
+    q1 = np.asarray(tuple(float(value) for value in second), dtype=np.float64)
+    if q0.shape != (4,) or q1.shape != (4,):
+        raise ValueError("quaternion angle requires two XYZW quaternions")
+    n0 = float(np.linalg.norm(q0))
+    n1 = float(np.linalg.norm(q1))
+    if n0 <= 1e-12 or n1 <= 1e-12:
+        raise ValueError("quaternion angle cannot use a zero quaternion")
+    dot = abs(float(np.dot(q0 / n0, q1 / n1)))
+    return math.degrees(2.0 * math.acos(min(1.0, max(-1.0, dot))))
 
 
 @dataclass(frozen=True)
@@ -97,6 +149,8 @@ class LeftCartesianImpedanceStream:
         with self._lock:
             error = self._error
         if error is not None:
+            if isinstance(error, AdvanceRightRequested):
+                raise error
             raise SafetyError(f"Cartesian impedance stream stopped: {error}") from error
 
     def stop(self) -> None:
@@ -242,6 +296,8 @@ class LeftEndEffectorPositionStream:
         with self._lock:
             error = self._error
         if error is not None:
+            if isinstance(error, AdvanceRightRequested):
+                raise error
             raise SafetyError(f"end-effector position stream stopped: {error}") from error
 
     def stop(self) -> None:
@@ -298,6 +354,259 @@ class LeftEndEffectorPositionStream:
             self._stop.wait(max(0.0, deadline - time.monotonic()))
 
 
+class RightEndEffectorPositionStream:
+    """50-Hz, rate-limited mode-1 stream for ``arm_r_end_link``.
+
+    The stream can optionally synchronize the right Omnipicker through GDK's
+    ``EndEffectorPose.end_effector_joint_*`` fields.  This is important while
+    a pose stream is active: sending a separate ``right_tool`` command after
+    stopping the stream can be ignored by the pose controller until its
+    command lease has fully expired.
+
+    Its use is limited to calibrated, local right-hand motions because GDK's
+    pose-control interface does not plan or collision-check a trajectory.
+    """
+
+    def __init__(
+        self, controller: "G2Controller", *, rate_hz: float, life_time_s: float,
+        max_translation_velocity_mps: float,
+        allow_orientation_change: bool = False,
+        max_angular_velocity_rad_s: float = 0.5,
+    ) -> None:
+        if not 45.0 <= rate_hz <= 55.0:
+            raise ValueError("Cartesian position publication rate must be in [45, 55] Hz")
+        if not 0.04 <= life_time_s <= 0.20:
+            raise ValueError("Cartesian position life_time must be in [0.04, 0.20] seconds")
+        if not 0.001 <= max_translation_velocity_mps <= 0.03:
+            raise ValueError("Cartesian translation velocity must be in [0.001, 0.03] m/s")
+        if not 0.01 <= max_angular_velocity_rad_s <= 1.0:
+            raise ValueError("Cartesian angular velocity must be in [0.01, 1.0] rad/s")
+        self._controller = controller
+        self._period_s = 1.0 / float(rate_hz)
+        self._life_time_s = float(life_time_s)
+        self._max_translation_velocity_mps = float(max_translation_velocity_mps)
+        self._allow_orientation_change = bool(allow_orientation_change)
+        self._max_angular_velocity_rad_s = float(max_angular_velocity_rad_s)
+        self._lock = threading.Lock()
+        self._commanded: CartesianPoseTarget | None = None
+        self._desired: CartesianPoseTarget | None = None
+        self._fixed_orientation: tuple[float, float, float, float] | None = None
+        self._gripper_joint_names: tuple[str, ...] = ()
+        self._gripper_joint_positions: tuple[float, ...] = ()
+        self._error: Exception | None = None
+        self._stop = threading.Event()
+        self._at_target = threading.Event()
+        self._target_generation = 0
+        self._arrived_generation = 0
+        self._thread: threading.Thread | None = None
+
+    def start(self, initial_target: CartesianPoseTarget) -> None:
+        with self._lock:
+            if self._thread is not None:
+                raise RuntimeError("right end-effector position stream is already started")
+            self._commanded = initial_target
+            self._desired = initial_target
+            self._fixed_orientation = initial_target.orientation_xyzw
+            self._at_target.set()
+            self._thread = threading.Thread(target=self._run, name="g2-right-end-effector-position", daemon=True)
+            self._thread.start()
+
+    def update_target(self, target: CartesianPoseTarget) -> None:
+        self.raise_if_failed()
+        with self._lock:
+            if self._stop.is_set() or self._thread is None:
+                raise RuntimeError("right end-effector position stream is not running")
+            if (
+                not self._allow_orientation_change
+                and quaternion_angle_deg(target.orientation_xyzw, self._fixed_orientation) > _FIXED_ORIENTATION_TOLERANCE_DEG
+            ):
+                raise SafetyError("right mode-1 local grasp motion must keep the calibrated end-link orientation")
+            self._desired = target
+            self._target_generation += 1
+            self._at_target.clear()
+
+    def set_right_gripper_target(self, position_rad: float) -> None:
+        """Synchronize the right Omnipicker with this 50-Hz pose stream.
+
+        GDK obtains the installed end-effector joint name from ``get_end_state``;
+        do not guess it from a URDF or hard-code a model-specific name.
+        """
+        self.raise_if_failed()
+        raw = float(position_rad)
+        clipped = clamp_omnipicker(raw)
+        if clipped != raw:
+            raise SafetyError("Omnipicker target is outside [-pi/4, 0] rad")
+        names, current_positions = self._controller.read_gripper_state("right")
+        if len(names) != 1 or len(current_positions) != 1:
+            raise SafetyError(
+                "right_tool 的 GDK end_state 未提供恰好一个可同步控制的夹爪关节"
+            )
+        with self._lock:
+            if self._stop.is_set() or self._thread is None:
+                raise RuntimeError("end-effector position stream is not running")
+            self._gripper_joint_names = names
+            self._gripper_joint_positions = (clipped,)
+
+    def wait_until_target(self, timeout_s: float) -> bool:
+        """Wait only for the local 50-Hz command interpolator to finish.
+
+        This deliberately does *not* mean the physical robot reached the
+        target. Motion decisions which need physical arrival must call
+        :meth:`wait_until_actual_target` while this stream remains active.
+        """
+        deadline = time.monotonic() + float(timeout_s)
+        with self._lock:
+            requested_generation = self._target_generation
+        while True:
+            self.raise_if_failed()
+            with self._lock:
+                if self._arrived_generation >= requested_generation:
+                    return True
+            remaining = deadline - time.monotonic()
+            if remaining <= 0.0:
+                return False
+            self._at_target.wait(remaining)
+
+    def wait_until_actual_target(
+        self,
+        target: CartesianPoseTarget,
+        timeout_s: float,
+        *,
+        position_tolerance_m: float,
+        orientation_tolerance_deg: float,
+        stable_samples: int = 10,
+        poll_period_s: float = 0.02,
+    ) -> CartesianPoseTarget | None:
+        """Keep streaming until GDK feedback is continuously at ``target``."""
+        if not 0.0 < position_tolerance_m <= 0.005:
+            raise ValueError("actual position tolerance must be in (0, 0.005] m")
+        if not 0.0 < orientation_tolerance_deg <= 2.0:
+            raise ValueError("actual orientation tolerance must be in (0, 2] deg")
+        if not 1 <= int(stable_samples) <= 50 or not 0.01 <= poll_period_s <= 0.10:
+            raise ValueError("actual-pose stability parameters are invalid")
+        with self._lock:
+            requested_generation = self._target_generation
+        target_position = np.asarray(target.position_m, dtype=np.float64)
+        target_orientation = np.asarray(target.orientation_xyzw, dtype=np.float64)
+        target_orientation /= np.linalg.norm(target_orientation)
+        deadline = time.monotonic() + float(timeout_s)
+        consecutive = 0
+        while time.monotonic() < deadline:
+            self.raise_if_failed()
+            with self._lock:
+                if self._target_generation != requested_generation:
+                    raise SafetyError("right end-effector target changed while waiting for actual arrival")
+            status = self._controller.robot.get_motion_control_status()
+            # ``mode`` is the instantaneous motion state (0=stop, 1=servo,
+            # 2=planning).  It is legitimately 0 immediately after switching
+            # control_mode and before the first pose command, so the position
+            # stream gates only on the persistent control mode and errors.
+            if int(status.mode) not in {0, 1} or int(status.control_mode) != 1 or int(status.error_code) != 0:
+                raise SafetyError(
+                    "right end-effector actual-arrival wait requires motion mode 0/1 and healthy control_mode=1; "
+                    f"actual={{'mode': {int(status.mode)}, 'control_mode': {int(status.control_mode)}, "
+                    f"'error_code': {int(status.error_code)}, 'error_msg': '{status.error_msg}'}}"
+                )
+            actual = self._controller.read_end_effector_pose("arm_r_end_link")
+            position_error = float(np.linalg.norm(np.asarray(actual.position_m) - target_position))
+            actual_orientation = np.asarray(actual.orientation_xyzw, dtype=np.float64)
+            norm = float(np.linalg.norm(actual_orientation))
+            if norm <= 1e-12:
+                raise SafetyError("right end-effector feedback orientation is invalid")
+            actual_orientation /= norm
+            dot = min(1.0, max(-1.0, abs(float(np.dot(actual_orientation, target_orientation)))))
+            orientation_error_deg = math.degrees(2.0 * math.acos(dot))
+            if position_error <= position_tolerance_m and orientation_error_deg <= orientation_tolerance_deg:
+                consecutive += 1
+                if consecutive >= stable_samples:
+                    return actual
+            else:
+                consecutive = 0
+            self._stop.wait(poll_period_s)
+        return None
+
+    def raise_if_failed(self) -> None:
+        with self._lock:
+            error = self._error
+        if error is not None:
+            if isinstance(error, AdvanceRightRequested):
+                raise error
+            raise SafetyError(f"right end-effector position stream stopped: {error}") from error
+
+    def stop(self) -> None:
+        self._stop.set()
+        thread = self._thread
+        if thread is not None and thread is not threading.current_thread():
+            thread.join(timeout=max(0.2, self._period_s * 4.0))
+        self._thread = None
+
+    def _run(self) -> None:
+        deadline = time.monotonic()
+        while not self._stop.is_set():
+            with self._lock:
+                commanded, desired, generation = self._commanded, self._desired, self._target_generation
+                gripper_joint_names = self._gripper_joint_names
+                gripper_joint_positions = self._gripper_joint_positions
+            if commanded is None or desired is None:
+                return
+            current = np.asarray(commanded.position_m, dtype=np.float64)
+            wanted = np.asarray(desired.position_m, dtype=np.float64)
+            delta = wanted - current
+            distance = float(np.linalg.norm(delta))
+            max_step_m = self._max_translation_velocity_mps * self._period_s
+            if distance <= max_step_m:
+                next_position = wanted
+            else:
+                next_position = current + delta * (max_step_m / distance)
+            current_orientation = np.asarray(commanded.orientation_xyzw, dtype=np.float64)
+            desired_orientation = np.asarray(desired.orientation_xyzw, dtype=np.float64)
+            orientation_dot = abs(float(np.dot(
+                current_orientation / np.linalg.norm(current_orientation),
+                desired_orientation / np.linalg.norm(desired_orientation),
+            )))
+            orientation_angle_rad = 2.0 * math.acos(min(1.0, max(-1.0, orientation_dot)))
+            max_angle_step_rad = self._max_angular_velocity_rad_s * self._period_s
+            if not self._allow_orientation_change or orientation_angle_rad <= max_angle_step_rad:
+                next_orientation = desired.orientation_xyzw
+            else:
+                next_orientation = quaternion_slerp(
+                    commanded.orientation_xyzw, desired.orientation_xyzw,
+                    max_angle_step_rad / orientation_angle_rad,
+                )
+            if distance <= max_step_m and orientation_angle_rad <= max_angle_step_rad:
+                next_target = desired
+            else:
+                next_target = CartesianPoseTarget(
+                    tuple(float(value) for value in next_position), next_orientation,
+                )
+            try:
+                status = self._controller.motion_status_summary()
+                if status["mode"] not in {0, 1} or status["control_mode"] != 1 or status["error_code"] != 0:
+                    raise SafetyError(
+                        "right end-effector position stream requires motion mode 0/1 and healthy control_mode=1; "
+                        f"actual={status}"
+                    )
+                self._controller._send_right_cartesian_pose(
+                    next_target,
+                    self._life_time_s,
+                    end_effector_joint_names=gripper_joint_names,
+                    end_effector_joint_positions=gripper_joint_positions,
+                )
+            except Exception as exc:
+                with self._lock:
+                    self._error = exc
+                self._stop.set()
+                return
+            with self._lock:
+                self._commanded = next_target
+                if next_target == desired:
+                    self._arrived_generation = max(self._arrived_generation, generation)
+                    if generation == self._target_generation:
+                        self._at_target.set()
+            deadline += self._period_s
+            self._stop.wait(max(0.0, deadline - time.monotonic()))
+
+
 class G2Controller:
     """Own all GDK motion calls; construction and state reads never move G2."""
 
@@ -309,6 +618,7 @@ class G2Controller:
         allow_motion: bool = False,
         control_period_s: float = 0.01,
         max_servo_velocity_rad_s: float = 0.15,
+        motion_gate=None,
     ) -> None:
         if not 0.005 <= control_period_s <= 0.02:
             raise ValueError("control_period_s must be in [0.005, 0.02]")
@@ -319,6 +629,7 @@ class G2Controller:
         self.allow_motion = bool(allow_motion)
         self.control_period_s = float(control_period_s)
         self.max_servo_velocity_rad_s = float(max_servo_velocity_rad_s)
+        self.motion_gate = motion_gate
 
     def checked_arm_state(self) -> tuple[float, ...]:
         whole = dict(self.robot.get_whole_body_status())
@@ -359,6 +670,20 @@ class G2Controller:
     def _require_motion(self) -> None:
         if not self.allow_motion:
             raise MotionDisabledError("allow_motion is false; no GDK command was sent")
+        if self.motion_gate is not None:
+            self.motion_gate.wait_for_auto()
+
+    def manual_motion(self):
+        """Return a context that bypasses an active automatic-motion pause."""
+        if self.motion_gate is None:
+            return nullcontext()
+        return self.motion_gate.manual_motion()
+
+    def _motion_write(self):
+        """Reserve the single GDK motion writer for one robot request."""
+        if self.motion_gate is None:
+            return nullcontext()
+        return self.motion_gate.automatic_motion()
 
     def move_preset(
         self,
@@ -391,7 +716,8 @@ class G2Controller:
         request.joint_names = list(names)
         request.joint_positions = list(target)
         request.joint_velocities = [float(velocity_rad_s)] * 7
-        self.robot.joint_control_request(request)
+        with self._motion_write():
+            self.robot.joint_control_request(request)
 
     def servo_to(
         self,
@@ -438,9 +764,10 @@ class G2Controller:
             if now - last_status_check >= 0.1:
                 self.checked_arm_state()
                 last_status_check = now
-            self.robot.move_arm_joint_servo(
-                command, self.control_period_s, 2, False
-            )
+            with self._motion_write():
+                self.robot.move_arm_joint_servo(
+                    command, self.control_period_s, 2, False
+                )
             sent += 1
             deadline += self.control_period_s
             delay = deadline - time.monotonic()
@@ -559,7 +886,8 @@ class G2Controller:
             raise SafetyError(f"cannot switch control mode: motion error {int(before.error_code)}: {before.error_msg}")
         if int(before.control_mode) == mode:
             return
-        self.robot.set_control_mode(mode)
+        with self._motion_write():
+            self.robot.set_control_mode(mode)
         # GDK documents control_mode as a persistent robot state.  Its status
         # update can lag the setter by a short DDS cycle, so do not mistake an
         # immediate stale read for a failed mode transition.
@@ -616,6 +944,35 @@ class G2Controller:
         stream.start(initial_target)
         return stream
 
+    def start_left_gripper_position_stream(
+        self,
+        position_rad: float,
+        *,
+        rate_hz: float = 50.0,
+        life_time_s: float = 0.10,
+        max_translation_velocity_mps: float = 0.005,
+    ) -> LeftEndEffectorPositionStream:
+        """Hold the measured left end-link pose while driving its Omnipicker.
+
+        GDK mode-1 pose control accepts the end-effector joint target in the
+        same 50-Hz request as the pose.  A short-lived stream avoids relying
+        on a standalone ``move_end_effector_joint`` request while a preceding
+        arm preset is still settling.
+        """
+        initial_target = self.read_end_effector_pose("arm_l_end_link")
+        stream = self.start_left_end_effector_position_stream(
+            initial_target,
+            rate_hz=rate_hz,
+            life_time_s=life_time_s,
+            max_translation_velocity_mps=max_translation_velocity_mps,
+        )
+        try:
+            stream.set_left_gripper_target(position_rad)
+        except Exception:
+            stream.stop()
+            raise
+        return stream
+
     def send_left_end_effector_position_setpoint(
         self, target: CartesianPoseTarget, *, life_time_s: float = 0.10
     ) -> None:
@@ -635,6 +992,38 @@ class G2Controller:
                 f"actual={status}. control_mode=3 is joint impedance and is deliberately refused by this position-only workflow"
             )
         self._send_left_cartesian_pose(target, life_time_s)
+
+    def start_right_end_effector_position_stream(
+        self,
+        initial_target: CartesianPoseTarget,
+        *,
+        rate_hz: float = 50.0,
+        life_time_s: float = 0.10,
+        max_translation_velocity_mps: float = 0.01,
+        allow_orientation_change: bool = False,
+        max_angular_velocity_rad_s: float = 0.5,
+    ) -> RightEndEffectorPositionStream:
+        """Start a mode-1 right end-link stream.
+
+        The default keeps the calibrated local-motion invariant of a fixed
+        orientation.  Autonomous coarse approach must opt in explicitly and
+        supplies a separately bounded angular velocity.
+        """
+        self._require_motion()
+        status = self.motion_status_summary()
+        if status["mode"] not in {0, 1} or status["control_mode"] != 1 or status["error_code"] != 0:
+            raise SafetyError(
+                "right end-effector position stream requires motion mode 0/1 and healthy GDK control_mode=1; "
+                f"actual={status}"
+            )
+        stream = RightEndEffectorPositionStream(
+            self, rate_hz=rate_hz, life_time_s=life_time_s,
+            max_translation_velocity_mps=max_translation_velocity_mps,
+            allow_orientation_change=allow_orientation_change,
+            max_angular_velocity_rad_s=max_angular_velocity_rad_s,
+        )
+        stream.start(initial_target)
+        return stream
 
     def _send_left_cartesian_pose(
         self,
@@ -657,9 +1046,36 @@ class G2Controller:
         if end_effector_joint_names:
             request.end_effector_joint_names = list(end_effector_joint_names)
             request.end_effector_joint_positions = [float(value) for value in end_effector_joint_positions]
-        result = self.robot.end_effector_pose_control(request)
+        with self._motion_write():
+            result = self.robot.end_effector_pose_control(request)
         if result not in (None, 0):
             raise SafetyError(f"GDK end_effector_pose_control failed: {result}")
+
+    def _send_right_cartesian_pose(
+        self,
+        target: CartesianPoseTarget,
+        life_time_s: float,
+        *,
+        end_effector_joint_names: Sequence[str] = (),
+        end_effector_joint_positions: Sequence[float] = (),
+    ) -> None:
+        """Internal sender for the right mode-1 stream; callers never bypass it."""
+        self._require_motion()
+        if len(end_effector_joint_names) != len(end_effector_joint_positions):
+            raise ValueError("end-effector joint names and positions must have the same length")
+        request = self.gdk.EndEffectorPose()
+        request.life_time = float(life_time_s)
+        request.group = self.gdk.EndEffectorControlGroup.kRightArm
+        pose = request.right_end_effector_pose
+        pose.position.x, pose.position.y, pose.position.z = target.position_m
+        pose.orientation.x, pose.orientation.y, pose.orientation.z, pose.orientation.w = target.orientation_xyzw
+        if end_effector_joint_names:
+            request.end_effector_joint_names = list(end_effector_joint_names)
+            request.end_effector_joint_positions = [float(value) for value in end_effector_joint_positions]
+        with self._motion_write():
+            result = self.robot.end_effector_pose_control(request)
+        if result not in (None, 0):
+            raise SafetyError(f"GDK right end_effector_pose_control failed: {result}")
 
     def read_gripper_state(self, side: str) -> tuple[tuple[str, ...], tuple[float, ...]]:
         """Read GDK's installed end-effector names and finite positions."""
@@ -692,8 +1108,9 @@ class G2Controller:
         clipped = clamp_omnipicker(raw)
         if clipped != raw:
             raise SafetyError("Omnipicker target is outside [-pi/4, 0] rad")
-        result = self.robot.move_end_effector_joint(
-            [clipped], [0.0], f"{side}_tool"
-        )
+        with self._motion_write():
+            result = self.robot.move_end_effector_joint(
+                [clipped], [0.0], f"{side}_tool"
+            )
         if result not in (None, 0):
             raise SafetyError(f"GDK move_end_effector_joint failed: {result}")

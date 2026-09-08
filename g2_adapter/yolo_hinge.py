@@ -7,6 +7,7 @@ full-image masks.
 
 from __future__ import annotations
 
+import math
 from pathlib import Path
 from typing import Any
 
@@ -266,3 +267,24 @@ def review_matches(
         "max_pixel_error": float(max_pixel_error),
         "max_depth_error_m": float(max_depth_error_m),
     }
+
+
+def reviewed_target_matches_selected(
+    selected: dict | None,
+    review: dict,
+    *,
+    max_distance_px: float,
+) -> tuple[bool, float | None]:
+    """Check whether the current candidate is the reviewed YOLO target."""
+    if not math.isfinite(float(max_distance_px)) or max_distance_px <= 0.0:
+        raise ValueError("max_distance_px must be positive and finite")
+    if selected is None or review.get("yolo_center_px") is None:
+        return False, None
+    selected_center = np.asarray(selected.get("center_px"), dtype=np.float64)
+    reviewed_center = np.asarray(review["yolo_center_px"], dtype=np.float64)
+    if selected_center.shape != (2,) or reviewed_center.shape != (2,):
+        return False, None
+    if not np.all(np.isfinite(selected_center)) or not np.all(np.isfinite(reviewed_center)):
+        return False, None
+    distance = float(np.linalg.norm(selected_center - reviewed_center))
+    return distance <= float(max_distance_px), distance
