@@ -2,7 +2,9 @@
 """Read and optionally save the current G2 pose; never sends a command.
 
 The recorded ``right_pr1`` and ``right_pr2`` poses are consumed by the right
-AprilTag pre-move and post-grasp transport sequence.
+AprilTag pre-move and post-grasp transport sequence.  Each record also stores
+the measured end-link position and orientation when GDK exposes them for
+diagnostics and later calibration.
 """
 
 from __future__ import annotations
@@ -76,6 +78,22 @@ def _gripper_names(end_state: dict, side: str) -> list[str]:
     return [str(value) for value in group.get("names", ())]
 
 
+def _end_link_pose(motion, side: str) -> tuple[list[float], list[float]] | None:
+    """Read the GDK end-link pose so a preset can be orientation-only later."""
+    link = "arm_l_end_link" if side == "left" else "arm_r_end_link"
+    names = [str(value) for value in getattr(motion, "frame_names", ())]
+    poses = getattr(motion, "frame_poses", ())
+    try:
+        pose = poses[names.index(link)]
+    except (ValueError, IndexError, TypeError):
+        return None
+    position = [float(pose.position.x), float(pose.position.y), float(pose.position.z)]
+    orientation = [float(pose.orientation.x), float(pose.orientation.y), float(pose.orientation.z), float(pose.orientation.w)]
+    if not all(math.isfinite(value) for value in (*position, *orientation)):
+        return None
+    return position, orientation
+
+
 def _atomic_json(path: Path, payload: dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     fd, temporary = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
@@ -122,6 +140,7 @@ def main() -> int:
         side = "left" if args.name.startswith("left_") else "right"
         selected_names = LEFT_ARM_JOINT_NAMES if side == "left" else RIGHT_ARM_JOINT_NAMES
         offset = 0 if side == "left" else 7
+        end_link_pose = _end_link_pose(motion, side)
         record = {
             "name": args.name,
             "captured_at_utc": datetime.now(timezone.utc).isoformat(),
@@ -137,6 +156,9 @@ def main() -> int:
             "motion_mode": int(motion.mode),
             "motion_error_code": int(motion.error_code),
         }
+        if end_link_pose is not None:
+            record["end_link_position_m"] = end_link_pose[0]
+            record["end_link_orientation_xyzw"] = end_link_pose[1]
         print(json.dumps(record, indent=2, ensure_ascii=False))
         print("只读完成：未发送任何运动或夹爪命令。", file=sys.stderr)
         if args.save:

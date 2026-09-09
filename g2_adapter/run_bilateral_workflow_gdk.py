@@ -38,6 +38,13 @@ def parse_args(argv=None) -> argparse.Namespace:
     parser.add_argument("--poses", type=Path, default=PROJECT_ROOT / "g2_adapter" / "recorded_poses.json")
     parser.add_argument("--checkpoint", type=Path, default=PROJECT_ROOT / "checkpoints" / "sam3.1_multiplex.pt")
     parser.add_argument("--yolo-model", type=Path, default=PROJECT_ROOT / "models" / "left_d405_hinge_shaft_yolo" / "best.pt")
+    parser.add_argument("--head-yolo-model", type=Path, default=PROJECT_ROOT / "runs/head_hinge_yolo_seg/head_from_scratch_v1/weights/best.pt")
+    parser.add_argument("--head-forward-yaw-deg", type=float, default=0.0,
+                        help="头部粗定位时末端 +Z 相对 base_link +X 的水平偏航角。")
+    parser.add_argument("--head-gripper-pitch-deg", type=float, default=30.0,
+                        help="头部粗定位时末端 +Z 向下俯角，正值向下。")
+    parser.add_argument("--head-gripper-roll-deg", type=float, default=180.0,
+                        help="头部粗定位时绕末端 +Z 的滚转角，默认 180 度。")
     parser.add_argument("--left-web-port", type=int, default=8767)
     parser.add_argument("--right-web-port", type=int, default=8767)
     parser.add_argument(
@@ -80,6 +87,10 @@ def _optional_auto_args(args: argparse.Namespace) -> list[str]:
 
 def build_stage_commands(args: argparse.Namespace) -> tuple[list[str], list[str]]:
     python = sys.executable
+    head_yolo_model = getattr(
+        args, "head_yolo_model",
+        PROJECT_ROOT / "runs/head_hinge_yolo_seg/head_from_scratch_v1/weights/best.pt",
+    )
     step_profile = getattr(args, "left_step_profile", None)
     step_reference = getattr(args, "left_step_reference", None)
     if bool(step_profile) != bool(step_reference):
@@ -90,6 +101,11 @@ def build_stage_commands(args: argparse.Namespace) -> tuple[list[str], list[str]
         *(["--step-profile", str(step_profile), "--step-reference", str(step_reference)] if step_profile else []),
         "--checkpoint", str(Path(args.checkpoint).expanduser()),
         "--yolo-model", str(Path(args.yolo_model).expanduser()),
+        "--head-coarse-approach",
+        "--head-forward-yaw-deg", str(getattr(args, "head_forward_yaw_deg", 0.0)),
+        "--head-gripper-pitch-deg", str(getattr(args, "head_gripper_pitch_deg", 30.0)),
+        "--head-gripper-roll-deg", str(getattr(args, "head_gripper_roll_deg", 180.0)),
+        "--head-yolo-model", str(Path(head_yolo_model).expanduser()),
         "--poses", str(Path(args.poses).expanduser()),
         "--full-cycle",
         "--wait-for-next",

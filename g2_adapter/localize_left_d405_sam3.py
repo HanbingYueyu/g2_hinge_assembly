@@ -18,9 +18,6 @@ from pathlib import Path
 import cv2
 import numpy as np
 import torch
-from PIL import Image
-from sam3.model.sam3_image_processor import Sam3Processor
-from sam3.model_builder import build_sam3_image_model
 
 try:
     from .sam_crop import center_crop_image, draw_crop_box, expand_crop_masks
@@ -308,6 +305,10 @@ def eligible_candidates(
 
 
 def main() -> int:
+    from PIL import Image
+    from sam3.model.sam3_image_processor import Sam3Processor
+    from sam3.model_builder import build_sam3_image_model
+
     args = parse_args()
     if (
         not 0.0 <= args.threshold <= 1.0

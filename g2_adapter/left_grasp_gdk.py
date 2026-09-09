@@ -15,6 +15,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import subprocess
 import sys
 import threading
 import time
@@ -26,15 +27,12 @@ from pathlib import Path
 import cv2
 import numpy as np
 import torch
-from PIL import Image
-from sam3.model.sam3_image_processor import Sam3Processor
-from sam3.model_builder import build_sam3_image_model
 
 try:
     from .left_step_xy import xy_error, bounded_xy
     from .left_step_rgb import OcclusionTrackerPool
     from .apriltag_workpiece import transform_from_dict
-    from .left_step_rgb import load_profile, load_alignment_reference, detect_hole_centres, match_holes, servo_pixel
+    from .left_step_rgb import load_profile, load_alignment_reference, detect_hole_centres, match_holes
     from .camera import align_depth_to_color, decode_color_rgb, decode_depth_u16, intrinsic_to_dict, transform_to_dict
     from .contact_detection import ForceContactDetector, ForceContactParameters
     from .control import CartesianPoseTarget, G2Controller, LeftEndEffectorPositionStream
@@ -47,6 +45,7 @@ try:
     from .xy_mapping import choose_candidate_by_left_rank
     from .yolo_hinge import associate_shaft_to_hinge, infer_yolo_masks, load_yolo_segmentation_model, review_matches, reviewed_target_matches_selected, split_yolo_candidates
     from .record_pose import DEFAULT_OUTPUT as DEFAULT_POSES_OUTPUT
+    from .inspect_left_gripper_urdf import audit as audit_left_gripper_urdf
     from .run_left_premove_sequence import HANDOFF_PRESETS, load_presets as load_premove_presets, open_handoff_gripper
     from .run_left_post_grasp_sequence import (
         PRE_P4_LIFT_M,
@@ -59,7 +58,7 @@ except ImportError:
     from left_step_xy import xy_error, bounded_xy
     from left_step_rgb import OcclusionTrackerPool
     from apriltag_workpiece import transform_from_dict
-    from left_step_rgb import load_profile, load_alignment_reference, detect_hole_centres, match_holes, servo_pixel
+    from left_step_rgb import load_profile, load_alignment_reference, detect_hole_centres, match_holes
     from camera import align_depth_to_color, decode_color_rgb, decode_depth_u16, intrinsic_to_dict, transform_to_dict
     from contact_detection import ForceContactDetector, ForceContactParameters
     from control import CartesianPoseTarget, G2Controller, LeftEndEffectorPositionStream
@@ -72,6 +71,7 @@ except ImportError:
     from xy_mapping import choose_candidate_by_left_rank
     from yolo_hinge import associate_shaft_to_hinge, infer_yolo_masks, load_yolo_segmentation_model, review_matches, reviewed_target_matches_selected, split_yolo_candidates
     from record_pose import DEFAULT_OUTPUT as DEFAULT_POSES_OUTPUT
+    from inspect_left_gripper_urdf import audit as audit_left_gripper_urdf
     from run_left_premove_sequence import HANDOFF_PRESETS, load_presets as load_premove_presets, open_handoff_gripper
     from run_left_post_grasp_sequence import (
         PRE_P4_LIFT_M,
@@ -99,9 +99,51 @@ DEFAULT_G2_NATIVE_YOLO = (
     if _PREFERRED_G2_HINGE_SHAFT_YOLO.is_file()
     else _ROLLBACK_G2_HINGE_YOLO
 )
+DEFAULT_G2_URDF = PROJECT_ROOT / "robot_description" / "G2_t2v2_crsB_omnipicker.urdf"
 EXIT_ADVANCE_RIGHT = 20
 HINGE_CLASS_ID = 0
 SHAFT_CLASS_ID = 1
+
+
+def yolo_box_fraction_grasp_pixel(item: dict, height_fraction: float = 0.55) -> list[float]:
+    """Return the YOLO box centre at a fractional height from top to bottom."""
+    if not 0.0 <= height_fraction <= 1.0:
+        raise ValueError("YOLO box grasp height fraction must be in [0, 1]")
+    box = np.asarray(item.get("bbox_xyxy"), dtype=np.float64)
+    if box.shape != (4,) or not np.isfinite(box).all() or box[2] <= box[0] or box[3] <= box[1]:
+        raise ValueError("YOLO grasp target requires a finite non-empty bbox_xyxy")
+    return [float((box[0] + box[2]) / 2.0), float(box[1] + height_fraction * (box[3] - box[1]))]
+
+
+def servo_pixel(item: dict) -> list[float]:
+    """Use the YOLO-box grasp landmark; STEP/CAD offsets are legacy only."""
+    if "yolo_box_grasp_pixel_px" in item:
+        return item["yolo_box_grasp_pixel_px"]
+    return item["center_px"]
+
+
+def urdf_gripper_center_end_m(path: Path, opening_rad: float) -> np.ndarray:
+    """Use the midpoint of the two symmetric fixed loop anchors in the URDF."""
+    report = audit_left_gripper_urdf(path, opening_rad)
+    anchors = [
+        np.asarray(loop["anchor1_end_m"], dtype=np.float64)
+        for loop in report["closed_loop_checks"]
+        if loop["joint"] in {"idx53_gripper_l_outer_joint2", "idx54_gripper_l_inner_joint2"}
+    ]
+    if len(anchors) != 2 or any(anchor.shape != (3,) or not np.isfinite(anchor).all() for anchor in anchors):
+        raise ValueError("URDF does not provide both finite left gripper loop anchors")
+    return np.mean(anchors, axis=0)
+
+
+def project_end_point_to_color_pixel(point_end_m: np.ndarray, camera_to_end: dict, intrinsic: dict) -> list[float]:
+    transform = transform_from_dict(camera_to_end)
+    point_camera = transform[:3, :3].T @ (np.asarray(point_end_m, dtype=np.float64) - transform[:3, 3])
+    if point_camera.shape != (3,) or not np.isfinite(point_camera).all() or point_camera[2] <= 0.0:
+        raise ValueError("URDF gripper center projects behind the left color camera")
+    return [
+        float(intrinsic["fx"] * point_camera[0] / point_camera[2] + intrinsic["ppx"]),
+        float(intrinsic["fy"] * point_camera[1] / point_camera[2] + intrinsic["ppy"]),
+    ]
 
 
 @dataclass(frozen=True)
@@ -319,13 +361,18 @@ def stalled_gripper_position(
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="G2 左手最终检测位 D405/SAM3 闭环抓取")
     parser.add_argument("--config", type=Path, default=PROJECT_ROOT / "g2_adapter" / "left_grasp.example.json")
-    parser.add_argument("--prompt", default="silver triangular hinge")
+    parser.add_argument("--urdf", type=Path, default=DEFAULT_G2_URDF, help="用于计算左夹爪对称中心的 G2 URDF。")
+    parser.add_argument(
+        "--prompt",
+        default="silver triangular hinge",
+        help="SAM3 text prompt used to review the YOLO-selected hinge.",
+    )
     parser.add_argument("--threshold", type=float, default=0.10)
     parser.add_argument(
         "--detector",
-        choices=("yolo-sam", "sam3"),
-        default="yolo-sam",
-        help="默认使用 G2 原生 YOLO 主检测并由 SAM3 复核；sam3 是只用于回退对比的旧路径。",
+        choices=("yolo",),
+        default="yolo",
+        help="仅使用 YOLO 检测与跟踪。",
     )
     parser.add_argument("--yolo-model", type=Path, default=DEFAULT_G2_NATIVE_YOLO)
     parser.add_argument("--yolo-confidence", type=float, default=0.25)
@@ -353,6 +400,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--sam-review-interval-s", type=float, default=0.50)
     parser.add_argument("--sam-review-ttl-s", type=float, default=1.50)
     parser.add_argument("--sam-review-max-pixel-error", type=float, default=80.0)
+    parser.add_argument(
+        "--yolo-box-height-fraction",
+        type=float,
+        default=0.55,
+        help="YOLO 框从底部向上 45%%（即从顶部向下 55%%）；横坐标取检测框中心。",
+    )
     parser.add_argument("--step-profile", type=Path, help="Use RGB STEP grasp point for XY alignment")
     parser.add_argument("--step-reference", type=Path, help="New manually aligned STEP pixel reference")
     parser.add_argument("--step-metric-xy", action="store_true", help="Use approximate TCP and image-time TF for base XY servo")
@@ -456,8 +509,22 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--full-cycle",
         action="store_true",
-        help="单进程执行 P1→P2、SAM3 抓取、+Z 上抬 150 mm、P3→P4；要求 --allow-motion，且不能与受看护停止选项合用。",
+        help="执行启动接近、SAM3 抓取、+Z 上抬 150 mm、P3→P4；可用 --head-coarse-approach 替换 P1→P2。",
     )
+    parser.add_argument(
+        "--head-coarse-approach",
+        action="store_true",
+        help="全流程开始时先用头部 RGB-D 定位并移动到最左铰链上方，跳过旧 P1→P2 预移动。",
+    )
+    parser.add_argument("--head-yolo-model", type=Path, default=PROJECT_ROOT / "runs/head_hinge_yolo_seg/head_from_scratch_v1/weights/best.pt")
+    parser.add_argument("--head-above-mm", type=float, default=150.0)
+    parser.add_argument("--head-xy-tolerance-mm", type=float, default=50.0)
+    parser.add_argument("--head-forward-yaw-deg", type=float, default=0.0,
+                        help="头部粗定位时末端 +Z 相对 base_link +X 的水平偏航角。")
+    parser.add_argument("--head-gripper-pitch-deg", type=float, default=30.0,
+                        help="头部粗定位时末端 +Z 向下俯角，正值向下。")
+    parser.add_argument("--head-gripper-roll-deg", type=float, default=180.0,
+                        help="头部粗定位时绕末端 +Z 的滚转角，默认 180 度。")
     parser.add_argument(
         "--wait-for-next",
         action="store_true",
@@ -623,7 +690,8 @@ def sam_review_for_yolo_target(
     min_valid_depth_pixels: int,
     roi: tuple[int, int, int, int] | None,
     reference_center_px: list[float],
-) -> tuple[list[dict], int | None]:
+    return_masks: bool = False,
+) -> tuple[list[dict], int | None] | tuple[list[dict], int | None, list[np.ndarray]]:
     """Return the nearest valid SAM3 instance to the selected YOLO instance.
 
     SAM3 is a review gate only in the YOLO path.  It never substitutes a
@@ -653,6 +721,8 @@ def sam_review_for_yolo_target(
         key=lambda index: float(np.linalg.norm(np.asarray(statistics[index]["center_px"], dtype=np.float64) - reference)),
         default=None,
     )
+    if return_masks:
+        return statistics, selected, masks
     return statistics, selected
 
 
@@ -1023,6 +1093,7 @@ class PersistentPerception:
 
     def _run(self) -> None:
         color_intrinsic = depth_intrinsic = depth_to_color = end_link_transform = None
+        intrinsic_retry_started = time.monotonic()
         previous_step_timestamp = None
         step_trackers = OcclusionTrackerPool()
         last_sam_review_at = float("-inf")
@@ -1042,15 +1113,49 @@ class PersistentPerception:
                     depth = self.camera.get_nearest_image(self.depth_type, int(color.timestamp_ns), 1000.0)
                     depth_u16 = decode_depth_u16(depth, self.gdk)
                 if color_intrinsic is None:
-                    color_intrinsic = intrinsic_to_dict(self.camera.get_camera_intrinsic(self.color_type), width=int(color.width), height=int(color.height))
-                    if not use_step:
-                        depth_intrinsic = intrinsic_to_dict(self.camera.get_camera_intrinsic(self.depth_type), width=int(depth.width), height=int(depth.height))
-                        depth_to_color = transform_to_dict(self.tf.get_tf_from_sensor(self.gdk.SensorExtrinsicType.kLeftHandDepthToLeftHandColor))
-                    else:
-                        if not self.args.step_metric_xy and color_intrinsic != self.args.step_alignment["intrinsic"]:
+                    try:
+                        candidate_color_intrinsic = intrinsic_to_dict(
+                            self.camera.get_camera_intrinsic(self.color_type),
+                            width=int(color.width), height=int(color.height),
+                        )
+                        candidate_depth_intrinsic = None
+                        candidate_depth_to_color = None
+                        if not use_step:
+                            candidate_depth_intrinsic = intrinsic_to_dict(
+                                self.camera.get_camera_intrinsic(self.depth_type),
+                                width=int(depth.width), height=int(depth.height),
+                            )
+                            candidate_depth_to_color = transform_to_dict(self.tf.get_tf_from_sensor(
+                                self.gdk.SensorExtrinsicType.kLeftHandDepthToLeftHandColor
+                            ))
+                        elif not self.args.step_metric_xy and candidate_color_intrinsic != self.args.step_alignment["intrinsic"]:
                             raise RuntimeError("STEP reference camera calibration differs; recapture reference")
-                    end_link_transform = transform_to_dict(self.tf.get_tf_from_sensor(self.gdk.SensorExtrinsicType.kLeftHandRGBDToArmLEndLink))
+                        candidate_end_link_transform = transform_to_dict(self.tf.get_tf_from_sensor(
+                            self.gdk.SensorExtrinsicType.kLeftHandRGBDToArmLEndLink
+                        ))
+                    except Exception as exc:
+                        elapsed = time.monotonic() - intrinsic_retry_started
+                        if elapsed >= 5.0:
+                            raise RuntimeError(f"左手相机内参/外参连续 5 秒不可用：{exc}") from exc
+                        if self.shared is not None:
+                            self.shared.update(None, {
+                                "state": "waiting_for_left_camera_calibration",
+                                "sequence": self._sequence,
+                                "retry_elapsed_s": round(elapsed, 2),
+                                "error": str(exc),
+                            })
+                        time.sleep(0.20)
+                        continue
+                    color_intrinsic = candidate_color_intrinsic
+                    depth_intrinsic = candidate_depth_intrinsic
+                    depth_to_color = candidate_depth_to_color
+                    end_link_transform = candidate_end_link_transform
                 aligned_depth = np.zeros(color_rgb.shape[:2], dtype=np.uint16) if use_step else align_depth_to_color(depth_u16, depth_intrinsic=depth_intrinsic, color_intrinsic=color_intrinsic, depth_to_color=depth_to_color, depth_scale_m=DEPTH_SCALE_M)
+                urdf_target_pixel_px = project_end_point_to_color_pixel(
+                    self.args.urdf_gripper_center_end_m,
+                    end_link_transform,
+                    color_intrinsic,
+                )
                 crop_bounds = center_crop_bounds(color_rgb.shape)
                 roi = intersect_roi(parse_roi(self.args.roi, color_rgb.shape[:2]), crop_bounds)
                 if self.args.detector == "sam3":
@@ -1061,7 +1166,11 @@ class PersistentPerception:
                     masks = expand_crop_masks([np.asarray(mask, dtype=bool).squeeze() for mask in result["masks"].detach().cpu().numpy()], full_shape=color_rgb.shape[:2], bounds=crop_bounds)
                     scores = result["scores"].detach().float().cpu().numpy().reshape(-1)
                     statistics = [stats_for_mask(mask, aligned_depth, DEPTH_SCALE_M, color_intrinsic, end_link_transform) for mask in masks]
-                    for item, score in zip(statistics, scores): item["sam3_confidence"] = float(score)
+                    for item, score, mask in zip(statistics, scores, masks):
+                        item["sam3_confidence"] = float(score)
+                        item["sam_grasp_pixel_px"] = mask_fraction_grasp_pixel(
+                            mask, self.args.sam_grasp_height_fraction
+                        )
                     candidates = eligible_candidates(statistics, min_area=self.args.min_area, min_valid_depth_pixels=self.args.min_valid_depth_pixels, roi=roi, require_depth=False)
                     sam_review = {"accepted": True, "fresh": True, "reason": "sam3_primary"}
                 else:
@@ -1082,6 +1191,11 @@ class PersistentPerception:
                         item["yolo_confidence"] = float(score)
                         item["yolo_class_id"] = class_id
                         item["yolo_class_name"] = names.get(class_id, str(class_id)) if isinstance(names, dict) else str(class_id)
+                    if self.args.detector == "yolo":
+                        for item in statistics:
+                            item["yolo_box_grasp_pixel_px"] = yolo_box_fraction_grasp_pixel(
+                                item, self.args.yolo_box_height_fraction
+                            )
                     geometry = eligible_candidates(
                         statistics,
                         min_area=self.args.min_area,
@@ -1111,16 +1225,63 @@ class PersistentPerception:
                     # do not let a synchronous periodic SAM3 review starve
                     # that mailbox and turn a healthy hold into a stale alarm.
                     if (
+                        self.args.detector == "yolo-sam"
+                        and
                         provisional is not None
                         and not transport_phase
                         and now - last_sam_review_at >= self.args.sam_review_interval_s
                     ):
-                        sam_statistics, sam_index = sam_review_for_yolo_target(self.processor, color_rgb, aligned_depth, color_intrinsic=color_intrinsic, end_link_transform=end_link_transform, prompt=self.args.prompt, min_area=self.args.min_area, min_valid_depth_pixels=self.args.min_valid_depth_pixels, roi=roi, reference_center_px=statistics[provisional]["center_px"])
+                        sam_statistics, sam_index, sam_masks = sam_review_for_yolo_target(self.processor, color_rgb, aligned_depth, color_intrinsic=color_intrinsic, end_link_transform=end_link_transform, prompt=self.args.prompt, min_area=self.args.min_area, min_valid_depth_pixels=self.args.min_valid_depth_pixels, roi=roi, reference_center_px=statistics[provisional]["center_px"], return_masks=True)
+                        if sam_index is not None:
+                            sam_statistics[sam_index]["sam_grasp_pixel_px"] = mask_fraction_grasp_pixel(
+                                sam_masks[sam_index], self.args.sam_grasp_height_fraction
+                            )
+                            sam_statistics[sam_index]["sam_grasp_offset_from_center_px"] = (
+                                np.asarray(sam_statistics[sam_index]["sam_grasp_pixel_px"], dtype=np.float64)
+                                - np.asarray(sam_statistics[sam_index]["center_px"], dtype=np.float64)
+                            ).tolist()
                         accepted, detail = review_matches(statistics[provisional], None if sam_index is None else sam_statistics[sam_index], max_pixel_error=self.args.sam_review_max_pixel_error, max_depth_error_m=self.args.sam_review_max_depth_error_m, allow_missing_depth=True)
-                        sam_review = {**detail, "accepted": accepted, "timestamp_monotonic": now, "yolo_center_px": statistics[provisional]["center_px"], "sam_selected": None if sam_index is None else sam_statistics[sam_index]}
+                        attempt = {
+                            **detail,
+                            "accepted": accepted,
+                            "timestamp_monotonic": now,
+                            "yolo_center_px": statistics[provisional]["center_px"],
+                        }
+                        if accepted:
+                            sam_review = {
+                                **attempt,
+                                "sam_selected": sam_statistics[sam_index],
+                            }
+                        elif not sam_review.get("accepted"):
+                            # Before the first valid SAM review, fail closed.
+                            sam_review = {**attempt, "sam_selected": None}
+                        else:
+                            # A transient SAM miss must not erase a valid
+                            # landmark for the same continuously tracked YOLO
+                            # instance. The normal TTL and target-distance gate
+                            # below still reject stale or switched targets.
+                            sam_review = {**sam_review, "latest_attempt": attempt}
                         last_sam_review_at = now
                     age = None if "timestamp_monotonic" not in sam_review else now - float(sam_review["timestamp_monotonic"])
                     sam_review = {**sam_review, "fresh": age is not None and age <= self.args.sam_review_ttl_s, "age_s": None if age is None else round(max(age, 0.0), 3)}
+                    if provisional is not None and sam_review.get("accepted") and sam_review.get("fresh"):
+                        sam_selected = sam_review.get("sam_selected")
+                        if sam_selected is not None and "sam_grasp_pixel_px" in sam_selected:
+                            # SAM is intentionally slower than YOLO. Carry the
+                            # latest SAM landmark as an offset on the current
+                            # YOLO centre so the control point follows every
+                            # frame instead of freezing between SAM reviews.
+                            offset = np.asarray(
+                                sam_selected.get(
+                                    "sam_grasp_offset_from_center_px",
+                                    np.asarray(sam_selected["sam_grasp_pixel_px"], dtype=np.float64)
+                                    - np.asarray(sam_selected["center_px"], dtype=np.float64),
+                                ),
+                                dtype=np.float64,
+                            )
+                            statistics[provisional]["sam_grasp_pixel_px"] = (
+                                np.asarray(statistics[provisional]["center_px"], dtype=np.float64) + offset
+                            ).tolist()
                 if use_step:
                     bgr = cv2.cvtColor(color_rgb, cv2.COLOR_RGB2BGR)
                     base_end = None
@@ -1148,18 +1309,37 @@ class PersistentPerception:
                     max_center_distance_px=self.args.shaft_association_max_distance_px,
                     max_horizontal_distance_px=self.args.shaft_association_max_horizontal_distance_px,
                     ambiguity_margin_px=self.args.shaft_association_ambiguity_margin_px,
-                    shaft_indices=shaft_candidates if self.args.detector == "yolo-sam" else None,
-                ) if self.args.detector == "yolo-sam" else {"shaft_index": None, "reason": "sam3_mode"}
+                    shaft_indices=shaft_candidates,
+                ) if self.args.detector in {"yolo", "yolo-sam"} else {"shaft_index": None, "reason": "sam3_mode"}
                 with self._condition:
                     self._sequence += 1
-                    snapshot = {"sequence": self._sequence, "color_rgb": color_rgb, "masks": masks, "statistics": statistics, "candidates": candidates, "hinge_candidates": candidates, "shaft_candidates": shaft_candidates if self.args.detector == "yolo-sam" else [], "selected": selected, "shaft_association": shaft_association, "aligned_depth": aligned_depth, "color_intrinsic": color_intrinsic, "depth_intrinsic": depth_intrinsic, "depth_to_color": depth_to_color, "end_link_transform": end_link_transform, "roi": roi, "crop_bounds": crop_bounds, "sam_review": dict(sam_review), "inference_ms": (time.monotonic() - started) * 1000.0}
+                    snapshot = {"sequence": self._sequence, "color_rgb": color_rgb, "masks": masks, "statistics": statistics, "candidates": candidates, "hinge_candidates": candidates, "shaft_candidates": shaft_candidates if self.args.detector in {"yolo", "yolo-sam"} else [], "selected": selected, "shaft_association": shaft_association, "aligned_depth": aligned_depth, "color_intrinsic": color_intrinsic, "depth_intrinsic": depth_intrinsic, "depth_to_color": depth_to_color, "end_link_transform": end_link_transform, "urdf_gripper_center_pixel_px": urdf_target_pixel_px, "roi": roi, "crop_bounds": crop_bounds, "sam_review": dict(sam_review), "inference_ms": (time.monotonic() - started) * 1000.0}
                     self._latest = snapshot
                     phase = dict(self._phase)
                     self._condition.notify_all()
                 if self.shared is not None:
-                    overlay = draw_crop_box(draw_overlay(cv2.cvtColor(color_rgb, cv2.COLOR_RGB2BGR), masks, statistics, selected), crop_bounds)
-                    if use_step and selected is not None and statistics[selected].get("step_pose", {}).get("accepted"):
-                        cv2.drawMarker(overlay, tuple(np.round(servo_pixel(statistics[selected])).astype(int)), (0, 0, 255), cv2.MARKER_CROSS, 22, 2)
+                    if self.args.detector == "yolo" and selected is not None:
+                        overlay = draw_overlay(
+                            cv2.cvtColor(color_rgb, cv2.COLOR_RGB2BGR),
+                            [masks[selected]], [statistics[selected]], 0,
+                        )
+                    else:
+                        overlay = draw_crop_box(draw_overlay(cv2.cvtColor(color_rgb, cv2.COLOR_RGB2BGR), masks, statistics, selected), crop_bounds)
+                    if selected is not None and "yolo_box_grasp_pixel_px" in statistics[selected]:
+                        point = tuple(np.round(servo_pixel(statistics[selected])).astype(int))
+                        cv2.drawMarker(overlay, point, (0, 0, 255), cv2.MARKER_CROSS, 22, 2)
+                        source = "YOLO" if self.args.detector == "yolo" else "SAM"
+                        cv2.putText(overlay, f"{source} grasp bottom-45%", (point[0] + 10, point[1] - 10), cv2.FONT_HERSHEY_SIMPLEX, .55, (0, 0, 255), 2)
+                        sam_selected = sam_review.get("sam_selected")
+                        if sam_selected is not None and sam_selected.get("bbox_xyxy") is not None:
+                            x0, y0, x1, y1 = (int(round(value)) for value in sam_selected["bbox_xyxy"])
+                            cv2.rectangle(overlay, (x0, y0), (x1, y1), (255, 0, 255), 2)
+                            cv2.putText(overlay, "SAM full mask bbox", (x0, max(20, y0 - 8)), cv2.FONT_HERSHEY_SIMPLEX, .55, (255, 0, 255), 2)
+                    target_pixel = urdf_target_pixel_px
+                    if target_pixel is not None:
+                        target_point = tuple(np.round(target_pixel).astype(int))
+                        cv2.drawMarker(overlay, target_point, (0, 255, 255), cv2.MARKER_TILTED_CROSS, 22, 2)
+                        cv2.putText(overlay, "servo target", (target_point[0] + 10, target_point[1] + 20), cv2.FONT_HERSHEY_SIMPLEX, .55, (0, 255, 255), 2)
                     ok, encoded = cv2.imencode(".jpg", overlay, [cv2.IMWRITE_JPEG_QUALITY, 82])
                     if ok:
                         self.shared.update(encoded.tobytes(), {"state": phase["state"], "sequence": self._sequence, "selected_mask_index": selected, "selected": None if selected is None else statistics[selected], "shaft_association": shaft_association, "detector": self.args.detector, "inference_ms": round(snapshot["inference_ms"], 1), "grasp_reason": phase["reason"], "safety": "常驻感知线程独占相机、YOLO/SAM3 与网页更新；动作状态机仅消费最新快照。"})
@@ -1429,6 +1609,7 @@ def main() -> int:
         and args.sam_review_ttl_s > 0
         and args.sam_review_max_pixel_error > 0
         and args.sam_review_max_depth_error_m > 0
+        and 0.0 <= args.yolo_box_height_fraction <= 1.0
         and args.min_area >= 1
         and args.min_valid_depth_pixels >= 1
         and args.warmup >= 0
@@ -1487,6 +1668,10 @@ def main() -> int:
                 parameters = replace(parameters, target_u_px=args.step_alignment["target_pixel_px"][0], target_v_px=args.step_alignment["target_pixel_px"][1])
         elif args.step_metric_xy:
             raise ValueError("--step-metric-xy requires --step-profile")
+        args.urdf_gripper_center_end_m = urdf_gripper_center_end_m(
+            args.urdf.expanduser().resolve(),
+            -0.51025 if gripper_open is None else gripper_open,
+        )
     except Exception as exc:
         print(f"抓取配置无效：{exc}", file=sys.stderr)
         return 2
@@ -1538,7 +1723,8 @@ def main() -> int:
     handoff_presets: list[tuple[str, list[float]]] | None = None
     if args.full_cycle:
         try:
-            premove_presets = load_premove_presets(args.poses)
+            if not args.head_coarse_approach:
+                premove_presets = load_premove_presets(args.poses)
             post_grasp_presets = load_post_grasp_presets(args.poses)
             if args.wait_for_next:
                 handoff_presets = load_premove_presets(args.poses, HANDOFF_PRESETS)
@@ -1548,19 +1734,54 @@ def main() -> int:
     if not torch.cuda.is_available():
         print("未检测到 CUDA，不能运行实时 SAM3。", file=sys.stderr)
         return 2
+    checkpoint = Path(args.checkpoint).expanduser().resolve()
+    if args.detector in {"yolo-sam", "sam3"} and not checkpoint.is_file():
+        print(f"找不到 SAM3 权重：{checkpoint}", file=sys.stderr)
+        return 2
+    yolo_model_path = args.yolo_model.expanduser().resolve()
+    if args.detector in {"yolo", "yolo-sam"} and not yolo_model_path.is_file():
+        print(f"找不到 G2 原生 YOLO 权重：{yolo_model_path}", file=sys.stderr)
+        return 2
+    if args.head_coarse_approach:
+        if not args.full_cycle or not args.allow_motion:
+            print("--head-coarse-approach 必须与 --full-cycle --allow-motion 共用。", file=sys.stderr)
+            return 2
+        head_model_path = args.head_yolo_model.expanduser().resolve()
+        if not head_model_path.is_file():
+            print(f"找不到头部 YOLO 权重：{head_model_path}", file=sys.stderr)
+            return 2
+        command = [
+            sys.executable, str(PROJECT_ROOT / "g2_adapter" / "move_left_above_head_hinge_gdk.py"),
+            "--yolo-model", str(head_model_path),
+            "--above-mm", str(args.head_above_mm),
+            "--head-xy-tolerance-mm", str(args.head_xy_tolerance_mm),
+            "--forward-yaw-deg", str(args.head_forward_yaw_deg),
+            "--gripper-pitch-deg", str(args.head_gripper_pitch_deg),
+            "--gripper-roll-deg", str(args.head_gripper_roll_deg),
+            "--tcp-end-mm", args.step_tcp_end_mm,
+            "--poses", str(args.poses.expanduser()),
+            "--orientation-only",
+            "--speed-mm-s", str(args.xy_speed_mm_s),
+            "--preset-velocity-rad-s", str(motion_preset_velocity_rad_s),
+            "--allow-motion",
+        ]
+        print(json.dumps({"event":"head_coarse_approach_start", "command":command}, ensure_ascii=False), flush=True)
+        result = subprocess.run(command, cwd=PROJECT_ROOT)
+        if result.returncode != 0:
+            print("头部粗定位未到位；不启动左手 D405 视觉伺服。", file=sys.stderr)
+            return int(result.returncode)
+        print(json.dumps({"event":"head_coarse_approach_complete", "xy_tolerance_mm":args.head_xy_tolerance_mm}, ensure_ascii=False), flush=True)
+        # gdk_release() tears down DDS asynchronously.  Starting a new GDK
+        # client immediately can consume the previous config response and
+        # produce a UUID mismatch on the first camera-intrinsic request.
+        time.sleep(1.0)
+    # Importing agibot_gdk starts its DDS runtime even before gdk_init().  Keep
+    # this import after the coarse child has fully released GDK; otherwise the
+    # parent and child create overlapping python3.12_S1 DDS nodes.
     try:
         import agibot_gdk
     except ImportError:
         print("agibot_gdk 不可用；请通过 scripts/run_gdk_sam3_python.sh 运行。", file=sys.stderr)
-        return 2
-
-    checkpoint = Path(args.checkpoint).expanduser().resolve()
-    if not checkpoint.is_file():
-        print(f"找不到 SAM3 权重：{checkpoint}", file=sys.stderr)
-        return 2
-    yolo_model_path = args.yolo_model.expanduser().resolve()
-    if args.detector == "yolo-sam" and not yolo_model_path.is_file():
-        print(f"找不到 G2 原生 YOLO 权重：{yolo_model_path}", file=sys.stderr)
         return 2
     log_path = args.log or PROJECT_ROOT / "logs" / f"left_grasp_{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}.jsonl"
     log_path = log_path.expanduser().resolve()
@@ -1580,8 +1801,10 @@ def main() -> int:
         "preset_timeout_s": motion_preset_timeout_s,
         "poses": None if not args.full_cycle else str(args.poses.expanduser().resolve()),
         "safety": (
-            "single process: preload SAM3, then P1/P2→visual grasp→+Z 150 mm→P3→P4; "
-            "one GDK initialization and no extra gripper command after grasp"
+            (("head RGB-D coarse approach (orientation-only at current position)→visual grasp→+Z 150 mm→P3→P4; "
+              if args.head_coarse_approach else
+              "single process: preload SAM3, then P1/P2→visual grasp→+Z 150 mm→P3→P4; ")
+             + "one GDK initialization and no extra gripper command after grasp")
             if args.full_cycle else "P1/P2/P3/P4 are not commanded by this program"
         ),
     }, ensure_ascii=False))
@@ -1604,7 +1827,8 @@ def main() -> int:
             web_shared = SharedView()
             web_server = ThreadingHTTPServer((args.web_host, args.web_port), handler_class(web_shared))
             threading.Thread(target=web_server.serve_forever, daemon=True).start()
-            print(f"内嵌实时页面：http://{args.web_host}:{args.web_port}（与抓取共用同一 SAM3 模型）")
+            model_note = "YOLO 实时分割" if args.detector == "yolo" else "与抓取共用同一 SAM3 模型"
+            print(f"内嵌实时页面：http://{args.web_host}:{args.web_port}（{model_note}）")
         if agibot_gdk.gdk_init() != agibot_gdk.GDKRes.kSuccess:
             raise RuntimeError("GDK 初始化失败")
         initialized = True
@@ -1638,10 +1862,9 @@ def main() -> int:
         depth_type = agibot_gdk.CameraType.kHandLeftDepth
         camera = agibot_gdk.Camera([camera_type] if args.step_profile is not None else [camera_type, depth_type])
         tf = agibot_gdk.TF()
-        model = build_sam3_image_model(checkpoint_path=str(checkpoint), load_from_HF=False)
-        processor = Sam3Processor(model, confidence_threshold=args.threshold)
+        processor = None
         yolo_model = None
-        if args.detector == "yolo-sam":
+        if args.detector in {"yolo", "yolo-sam"}:
             print(f"加载 G2 原生 YOLO 主检测器：{yolo_model_path}", flush=True)
             yolo_model = load_yolo_segmentation_model(yolo_model_path, device=args.yolo_device)
         # From this point onward the worker is the sole camera/model owner.
@@ -1709,22 +1932,32 @@ def main() -> int:
                 "final_descent_speed_mps": None if parameters is None else parameters.final_descent_speed_mps,
                 "final_descent_duration_s": None if parameters is None else parameters.final_descent_duration_s,
                 "full_cycle": args.full_cycle,
-                "sam3_preloaded_before_premove": args.full_cycle,
+                "sam3_preloaded_before_premove": args.full_cycle and not args.head_coarse_approach,
                 "perception_architecture": "one persistent owner: camera + YOLO + periodic SAM3 + web; state machine consumes latest snapshots only",
             })
             json_record(log, {"event": "gdk_motion_status_before_perception", **controller.motion_status_summary()})
             if args.full_cycle:
-                assert premove_presets is not None
-                json_record(log, {
-                    "event": "premove_start_after_sam3_preload",
-                    "utc": datetime.now(timezone.utc).isoformat(),
-                    "presets": [name for name, _ in premove_presets],
-                    "sam3": "loaded",
-                })
-                premove_sequence = NonBlockingLeftPresetSequence(
-                    premove_presets, motion_preset_velocity_rad_s,
-                    args.preset_arrival_tolerance_rad, motion_preset_timeout_s, "premove",
-                )
+                if args.head_coarse_approach:
+                    controller.set_control_mode(1)
+                    assert gripper_close_timeout is not None and gripper_open is not None
+                    initial_gripper_open_stream = controller.start_left_gripper_position_stream(gripper_open)
+                    initial_gripper_open = {
+                        "deadline": time.monotonic() + gripper_close_timeout,
+                        "next_command_at": time.monotonic(), "attempts": 0,
+                    }
+                    json_record(log, {"event":"legacy_premove_skipped_after_head_coarse_approach", "utc":datetime.now(timezone.utc).isoformat()})
+                else:
+                    assert premove_presets is not None
+                    json_record(log, {
+                        "event": "premove_start_after_sam3_preload",
+                        "utc": datetime.now(timezone.utc).isoformat(),
+                        "presets": [name for name, _ in premove_presets],
+                        "sam3": "loaded",
+                    })
+                    premove_sequence = NonBlockingLeftPresetSequence(
+                        premove_presets, motion_preset_velocity_rad_s,
+                        args.preset_arrival_tolerance_rad, motion_preset_timeout_s, "premove",
+                    )
             if not args.full_cycle and args.allow_motion and args.stop_after == "none":
                 assert gripper_open is not None and gripper_tolerance is not None and gripper_close_timeout is not None
                 initial_gripper_open_stream = controller.start_left_gripper_position_stream(gripper_open)
@@ -2214,9 +2447,21 @@ def main() -> int:
                     depth_intrinsic = snapshot["depth_intrinsic"]
                     depth_to_color = snapshot["depth_to_color"]
                     end_link_transform = snapshot["end_link_transform"]
+                    urdf_target_pixel_px = np.asarray(snapshot["urdf_gripper_center_pixel_px"], dtype=np.float64)
+                    record["urdf_gripper_center_end_m"] = args.urdf_gripper_center_end_m.tolist()
+                    record["urdf_gripper_center_pixel_px"] = urdf_target_pixel_px.tolist()
+                    if state is not None and args.step_profile is None:
+                        parameters = replace(
+                            parameters,
+                            target_u_px=float(urdf_target_pixel_px[0]),
+                            target_v_px=float(urdf_target_pixel_px[1]),
+                        )
+                        state.fine_parameters = parameters
+                        if not state.coarse_active:
+                            state.parameters = parameters
                     roi = snapshot["roi"]
                     crop_bounds = snapshot["crop_bounds"]
-                    if args.detector == "yolo-sam":
+                    if args.detector in {"yolo", "yolo-sam"}:
                         record["yolo"] = {
                             "model": str(yolo_model_path),
                             "input": "persistent_native_left_d405_color_image",
@@ -2313,10 +2558,10 @@ def main() -> int:
                             max_horizontal_distance_px=args.shaft_association_max_horizontal_distance_px,
                             ambiguity_margin_px=args.shaft_association_ambiguity_margin_px,
                         )
-                        if args.detector == "yolo-sam"
+                        if args.detector in {"yolo", "yolo-sam"}
                         else {"shaft_index": None, "reason": "sam3_mode"}
                     )
-                    if args.detector == "yolo-sam" and "yolo" in record:
+                    if args.detector in {"yolo", "yolo-sam"} and "yolo" in record:
                         record["yolo"]["shaft_association"] = shaft_association
                     record.update({
                         "tracking": tracking,
@@ -2373,7 +2618,11 @@ def main() -> int:
                     if coarse_active or gripper_closing:
                         item = dict(item)
                         item.pop("step_pose", None)
-                    record["alignment_stage"] = "coarse_yolo" if coarse_active else "fine_step"
+                    record["alignment_stage"] = (
+                        "coarse_yolo"
+                        if coarse_active
+                        else ("fine_step" if args.step_profile is not None else "sam_fraction")
+                    )
                     if args.step_profile is not None and not gripper_closing:
                         record["step_pose"] = item.get("step_pose", {})
                         if not coarse_active and not item.get("step_pose", {}).get("accepted"):

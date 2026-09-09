@@ -56,6 +56,7 @@ def infer_yolo_masks(
         device=device,
         verbose=False,
         retina_masks=True,
+        iou=0.50,
         max_det=10,
     )
     if not results:

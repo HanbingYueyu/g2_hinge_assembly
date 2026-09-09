@@ -53,6 +53,7 @@ class BilateralWorkflowTests(unittest.TestCase):
     def test_stage_commands_include_takeover_and_left_full_cycle_right_execute(self):
         left, right = build_stage_commands(self.args())
         self.assertIn("--full-cycle", left)
+        self.assertIn("--head-coarse-approach", left)
         self.assertIn("--wait-for-next", left)
         self.assertIn("--spacemouse-device", left)
         self.assertIn("--speed-mm-s", left)

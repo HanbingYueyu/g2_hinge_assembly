@@ -197,6 +197,35 @@ class ControlTests(unittest.TestCase):
             dot = abs(sum(a * b for a, b in zip(first, second)))
             self.assertLessEqual(2.0 * math.acos(min(1.0, dot)), 0.02 + 1e-6)
 
+    def test_left_stream_can_rotate_without_translating(self):
+        robot = FakeRobot()
+        controller = G2Controller(FakeGdk, robot, allow_motion=True)
+        initial = CartesianPoseTarget((0.1, -0.2, 0.3), (0.0, 0.0, 0.0, 1.0))
+        target = CartesianPoseTarget(
+            initial.position_m,
+            (0.0, 0.0, math.sin(math.pi / 4.0), math.cos(math.pi / 4.0)),
+        )
+        stream = controller.start_left_end_effector_position_stream(
+            initial,
+            max_translation_velocity_mps=0.001,
+            allow_orientation_change=True,
+            max_angular_velocity_rad_s=1.0,
+        )
+        try:
+            stream.update_target(target)
+            self.assertTrue(stream.wait_until_target(2.0))
+        finally:
+            stream.stop()
+
+        poses = [request.left_end_effector_pose for request in robot.requests]
+        self.assertGreater(len(poses), 1)
+        self.assertEqual(
+            [(pose.position.x, pose.position.y, pose.position.z) for pose in poses[-3:]],
+            [(0.1, -0.2, 0.3)] * min(3, len(poses)),
+        )
+        self.assertAlmostEqual(poses[-1].orientation.z, math.sin(math.pi / 4.0), places=6)
+        self.assertAlmostEqual(poses[-1].orientation.w, math.cos(math.pi / 4.0), places=6)
+
     def test_right_stream_still_rejects_orientation_without_opt_in(self):
         robot = FakeRobot()
         controller = G2Controller(FakeGdk, robot, allow_motion=True)

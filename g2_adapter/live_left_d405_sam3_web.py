@@ -18,9 +18,6 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import cv2
 import numpy as np
 import torch
-from PIL import Image
-from sam3.model.sam3_image_processor import Sam3Processor
-from sam3.model_builder import build_sam3_image_model
 
 try:
     from .camera import align_depth_to_color, decode_color_rgb, decode_depth_u16, intrinsic_to_dict, transform_to_dict
@@ -109,6 +106,10 @@ def handler_class(shared: SharedView, *, title: str = "G2 左手 D405 / SAM3（�
 
 
 def run() -> int:
+    from PIL import Image
+    from sam3.model.sam3_image_processor import Sam3Processor
+    from sam3.model_builder import build_sam3_image_model
+
     args = parse_args()
     if (
         args.inference_fps < 0

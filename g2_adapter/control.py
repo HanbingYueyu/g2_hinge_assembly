@@ -194,6 +194,8 @@ class LeftEndEffectorPositionStream:
         rate_hz: float,
         life_time_s: float,
         max_translation_velocity_mps: float,
+        allow_orientation_change: bool = False,
+        max_angular_velocity_rad_s: float = 0.5,
     ) -> None:
         if not 45.0 <= rate_hz <= 55.0:
             raise ValueError("end-effector position publication rate must be in [45, 55] Hz")
@@ -201,10 +203,14 @@ class LeftEndEffectorPositionStream:
             raise ValueError("end-effector position life_time must be in [0.04, 0.20] seconds")
         if not 0.0 < max_translation_velocity_mps <= 0.05:
             raise ValueError("end-effector translation velocity must be in (0, 0.05] m/s")
+        if not 0.01 <= max_angular_velocity_rad_s <= 1.0:
+            raise ValueError("end-effector angular velocity must be in [0.01, 1.0] rad/s")
         self._controller = controller
         self._period_s = 1.0 / float(rate_hz)
         self._life_time_s = float(life_time_s)
         self._max_translation_velocity_mps = float(max_translation_velocity_mps)
+        self._allow_orientation_change = bool(allow_orientation_change)
+        self._max_angular_velocity_rad_s = float(max_angular_velocity_rad_s)
         self._lock = threading.Lock()
         self._commanded: CartesianPoseTarget | None = None
         self._desired: CartesianPoseTarget | None = None
@@ -236,7 +242,7 @@ class LeftEndEffectorPositionStream:
         with self._lock:
             if self._stop.is_set() or self._thread is None:
                 raise RuntimeError("end-effector position stream is not running")
-            if target.orientation_xyzw != self._fixed_orientation:
+            if not self._allow_orientation_change and quaternion_angle_deg(target.orientation_xyzw, self._fixed_orientation) > _FIXED_ORIENTATION_TOLERANCE_DEG:
                 raise SafetyError("mode-1 visual servo must keep the initial end-link orientation")
             self._desired = target
             self._target_generation += 1
@@ -331,14 +337,28 @@ class LeftEndEffectorPositionStream:
             distance = float(np.linalg.norm(delta))
             max_step_m = self._max_translation_velocity_mps * self._period_s
             if distance <= max_step_m:
-                next_target = desired
-                self._at_target.set()
+                next_position = desired_position
             else:
                 next_position = current_position + delta * (max_step_m / distance)
-                next_target = CartesianPoseTarget(
-                    tuple(float(value) for value in next_position),
+            current_orientation = np.asarray(commanded.orientation_xyzw, dtype=np.float64)
+            desired_orientation = np.asarray(desired.orientation_xyzw, dtype=np.float64)
+            orientation_dot = abs(float(np.dot(
+                current_orientation / np.linalg.norm(current_orientation),
+                desired_orientation / np.linalg.norm(desired_orientation),
+            )))
+            orientation_angle = 2.0 * math.acos(min(1.0, max(-1.0, orientation_dot)))
+            max_angle_step = self._max_angular_velocity_rad_s * self._period_s
+            if orientation_angle <= max_angle_step:
+                next_orientation = desired.orientation_xyzw
+            else:
+                next_orientation = quaternion_slerp(
                     commanded.orientation_xyzw,
+                    desired.orientation_xyzw,
+                    max_angle_step / orientation_angle,
                 )
+            next_target = CartesianPoseTarget(tuple(float(value) for value in next_position), next_orientation)
+            if distance <= max_step_m and orientation_angle <= max_angle_step:
+                self._at_target.set()
             try:
                 self._controller._send_left_cartesian_pose(
                     next_target,
@@ -933,6 +953,8 @@ class G2Controller:
         rate_hz: float = 50.0,
         life_time_s: float = 0.10,
         max_translation_velocity_mps: float = 0.01,
+        allow_orientation_change: bool = False,
+        max_angular_velocity_rad_s: float = 0.5,
     ) -> LeftEndEffectorPositionStream:
         """Start GDK's direct mode-1 end-link pose control without a mode change."""
         self._require_motion()
@@ -947,6 +969,8 @@ class G2Controller:
             rate_hz=rate_hz,
             life_time_s=life_time_s,
             max_translation_velocity_mps=max_translation_velocity_mps,
+            allow_orientation_change=allow_orientation_change,
+            max_angular_velocity_rad_s=max_angular_velocity_rad_s,
         )
         stream.start(initial_target)
         return stream
