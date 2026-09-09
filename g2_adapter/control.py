@@ -268,6 +268,13 @@ class LeftEndEffectorPositionStream:
         with self._lock:
             return self._arrived_generation >= self._target_generation
 
+    def set_translation_velocity(self, velocity_mps: float) -> None:
+        """Change stream rate limit without replacing the sole command writer."""
+        if not 0 < velocity_mps <= 0.05:
+            raise ValueError("translation velocity must be in (0, 0.05] m/s")
+        with self._lock:
+            self._max_translation_velocity_mps = float(velocity_mps)
+
     def set_left_gripper_target(self, position_rad: float) -> None:
         """Synchronize the left Omnipicker with this 50-Hz pose stream.
 

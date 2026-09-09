@@ -3,7 +3,9 @@
   "calibrated": true,
   "right_mode1_probe_verified": true,
   "description": "OpenArm 右手三张 tagStandard41h12 工件定位迁移至 G2。运动前必须填写实测的 right_end_from_grasp_tcp 并完成右臂 1 mm mode-1 探针。",
-  "tag_sample_count": 20,
+  "tag_sample_count": 3,
+  "grasp_distance_mm": 152.0,
+  "workpiece_relocalization": {"translation_m": 0.005, "rotation_deg": 3.0},
   "max_reprojection_error_px": 3.0,
   "calibration_max_reprojection_error_px": 3.0,
   "observation": {

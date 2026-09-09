@@ -123,6 +123,8 @@ class WorkpiecePose:
     max_reprojection_error_px: float
     inlier_count: int
     sample_counts: dict[int, int]
+    point_diagnostics: tuple = ()
+    expected_tag_corners: dict | None = None
 
 
 @dataclass(frozen=True)
@@ -315,7 +317,7 @@ class RollingWorkpiecePoseEstimator:
             raise AprilTagGeometryError("camera matrix must be finite 3x3")
         object_points = np.vstack([self.geometry.object_points[tag_id] for tag_id in available])
         raw_points = {tag_id: np.mean(np.stack(self._samples[tag_id]), axis=0) for tag_id in available}
-        candidates: list[tuple[float, float, str, np.ndarray, np.ndarray, int]] = []
+        candidates = []
         diagnostics: list[dict[str, object]] = []
         for name, order in CORNER_ORDER_CANDIDATES.items():
             # The deployed detector/model convention is forward_0 (also
@@ -356,16 +358,31 @@ class RollingWorkpiecePoseEstimator:
                 continue
             matrix = np.eye(4, dtype=np.float64)
             matrix[:3, :3], matrix[:3, 3] = rotation, np.asarray(tvec, dtype=np.float64).reshape(3)
-            candidates.append((mean_error, max_error, name, matrix, image_points, int(len(selected))))
+            expected_tags = {}
+            for tag_id in sorted(REQUIRED_TAG_IDS):
+                tag_projected, _ = cv2.projectPoints(
+                    self.geometry.object_points[tag_id], rvec, tvec, intrinsic, coefficients,
+                )
+                expected_tags[int(tag_id)] = tag_projected.reshape(-1, 2).tolist()
+            points = tuple({
+                "tag_id": int(available[i // 4]), "model_corner_index": int(i % 4),
+                "detected_corner_index": int(order[i % 4]),
+                "image_px": image_points[i].tolist(),
+                "projected_px": projected.reshape(-1, 2)[i].tolist(),
+                "error_px": float(errors[i]), "inlier": bool(i in selected),
+            } for i in range(len(image_points)))
+            candidates.append((mean_error, max_error, name, matrix, image_points,
+                               int(len(selected)), points, expected_tags))
         if not candidates:
             self._last_diagnostics = {"state": "pnp_ransac_failed", "sample_counts": self.sample_counts, "corner_candidates": diagnostics}
             return None
         candidates.sort(key=lambda item: item[0])
-        mean_error, max_error, order, matrix, _image_points, inlier_count = candidates[0]
+        mean_error, max_error, order, matrix, _image_points, inlier_count, points, expected_tags = candidates[0]
         summary = sorted(diagnostics, key=lambda item: float(item.get("mean_reprojection_error_px", math.inf)))
         if len(candidates) > 1 and candidates[1][0] - mean_error < 0.25:
             self._last_diagnostics = {
-                "state": "pnp_corner_order_ambiguous", "best_order": order,
+                "state": "pnp_corner_order_ambiguous", "best_order": order, "points": points,
+                "expected_tag_corners": expected_tags,
                 "mean_reprojection_error_px": mean_error, "corner_candidates": summary,
             }
             return None
@@ -373,14 +390,17 @@ class RollingWorkpiecePoseEstimator:
             self._last_diagnostics = {
                 "state": "pnp_reprojection_rejected", "corner_order": order, "inlier_count": inlier_count,
                 "mean_reprojection_error_px": mean_error, "max_reprojection_error_px": max_error,
-                "gate_px": self.max_reprojection_error_px, "corner_candidates": summary,
+                "gate_px": self.max_reprojection_error_px, "corner_candidates": summary, "points": points,
+                "expected_tag_corners": expected_tags,
             }
             return None
         self._last_diagnostics = {
-            "state": "pnp_accepted", "corner_order": order, "inlier_count": inlier_count,
+            "state": "pnp_accepted", "corner_order": order, "inlier_count": inlier_count, "points": points,
+            "expected_tag_corners": expected_tags,
             "mean_reprojection_error_px": mean_error, "max_reprojection_error_px": max_error, "corner_candidates": summary,
         }
-        return WorkpiecePose(matrix, mean_error, max_error, inlier_count, self.sample_counts)
+        return WorkpiecePose(matrix, mean_error, max_error, inlier_count, self.sample_counts,
+                             points, expected_tags)
 
 
 def g2_grasp_targets(

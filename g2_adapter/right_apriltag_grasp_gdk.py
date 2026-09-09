@@ -145,7 +145,7 @@ def handler_class(shared: SharedView):
             page = """<!doctype html><meta charset='utf-8'><title>G2 Right AprilTag</title>
 <style>body{margin:0;background:#161616;color:#eee;font:15px sans-serif}main{max-width:1280px;margin:auto;padding:14px}img{width:100%;background:#222}pre{white-space:pre-wrap;background:#242424;padding:10px;border-radius:6px}</style>
 <main><h2>G2 右手 AprilTag 41h12（只读预览）</h2><img id='overlay' alt='等待相机帧'><pre id='status'>starting</pre></main>
-<script>let s=-1;async function tick(){try{let r=await fetch('/status.json',{cache:'no-store'});let j=await r.json();document.querySelector('#status').textContent=JSON.stringify(j,null,2);if(j.sequence!==s){s=j.sequence;document.querySelector('#overlay').src='/overlay.jpg?seq='+s}}catch(e){document.querySelector('#status').textContent=String(e)}}setInterval(tick,250);tick();</script>"""
+<script>let s=-1;async function tick(){try{let r=await fetch('/status.json',{cache:'no-store'});let j=await r.json();document.querySelector('#status').textContent=JSON.stringify(j,null,2);if(j.sequence!==s){s=j.sequence;document.querySelector('#overlay').src='/overlay.jpg?seq='+s}}catch(e){document.querySelector('#status').textContent=String(e)}}setInterval(tick,100);tick();</script>"""
             self.send_payload(page.encode(), "text/html; charset=utf-8")
 
     return Handler
@@ -394,12 +394,45 @@ def draw_overlay(color_rgb: np.ndarray, visible: dict[int, np.ndarray], record: 
         cv2.polylines(image, [polygon], True, (0, 255, 0), 2, cv2.LINE_AA)
         center = np.mean(corners, axis=0).astype(int)
         cv2.putText(image, f"tag {tag_id}", tuple(center), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2, cv2.LINE_AA)
-    counts = record.get("sample_counts", {})
-    cv2.putText(image, f"tag samples: 0={counts.get(0, 0)} 1={counts.get(1, 0)} 2={counts.get(2, 0)} / 20", (14, 32), cv2.FONT_HERSHEY_SIMPLEX, 0.75, (255, 255, 255), 2, cv2.LINE_AA)
+    pnp = record.get("pnp") or record.get("pnp_diagnostics") or {}
+    for tag_id, corners in visible.items():
+        for index, corner in enumerate(corners):
+            xy = tuple(np.rint(corner).astype(int))
+            cv2.circle(image, xy, 5, (255, 255, 0), 1, cv2.LINE_AA)
+            cv2.putText(image, f"{tag_id}:{index}", (xy[0] + 7, xy[1] - 7),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 0), 1, cv2.LINE_AA)
+    expected_by_tag = {
+        int(tag_id): [{"projected_px": corner, "model_corner_index": index} for index, corner in enumerate(corners)]
+        for tag_id, corners in pnp.get("expected_tag_corners", {}).items()
+    }
+    for point in pnp.get("points", ()):
+        observed = tuple(np.rint(point["image_px"]).astype(int))
+        projected = tuple(np.rint(point["projected_px"]).astype(int))
+        if not pnp.get("expected_tag_corners"):
+            expected_by_tag.setdefault(int(point["tag_id"]), []).append(point)
+        color = (0, 255, 0) if point["inlier"] else (0, 0, 255)
+        cv2.line(image, observed, projected, color, 1, cv2.LINE_AA)
+        cv2.circle(image, observed, 3, color, -1, cv2.LINE_AA)
+        cv2.drawMarker(image, projected, (255, 0, 255), cv2.MARKER_CROSS, 9, 1)
+    for tag_id, points in expected_by_tag.items():
+        points.sort(key=lambda item: int(item.get("model_corner_index", 0)))
+        polygon = np.rint([item["projected_px"] for item in points]).astype(np.int32).reshape((-1, 1, 2))
+        if len(polygon) == 4:
+            cv2.polylines(image, [polygon], True, (255, 0, 255), 2, cv2.LINE_AA)
+        center = np.mean(polygon.reshape(-1, 2), axis=0).astype(int)
+        errors = [float(item["error_px"]) for item in pnp.get("points", ()) if int(item["tag_id"]) == tag_id]
+        error_text = f" mean={np.mean(errors):.1f} max={max(errors):.1f}px" if errors else " (not detected)"
+        cv2.putText(image, f"expected tag {tag_id}{error_text}",
+                    (int(center[0]) + 8, int(center[1]) + 18),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 0, 255), 1, cv2.LINE_AA)
+    counts = record.get("sample_counts") or pnp.get("sample_counts", {})
+    cv2.putText(image, f"tag samples: 0={counts.get(0, 0)} 1={counts.get(1, 0)} 2={counts.get(2, 0)} / 3", (14, 32), cv2.FONT_HERSHEY_SIMPLEX, 0.75, (255, 255, 255), 2, cv2.LINE_AA)
     locked = str(record.get("event", "")).startswith("stable_apriltag_")
-    message = "POSE LOCKED" if locked else "OBSERVING: need all 3 tags"
+    message = "POSE LOCKED" if locked else str(pnp.get("state", "OBSERVING: need any 2 tags"))
     color = (0, 220, 0) if locked else (0, 180, 255)
     cv2.putText(image, message, (14, 65), cv2.FONT_HERSHEY_SIMPLEX, 0.75, color, 2, cv2.LINE_AA)
+    cv2.putText(image, "Cyan: detected | Green/red: PnP inlier/outlier | Magenta: expected tag",
+                (14, 94), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1, cv2.LINE_AA)
     ok, encoded = cv2.imencode(".jpg", image, [cv2.IMWRITE_JPEG_QUALITY, 85])
     if not ok:
         raise RuntimeError("failed to encode AprilTag preview")
@@ -423,7 +456,14 @@ def publish_shared_view(
     """
     if shared is None:
         return
-    pnp = record.get("pnp") or record.get("pnp_diagnostics") or {}
+    pnp = dict(record.get("pnp") or record.get("pnp_diagnostics") or {})
+    tag_errors = {}
+    for point in pnp.get("points", ()):
+        tag_errors.setdefault(str(point["tag_id"]), []).append(float(point["error_px"]))
+    pnp["tag_errors_px"] = {
+        tag_id: {"mean": round(float(np.mean(errors)), 3), "max": round(max(errors), 3)}
+        for tag_id, errors in tag_errors.items()
+    }
     sample_counts = record.get("sample_counts") or pnp.get("sample_counts", {})
     visible_tag_ids = record.get("visible_tag_ids")
     if visible_tag_ids is None:
@@ -443,6 +483,8 @@ def publish_shared_view(
             "grasp_arm_r_end_link_base": record.get("grasp_arm_r_end_link_base"),
             "current_to_pregrasp": record.get("current_to_pregrasp"),
             "calibration_required": record.get("calibration_required"),
+            "spacemouse_connected": record.get("spacemouse_connected"),
+            "spacemouse_last_disconnect": record.get("spacemouse_last_disconnect"),
             "motion": motion,
         },
     )
@@ -467,7 +509,9 @@ def target_record(
         "grasp_arm_r_end_link_base": serialize(targets.base_from_grasp_end),
         "pnp": {"mean_reprojection_error_px": round(workpiece_pose.mean_reprojection_error_px, 4),
                 "max_reprojection_error_px": round(workpiece_pose.max_reprojection_error_px, 4),
-                "inlier_count": workpiece_pose.inlier_count, "sample_counts": workpiece_pose.sample_counts},
+                "inlier_count": workpiece_pose.inlier_count, "sample_counts": workpiece_pose.sample_counts,
+                "points": getattr(workpiece_pose, "point_diagnostics", ()),
+                "expected_tag_corners": getattr(workpiece_pose, "expected_tag_corners", {})},
         "current_to_pregrasp": {
             "translation_error_m": round(pregrasp_distance_m, 7),
             "orientation_error_deg": round(pregrasp_angle_deg, 4),
@@ -503,7 +547,9 @@ def workpiece_only_record(
         "workpiece_pose_base": matrix_pose_record(base_from_workpiece),
         "pnp": {"mean_reprojection_error_px": round(workpiece_pose.mean_reprojection_error_px, 4),
                 "max_reprojection_error_px": round(workpiece_pose.max_reprojection_error_px, 4),
-                "inlier_count": workpiece_pose.inlier_count, "sample_counts": workpiece_pose.sample_counts},
+                "inlier_count": workpiece_pose.inlier_count, "sample_counts": workpiece_pose.sample_counts,
+                "points": getattr(workpiece_pose, "point_diagnostics", ()),
+                "expected_tag_corners": getattr(workpiece_pose, "expected_tag_corners", {})},
         "gdk_tf": tf_info,
     }
 
@@ -779,6 +825,13 @@ def facing_distance_targets(targets, distance_mm):
     return GraspTargets(targets.base_from_workpiece, pre, grasp)
 
 
+def distance_grasp_targets(targets, distance_mm):
+    facing = facing_distance_targets(targets, distance_mm)
+    # The standoff is the grasp itself: never append an inward approach.
+    target = facing.base_from_pregrasp_end.copy()
+    return GraspTargets(targets.base_from_workpiece, target, target.copy())
+
+
 def targets_with_locked_orientation(targets, locked_rotation: np.ndarray) -> GraspTargets:
     """Keep live target translations while replacing both end-link rotations.
 
@@ -1032,6 +1085,7 @@ def execute_live_autonomous_pregrasp(
     *,
     shared: SharedView | None = None,
     face_distance_mm: float | None = None,
+    grasp_distance_mm: float | None = None,
 ):
     """Receding-horizon visual servo with a bounded hold/reacquire state.
 
@@ -1156,6 +1210,8 @@ def execute_live_autonomous_pregrasp(
         result = targets_with_locked_orientation(targets, locked_rotation)
         if face_distance_mm is not None:
             result = facing_distance_targets(result, face_distance_mm)
+        if grasp_distance_mm is not None:
+            result = distance_grasp_targets(result, grasp_distance_mm)
         return result
 
     latest_targets = locked_targets(first_targets)
@@ -1489,7 +1545,7 @@ def return_screwdriver(controller, saved_pose, config, emit) -> None:
     emit({"event": "right_return_released", **opened})
 
 
-def wait_for_manual_finish(worker, *, sleep=time.sleep) -> None:
+def wait_for_manual_finish(worker, *, preview=None, sleep=time.sleep) -> None:
     """Keep takeover alive after completion; only a new long hold finishes."""
     worker.allow_advance_right = True
     print("右手流程已完成；可双击任一按钮接管，右按钮长按 2 秒放回电批后结束程序。", flush=True)
@@ -1497,7 +1553,10 @@ def wait_for_manual_finish(worker, *, sleep=time.sleep) -> None:
         worker.raise_if_failed()
         if worker.advance_requested:
             return
-        sleep(0.01)
+        if preview is not None:
+            preview()
+        else:
+            sleep(0.01)
 
 
 def main() -> int:
@@ -1560,7 +1619,7 @@ def main() -> int:
             pregrasp_mapping, "workpiece_from_pregrasp_end",
         )
         estimator = RollingWorkpiecePoseEstimator(
-            sample_count=int(config.get("tag_sample_count", 20)),
+            sample_count=int(config.get("tag_sample_count", 3)),
             max_reprojection_error_px=float(config.get("max_reprojection_error_px", 3.0)),
             max_sample_age_s=get_number(require_mapping(config.get("observation"), "observation"), "max_sample_age_s", minimum=0.1),
             geometry=tag_geometry,
@@ -1796,7 +1855,7 @@ def main() -> int:
                         "preset": PR1_POSE_NAME,
                     })
 
-            def acquire_live_lock(*, moving: bool = False):
+            def acquire_raw_lock(*, moving: bool = False):
                 if live_estimator is None or intrinsic is None:
                     raise RuntimeError("自主视觉锁定尚未初始化相机内参")
                 lock = acquire_fresh_visual_lock(
@@ -1824,11 +1883,133 @@ def main() -> int:
                     lock["targets"] = facing_distance_targets(lock["targets"], args.face_distance_mm)
                 return lock
 
+            grasp_distance_mm = config.get("grasp_distance_mm") if args.face_distance_mm is None else None
+            if grasp_distance_mm is not None:
+                grasp_distance_mm = float(grasp_distance_mm)
+                if not math.isfinite(grasp_distance_mm) or not 10 <= grasp_distance_mm <= 300:
+                    raise ValueError("grasp_distance_mm must be in [10, 300]")
+                if args.execute and not args.autonomous_approach:
+                    raise ValueError("distance grasp requires --autonomous-approach")
+
+            cached_workpiece_mean = None
+            movement = config.get("workpiece_relocalization", {})
+            movement_m = get_number({"translation_m": movement.get("translation_m", .005)}, "translation_m", minimum=.0001)
+            movement_deg = get_number({"rotation_deg": movement.get("rotation_deg", 3.0)}, "rotation_deg", minimum=.01)
+
+            def acquire_distance_lock(*, moving: bool = False):
+                nonlocal cached_workpiece_mean
+                if grasp_distance_mm is None:
+                    return acquire_raw_lock(moving=moving)
+                try:
+                    from .right_grasp_distance import robust_pose_mean, workpiece_moved
+                except ImportError:
+                    from right_grasp_distance import robust_pose_mean, workpiece_moved
+                lock = acquire_raw_lock(moving=moving)
+                if cached_workpiece_mean is not None:
+                    changed, displacement, angle = workpiece_moved(cached_workpiece_mean,
+                        lock["base_from_workpiece"], movement_m, movement_deg)
+                    if changed:
+                        cached_workpiece_mean = None
+                        print(json.dumps({"event": "right_workpiece_moved", "translation_mm": displacement * 1000,
+                            "rotation_deg": angle, "motion": "hold_then_resample_3"}), flush=True)
+                        # The caller catches this and commands a measured-pose
+                        # hold before the next call starts collecting samples.
+                        raise VisualLockTimeout("工件移动超过阈值；保持当前位置后重新采集3次")
+                resampled = cached_workpiece_mean is None
+                if resampled:
+                    poses = [lock["base_from_workpiece"]]
+                    deadline = time.monotonic() + 10.0
+                    for _ in range(2):
+                        if time.monotonic() >= deadline:
+                            raise VisualLockTimeout("3-sample workpiece sampling timed out")
+                        lock = acquire_raw_lock(moving=moving)
+                        poses.append(lock["base_from_workpiece"])
+                    try:
+                        cached_workpiece_mean = robust_pose_mean(poses)
+                    except ValueError as exc:
+                        raise VisualLockTimeout(str(exc)) from exc
+                mean = cached_workpiece_mean
+                targets = g2_grasp_targets(mean, np.eye(4), np.eye(4), right_end_from_tcp,
+                    workpiece_from_pregrasp_end=workpiece_from_pregrasp_end)
+                targets = horizontal_grasp_targets(targets, right_end_from_tcp)
+                lock["base_from_workpiece"] = mean
+                lock["targets"] = distance_grasp_targets(targets, grasp_distance_mm)
+                if resampled:
+                    print(json.dumps({"event": "right_distance_grasp_lock", "distance_mm": grasp_distance_mm,
+                        "sample_count": 3, "retained_count": 3,
+                        "target_position_m": lock["targets"].base_from_grasp_end[:3, 3].tolist()}), flush=True)
+                return lock
+
+            def acquire_live_lock(*, moving: bool = False):
+                started = time.monotonic()
+                try:
+                    lock = acquire_distance_lock(moving=moving)
+                except VisualLockTimeout as exc:
+                    event = {"event": "right_visual_lock_wait", "utc": datetime.now(timezone.utc).isoformat(),
+                        "reason": str(exc), "elapsed_s": round(time.monotonic() - started, 3),
+                        "cached_target_available": cached_workpiece_mean is not None,
+                        "pnp_diagnostics": live_estimator.last_diagnostics if live_estimator is not None else None}
+                    log.write(json.dumps(event, ensure_ascii=False) + "\n")
+                    log.flush()
+                    raise
+                event = {"event": "right_visual_lock_ready", "utc": datetime.now(timezone.utc).isoformat(),
+                    "elapsed_s": round(time.monotonic() - started, 3), "moving": moving,
+                    "target_position_m": lock["targets"].base_from_grasp_end[:3, 3].tolist()}
+                log.write(json.dumps(event, ensure_ascii=False) + "\n")
+                log.flush()
+                return lock
+
+            takeover_preview_estimator = RollingWorkpiecePoseEstimator(
+                sample_count=int(config.get("tag_sample_count", 3)),
+                max_reprojection_error_px=float(config.get("max_reprojection_error_px", 3.0)),
+                max_sample_age_s=float(observation.get("max_sample_age_s", 2.5)),
+                geometry=tag_geometry,
+            )
+            takeover_preview_timestamp_ns = 0
+
+            def publish_takeover_preview() -> None:
+                """Refresh the right web image while automatic motion is paused."""
+                nonlocal intrinsic, distortion, takeover_preview_timestamp_ns
+                image = camera.get_latest_image(color_type, 200.0)
+                timestamp_ns = int(image.timestamp_ns)
+                if timestamp_ns <= takeover_preview_timestamp_ns:
+                    time.sleep(0.005)
+                    return
+                takeover_preview_timestamp_ns = timestamp_ns
+                color = decode_color_rgb(image, agibot_gdk)
+                if intrinsic is None:
+                    meta = intrinsic_to_dict(
+                        camera.get_camera_intrinsic(color_type),
+                        width=int(image.width), height=int(image.height),
+                    )
+                    intrinsic = np.asarray(
+                        ((meta["fx"], 0.0, meta["ppx"]),
+                         (0.0, meta["fy"], meta["ppy"]),
+                         (0.0, 0.0, 1.0)), dtype=np.float64,
+                    )
+                    distortion = meta["distortion"]
+                visible = detect_corners(detector, color)
+                timestamp_s = timestamp_ns / 1_000_000_000.0
+                takeover_preview_estimator.add(visible, timestamp_s=timestamp_s)
+                takeover_preview_estimator.estimate(intrinsic, distortion, now_s=timestamp_s)
+                publish_shared_view(shared, color, visible, {
+                    "event": (
+                        "spacemouse_takeover_preview"
+                        if takeover_worker is None or takeover_worker.connected
+                        else "spacemouse_reconnecting"
+                    ),
+                    "spacemouse_connected": None if takeover_worker is None else takeover_worker.connected,
+                    "spacemouse_last_disconnect": None if takeover_worker is None else takeover_worker.last_disconnect,
+                    "visible_tag_ids": sorted(visible),
+                    "sample_counts": takeover_preview_estimator.sample_counts,
+                    "pnp_diagnostics": takeover_preview_estimator.last_diagnostics,
+                }, motion="spacemouse_takeover")
+
             for index in range(args.max_frames or sys.maxsize):
                 if takeover_worker is not None:
                     takeover_worker.raise_if_failed()
                     if motion_gate is not None and motion_gate.is_paused():
-                        time.sleep(0.01)
+                        publish_takeover_preview()
                         continue
                 image = camera.get_latest_image(color_type, 1000.0)
                 color = decode_color_rgb(image, agibot_gdk)
@@ -1926,6 +2107,8 @@ def main() -> int:
                         targets = horizontal_grasp_targets(targets, right_end_from_tcp)
                         if args.face_distance_mm is not None:
                             targets = facing_distance_targets(targets, args.face_distance_mm)
+                        elif grasp_distance_mm is not None:
+                            targets = distance_grasp_targets(targets, grasp_distance_mm)
                         if workpiece_from_pregrasp_end is None:
                             record.update(workpiece_only_record(
                                 pose, base_from_workpiece, base_from_end_matrix,
@@ -2048,6 +2231,7 @@ def main() -> int:
                         if args.autonomous_approach:
                             _actual, execute_targets = execute_live_autonomous_pregrasp(
                                 controller, execute_targets, acquire_live_lock, config, shared=shared,
+                                grasp_distance_mm=grasp_distance_mm,
                             )
                         close_record = execute_local_grasp(
                             controller,
@@ -2110,7 +2294,7 @@ def main() -> int:
                             + "；请在现场核验夹爪状态。"
                         )
                         if takeover_worker is not None:
-                            wait_for_manual_finish(takeover_worker)
+                            wait_for_manual_finish(takeover_worker, preview=publish_takeover_preview)
                             takeover_worker.stop_for_final_motion()
                             controller.motion_gate = None
                             return_screwdriver(controller, saved_grasp_pose, config, emit_return_event)

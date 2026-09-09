@@ -6,13 +6,11 @@ import tempfile
 from pathlib import Path
 from unittest.mock import patch
 
-from spacemouse_input import InputFrame
 from run_bilateral_workflow_gdk import (
     EXIT_ADVANCE_RIGHT,
     build_stage_commands,
     main,
     parse_args,
-    wait_for_right_advance,
 )
 
 
@@ -82,73 +80,27 @@ class BilateralWorkflowTests(unittest.TestCase):
         self.assertNotIn("--auto-rotation-deg-s", left + right)
         self.assertNotIn("--auto-preset-velocity-rad-s", left + right)
 
-    def test_normal_left_completion_waits_for_manual_advance_before_right(self):
-        completed = [
-            subprocess.CompletedProcess([], 0),
-            subprocess.CompletedProcess([], 0),
-            subprocess.CompletedProcess([], 0),
-        ]
-        with (
-            patch("run_bilateral_workflow_gdk.subprocess.run", side_effect=completed) as run,
-            patch("run_bilateral_workflow_gdk.wait_for_right_advance", return_value=True) as wait,
-        ):
-            self.assertEqual(main(self.args()), 0)
-        self.assertEqual(run.call_count, 3)
-        self.assertIn("--handoff", run.call_args_list[1].args[0])
-        self.assertIn("--execute", run.call_args_list[2].args[0])
-        wait.assert_called_once_with("/dev/hidraw3")
-
+    def test_completed_in_process_handoff_starts_right(self):
         completed = [
             subprocess.CompletedProcess([], EXIT_ADVANCE_RIGHT),
             subprocess.CompletedProcess([], 0),
-            subprocess.CompletedProcess([], 0),
         ]
-        with (
-            patch("run_bilateral_workflow_gdk.subprocess.run", side_effect=completed) as run,
-            patch("run_bilateral_workflow_gdk.wait_for_right_advance") as wait,
-        ):
+        with patch("run_bilateral_workflow_gdk.subprocess.run", side_effect=completed) as run:
             self.assertEqual(main(self.args()), 0)
-        wait.assert_not_called()
-        self.assertEqual(run.call_count, 3)
-
-    def test_handoff_failure_blocks_right(self):
-        with patch("run_bilateral_workflow_gdk.subprocess.run", side_effect=[
-            subprocess.CompletedProcess([], EXIT_ADVANCE_RIGHT),
-            subprocess.CompletedProcess([], 1),
-        ]) as run:
-            self.assertEqual(main(self.args()), 1)
         self.assertEqual(run.call_count, 2)
+        self.assertIn("--execute", run.call_args_list[1].args[0])
+
+    def test_left_exit_without_completed_handoff_blocks_right(self):
+        with patch("run_bilateral_workflow_gdk.subprocess.run",
+                   return_value=subprocess.CompletedProcess([], 0)) as run:
+            self.assertEqual(main(self.args()), 1)
+        self.assertEqual(run.call_count, 1)
 
     def test_missing_handoff_point_blocks_all_motion(self):
         self.poses.write_text('{"poses": {}}')
         with patch("run_bilateral_workflow_gdk.subprocess.run") as run:
             self.assertEqual(main(self.args()), 2)
         run.assert_not_called()
-
-    def test_wait_for_right_advance_detects_two_second_right_hold(self):
-        frames = iter([
-            InputFrame((0.0,) * 6, (False, False), (), (0.0, 0.0), True),
-            InputFrame((0.0,) * 6, (False, True), (1,), (0.1, 0.1), True),
-            InputFrame((0.0,) * 6, (False, True), (), (2.2, 2.2), True),
-        ])
-        times = iter([0.0, 0.1, 2.2])
-
-        class FakeHID:
-            def __enter__(self):
-                return self
-
-            def __exit__(self, *args):
-                return None
-
-            def poll(self):
-                return next(frames)
-
-        self.assertTrue(wait_for_right_advance(
-            "/dev/hidraw3",
-            hid_factory=lambda _device: FakeHID(),
-            clock=lambda: next(times),
-            sleep=lambda _seconds: None,
-        ))
 
     def test_left_failure_stops_before_right(self):
         with patch(

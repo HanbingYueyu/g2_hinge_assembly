@@ -93,6 +93,19 @@ class ManualFinishTests(unittest.TestCase):
         wait_for_manual_finish(worker, sleep=sleep)
         self.assertEqual(len(checks), 4)
 
+    def test_wait_refreshes_preview_until_manual_finish(self):
+        worker = SimpleNamespace(allow_advance_right=False, advance_requested=False)
+        worker.raise_if_failed = lambda: None
+        previews = []
+
+        def preview():
+            previews.append(True)
+            if len(previews) == 3:
+                worker.advance_requested = True
+
+        wait_for_manual_finish(worker, preview=preview)
+        self.assertEqual(len(previews), 3)
+
 from control import CartesianPoseTarget, G2Controller
 from right_apriltag_grasp_gdk import (
     bounded_pose_waypoints,

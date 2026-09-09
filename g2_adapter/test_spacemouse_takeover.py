@@ -2,7 +2,7 @@ import threading
 import time
 import unittest
 
-from spacemouse_input import InputFrame
+from spacemouse_input import InputError, InputFrame
 from spacemouse_takeover import (
     AdvanceRightRequested,
     DOUBLE_CLICK_WINDOW_S,
@@ -16,7 +16,7 @@ from spacemouse_takeover import (
     TakeoverEvent,
 )
 from control import G2Controller
-from spacemouse_teleop import TeleopConfig
+from spacemouse_teleop import TeleopConfig, TransientGDKReadTimeout
 from test_control import FakeGdk
 from test_spacemouse_teleop import BilateralRobot
 
@@ -161,6 +161,81 @@ class MotionPauseGateTests(unittest.TestCase):
 
 
 class WorkerTests(unittest.TestCase):
+    def test_transient_gdk_read_timeout_cancels_takeover_and_resumes_auto(self):
+        robot = BilateralRobot()
+        gate = MotionPauseGate()
+        controller = G2Controller(FakeGdk, robot, allow_motion=True, motion_gate=gate)
+
+        class FakeHID:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return None
+
+            def poll(self):
+                return frame(1.0)
+
+        worker = SpaceMouseTakeoverWorker(
+            controller, gate, device="/dev/hidraw-test",
+            config=TeleopConfig(side="left", axis_map=(1, 2, 3, 4, 5, 6)),
+            clock=lambda: 1.0, hid_factory=lambda _device: FakeHID(),
+        )
+        gate.pause()
+        worker.active_side = "left"
+        worker._session = object()
+        calls = []
+
+        def step(_frame, _now):
+            calls.append(True)
+            if len(calls) == 1:
+                raise TransientGDKReadTimeout("slow status")
+            worker._stop.set()
+
+        worker.step = step
+        worker._run()
+        self.assertIsNone(worker._failed)
+        self.assertIsNone(worker.active_side)
+        self.assertIsNone(worker._session)
+        self.assertFalse(gate.is_paused())
+
+    def test_disconnect_holds_and_reopens_device_without_failing_workflow(self):
+        robot = BilateralRobot()
+        gate = MotionPauseGate()
+        controller = G2Controller(FakeGdk, robot, allow_motion=True, motion_gate=gate)
+        opened = []
+
+        class FakeHID:
+            def __init__(self, attempt):
+                self.attempt = attempt
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return None
+
+            def poll(self):
+                if self.attempt == 1:
+                    raise InputError("device disconnected")
+                worker._stop.set()
+                return frame(1.0)
+
+        def factory(_device):
+            opened.append(True)
+            return FakeHID(len(opened))
+
+        worker = SpaceMouseTakeoverWorker(
+            controller, gate, device="/dev/spacemouse-compact",
+            config=TeleopConfig(side="right", axis_map=(1, 2, 3, 4, 5, 6)),
+            clock=lambda: 1.0, hid_factory=factory,
+        )
+        worker._run()
+        self.assertEqual(len(opened), 2)
+        self.assertIsNone(worker._failed)
+        self.assertTrue(gate.is_paused())
+        self.assertIn("disconnected", worker.last_disconnect)
+
     def test_worker_samples_clock_after_hid_poll_before_takeover_tick(self):
         robot = BilateralRobot()
         gate = MotionPauseGate()

@@ -47,7 +47,7 @@ try:
     from .xy_mapping import choose_candidate_by_left_rank
     from .yolo_hinge import associate_shaft_to_hinge, infer_yolo_masks, load_yolo_segmentation_model, review_matches, reviewed_target_matches_selected, split_yolo_candidates
     from .record_pose import DEFAULT_OUTPUT as DEFAULT_POSES_OUTPUT
-    from .run_left_premove_sequence import load_presets as load_premove_presets
+    from .run_left_premove_sequence import HANDOFF_PRESETS, load_presets as load_premove_presets, open_handoff_gripper
     from .run_left_post_grasp_sequence import (
         PRE_P4_LIFT_M,
         PRE_P4_LIFT_TOLERANCE_M,
@@ -72,7 +72,7 @@ except ImportError:
     from xy_mapping import choose_candidate_by_left_rank
     from yolo_hinge import associate_shaft_to_hinge, infer_yolo_masks, load_yolo_segmentation_model, review_matches, reviewed_target_matches_selected, split_yolo_candidates
     from record_pose import DEFAULT_OUTPUT as DEFAULT_POSES_OUTPUT
-    from run_left_premove_sequence import load_presets as load_premove_presets
+    from run_left_premove_sequence import HANDOFF_PRESETS, load_presets as load_premove_presets, open_handoff_gripper
     from run_left_post_grasp_sequence import (
         PRE_P4_LIFT_M,
         PRE_P4_LIFT_TOLERANCE_M,
@@ -359,6 +359,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--step-tcp-end-mm", default="0,0,145", help="Approximate TCP XYZ in arm_l_end_link, mm; not a calibrated TCP")
     parser.add_argument("--step-compensation-xy-mm", default="0,0", help="Base X,Y target compensation, mm")
     parser.add_argument("--step-xy-tolerance-mm", type=float, default=2.0)
+    parser.add_argument("--xy-speed-mm-s", type=float, default=15.0, help="Continuous STEP/coarse XY speed; descent still uses --speed-mm-s")
     parser.add_argument("--sam-review-max-depth-error-m", type=float, default=0.05)
     parser.add_argument("--min-area", type=int, default=1)
     parser.add_argument("--min-valid-depth-pixels", type=int, default=50)
@@ -1490,6 +1491,9 @@ def main() -> int:
         print(f"抓取配置无效：{exc}", file=sys.stderr)
         return 2
     base_speed_mm_s = 10.0 if parameters is None else parameters.final_descent_speed_mps * 1000.0
+    if not math.isfinite(args.xy_speed_mm_s) or not 1 <= args.xy_speed_mm_s <= 30:
+        print("--xy-speed-mm-s must be in [1, 30]", file=sys.stderr)
+        return 2
     if args.speed_mm_s is not None and args.speed_scale is not None:
         print("--speed-mm-s 与旧兼容参数 --speed-scale 不能同时使用。", file=sys.stderr)
         return 2
@@ -1531,10 +1535,13 @@ def main() -> int:
         )
     premove_presets: list[tuple[str, list[float]]] | None = None
     post_grasp_presets: list[tuple[str, list[float]]] | None = None
+    handoff_presets: list[tuple[str, list[float]]] | None = None
     if args.full_cycle:
         try:
             premove_presets = load_premove_presets(args.poses)
             post_grasp_presets = load_post_grasp_presets(args.poses)
+            if args.wait_for_next:
+                handoff_presets = load_premove_presets(args.poses, HANDOFF_PRESETS)
         except Exception as exc:
             print(f"全流程姿态文件无效：{exc}", file=sys.stderr)
             return 2
@@ -1726,6 +1733,36 @@ def main() -> int:
                     "next_command_at": time.monotonic(), "attempts": 0,
                 }
 
+            def execute_handoff_before_exit() -> int:
+                nonlocal position_stream, initial_gripper_open_stream, post_grasp_regrasp_open_stream
+                assert handoff_presets is not None
+                if takeover_worker is not None:
+                    takeover_worker.stop_for_final_motion()
+                controller.motion_gate = None
+                for stream in (position_stream, initial_gripper_open_stream, post_grasp_regrasp_open_stream):
+                    if stream is not None:
+                        stream.stop()
+                position_stream = initial_gripper_open_stream = post_grasp_regrasp_open_stream = None
+                opened = open_handoff_gripper(controller)
+                json_record(log, {"utc": datetime.now(timezone.utc).isoformat(), **opened})
+                print(json.dumps(opened, ensure_ascii=False), flush=True)
+                sequence = NonBlockingLeftPresetSequence(
+                    handoff_presets, motion_preset_velocity_rad_s,
+                    args.preset_arrival_tolerance_rad, motion_preset_timeout_s, "handoff",
+                )
+                while True:
+                    complete, event = sequence.tick(controller, log)
+                    if event is not None:
+                        print(json.dumps(event, ensure_ascii=False), flush=True)
+                    if complete:
+                        json_record(log, {
+                            "event": "left_handoff_complete_before_gdk_release",
+                            "utc": datetime.now(timezone.utc).isoformat(),
+                        })
+                        print("左夹爪已张开，left_handoff_1→left_handoff_2 已到位；现在关闭左手 GDK。", flush=True)
+                        return EXIT_ADVANCE_RIGHT
+                    time.sleep(0.01)
+
             def wait_for_manual_next() -> int:
                 if not args.wait_for_next:
                     return 0
@@ -1741,7 +1778,7 @@ def main() -> int:
                 while True:
                     takeover_worker.raise_if_failed()
                     if takeover_worker.advance_requested:
-                        return EXIT_ADVANCE_RIGHT
+                        return execute_handoff_before_exit()
                     time.sleep(0.01)
 
             while args.max_frames == 0 or frame < args.max_frames:
@@ -1753,7 +1790,7 @@ def main() -> int:
                             "utc": datetime.now(timezone.utc).isoformat(),
                             "source": "spacemouse_right_long_press_2s",
                         })
-                        return EXIT_ADVANCE_RIGHT
+                        return execute_handoff_before_exit()
                     if motion_gate is not None and motion_gate.is_paused():
                         time.sleep(0.01)
                         continue
@@ -2351,18 +2388,6 @@ def main() -> int:
                             json_record(log, record)
                             print_compact_record(record)
                             continue
-                        if step_xy_pending is not None:
-                            actual = measured_left_end_link_pose(controller)
-                            error = float(np.linalg.norm(np.asarray(actual.position_m) - step_xy_pending[0]))
-                            record["actual_xy_error_m"] = error
-                            if time.monotonic() > step_xy_pending[1]:
-                                raise SafetyError("STEP XY 单步实际到位超时；不累加后续目标")
-                            if position_stream.is_target_reached() and error <= 0.0005:
-                                last_end_link_target = CartesianPoseTarget(actual.position_m, last_end_link_target.orientation_xyzw)
-                                step_xy_pending = None
-                            record.update(state="waiting_for_step_xy_feedback", reason="wait_actual_arrival_then_fresh_visual_frame")
-                            json_record(log, record)
-                            continue
                     if single_xy_verification is not None:
                         post_center = np.asarray(servo_pixel(item), dtype=np.float64)
                         pre_center = np.asarray(single_xy_verification["before_center_px"], dtype=np.float64)
@@ -2402,6 +2427,24 @@ def main() -> int:
                         xy_tolerance_m=args.step_xy_tolerance_mm / 1000,
                     )
                     step = state.update(observation, now=time.monotonic())
+                    if args.step_profile is not None and step.camera_delta_m is None and step_xy_pending is not None and not gripper_closing:
+                        # Entering the tolerance band: cancel the outstanding
+                        # lookahead, hold measured position, then reconfirm.
+                        actual = measured_left_end_link_pose(controller)
+                        last_end_link_target = CartesianPoseTarget(actual.position_m, last_end_link_target.orientation_xyzw)
+                        position_stream.update_target(last_end_link_target)
+                        step_xy_pending = None
+                        state.reset_alignment()
+                        record.update(state="xy_settling", reason="hold_actual_then_reconfirm_visual_alignment")
+                        json_record(log, record)
+                        continue
+                    if args.step_profile is not None and step.phase == GraspPhase.FINAL_DESCENT and position_stream is not None:
+                        actual = measured_left_end_link_pose(controller)
+                        if not position_stream.is_target_reached() or np.linalg.norm(np.asarray(actual.position_m) - last_end_link_target.position_m) > .0005:
+                            state.reset_alignment()
+                            record.update(state="xy_settling", reason="waiting_actual_before_descent")
+                            json_record(log, record)
+                            continue
                     record.update({"state": step.phase.value, "reason": step.reason, "camera_delta_m": step.camera_delta_m, "base_delta_m": step.base_delta_m})
                     perception.set_phase(record["state"], record["reason"])
                     if args.stop_after == "xy" and step.phase == GraspPhase.FINAL_DESCENT:
@@ -2501,6 +2544,8 @@ def main() -> int:
                                     life_time_s=0.10,
                                     max_translation_velocity_mps=parameters.final_descent_speed_mps,
                                 )
+                            if args.step_profile is not None:
+                                position_stream.set_translation_velocity(args.xy_speed_mm_s / 1000 if step.camera_delta_m is not None else parameters.final_descent_speed_mps)
                             position_stream.update_target(target)
                             last_end_link_target = target
                             if args.step_profile is not None and step.camera_delta_m is not None and not args.single_xy_step:
@@ -3413,7 +3458,7 @@ def main() -> int:
                     json_record(log, record)
                     print_compact_record(record)
                 except AdvanceRightRequested:
-                    return EXIT_ADVANCE_RIGHT
+                    return execute_handoff_before_exit()
                 except Exception as exc:
                     record.update({"state": "error_stop_sending_commands", "error": str(exc)})
                     json_record(log, record)

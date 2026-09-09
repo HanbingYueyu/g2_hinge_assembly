@@ -255,12 +255,22 @@ class SpaceMouseTakeoverWorker:
         self._session = None
         self._advance_requested = False
         self._failed: BaseException | None = None
+        self._connected = False
+        self._last_disconnect: str | None = None
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
 
     @property
     def advance_requested(self) -> bool:
         return self._advance_requested
+
+    @property
+    def connected(self) -> bool:
+        return self._connected
+
+    @property
+    def last_disconnect(self) -> str | None:
+        return self._last_disconnect
 
     def raise_if_failed(self) -> None:
         if self._failed is not None:
@@ -350,30 +360,67 @@ class SpaceMouseTakeoverWorker:
         try:
             if self.hid_factory is None:
                 try:
-                    from .spacemouse_input import CompactHID
+                    from .spacemouse_input import CompactHID, InputError
                 except ImportError:
-                    from spacemouse_input import CompactHID
+                    from spacemouse_input import CompactHID, InputError
 
                 hid_factory = CompactHID
             else:
                 hid_factory = self.hid_factory
-            with hid_factory(self.device) as source:
-                deadline = self.clock()
-                while not self._stop.is_set():
-                    # CompactHID timestamps each report while ``poll`` drains
-                    # the kernel queue. Read the control-loop time *after*
-                    # polling; sampling it before the read can make fresh
-                    # axis timestamps appear to be from the future and abort
-                    # takeover exactly when a button gesture arrives.
-                    frame = source.poll()
-                    now = self.clock()
-                    self.step(frame, now)
-                    deadline += 0.02
-                    self._stop.wait(max(0.0, deadline - self.clock()))
+                try:
+                    from .spacemouse_input import InputError
+                except ImportError:
+                    from spacemouse_input import InputError
+            while not self._stop.is_set():
+                try:
+                    with hid_factory(self.device) as source:
+                        self.gestures = SpaceMouseGestureState(deadzone=self.config.deadzone)
+                        self._connected = True
+                        deadline = self.clock()
+                        while not self._stop.is_set():
+                            # CompactHID timestamps each report while ``poll`` drains
+                            # the kernel queue. Read the control-loop time *after*
+                            # polling; sampling it before the read can make fresh
+                            # axis timestamps appear to be from the future.
+                            frame = source.poll()
+                            now = self.clock()
+                            try:
+                                self.step(frame, now)
+                            except Exception as exc:
+                                try:
+                                    from .spacemouse_teleop import TransientGDKReadTimeout
+                                except ImportError:
+                                    from spacemouse_teleop import TransientGDKReadTimeout
+                                if not isinstance(exc, TransientGDKReadTimeout):
+                                    raise
+                                # No stale command was sent. Discard the
+                                # session target and let the interrupted
+                                # automatic stage continue from feedback.
+                                self._session = None
+                                self.active_side = None
+                                self.gestures = SpaceMouseGestureState(deadzone=self.config.deadzone)
+                                self.gate.resume()
+                            deadline += 0.02
+                            self._stop.wait(max(0.0, deadline - self.clock()))
+                except (InputError, OSError) as exc:
+                    if self._stop.is_set():
+                        return
+                    self._connected = False
+                    self._last_disconnect = str(exc)
+                    # Cancel an active manual target using its measured-pose
+                    # stop, then keep the automatic writer paused. Reopening a
+                    # HID node never resumes motion or reuses old axis state.
+                    if self._session is not None:
+                        self._deactivate(resume=False)
+                    self.gate.pause()
+                    self.gestures = SpaceMouseGestureState(deadzone=self.config.deadzone)
+                    self._stop.wait(0.5)
         except BaseException as exc:  # Surface all worker/GDK failures to the owner loop.
             if not self._stop.is_set():
                 self._failed = exc
                 self.gate.abort(exc)
+        finally:
+            self._connected = False
 
     def start(self) -> None:
         if self.device is None:

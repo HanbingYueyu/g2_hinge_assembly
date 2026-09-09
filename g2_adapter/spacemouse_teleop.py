@@ -34,6 +34,10 @@ OPEN_RAD = -.785
 CLOSE_RAD = 0.0
 
 
+class TransientGDKReadTimeout(SafetyError):
+    """A delayed status read invalidated this tick, without sending motion."""
+
+
 @dataclass(frozen=True)
 class TeleopConfig:
     side: str = 'right'
@@ -190,7 +194,7 @@ class TeleopSession:
             positions = (min(CLOSE_RAD, max(OPEN_RAD, actual[0])),) if cancel_gripper else (self._gripper_goal,)
         # SDK reads must not cause old HID input to be sent after a long stall.
         if self.clock is not None and self._tick_time is not None and self.clock() - self._tick_time > .06:
-            raise SafetyError('GDK 状态读取超时；不发送过期运动目标')
+            raise TransientGDKReadTimeout('GDK 状态读取超时；不发送过期运动目标')
         sender = self.controller._send_left_cartesian_pose if self.side == 'left' else self.controller._send_right_cartesian_pose
         sender(target, LEASE_S, end_effector_joint_names=names, end_effector_joint_positions=positions)
 
@@ -205,6 +209,10 @@ class TeleopSession:
             raise SafetyError('遥操作已停止；需要重新启动')
         try:
             return self._tick(frame, now)
+        except TransientGDKReadTimeout:
+            # The current input has expired but the robot/GDK is not faulty.
+            # Let the takeover owner discard this session and resume/retry.
+            raise
         except Exception:
             self._failed = True
             raise

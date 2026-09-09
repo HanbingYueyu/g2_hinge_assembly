@@ -1,11 +1,10 @@
 #!/usr/bin/env python3
 """Run the existing left visual workflow followed by the right visual workflow.
 
-Each child owns its own GDK, camera, and SpaceMouse reader.  The parent never
-opens hidraw or creates a Robot, so serial stage transitions preserve the
-single-writer invariant.  A left child exit code of ``20`` means that the
-SpaceMouse right-button 2-second hold requested the same transition as normal
-left completion.
+Each child owns its own GDK, camera, and SpaceMouse reader. The left child
+opens its gripper and reaches both handoff presets before releasing its GDK.
+A left child exit code of ``20`` means that handoff completed and the right
+stage may start.
 """
 
 from __future__ import annotations
@@ -15,7 +14,6 @@ import json
 from pathlib import Path
 import subprocess
 import sys
-import time
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -28,16 +26,6 @@ def validate_handoff_poses(path):
     except ImportError:
         from run_left_premove_sequence import HANDOFF_PRESETS, load_presets
     return load_presets(Path(path), HANDOFF_PRESETS)
-
-
-def build_handoff_command(args):
-    velocity = args.auto_preset_velocity_rad_s
-    return [
-        sys.executable, str(PROJECT_ROOT / "g2_adapter" / "run_left_premove_sequence.py"),
-        "--handoff", "--poses", str(Path(args.poses).expanduser()),
-        "--velocity-rad-s", str(0.08 if velocity is None else velocity),
-        "--allow-motion",
-    ]
 
 
 def parse_args(argv=None) -> argparse.Namespace:
@@ -88,36 +76,6 @@ def _optional_auto_args(args: argparse.Namespace) -> list[str]:
     if getattr(args, "auto_preset_velocity_rad_s", None) is not None:
         result.extend(("--auto-preset-velocity-rad-s", str(args.auto_preset_velocity_rad_s)))
     return result
-
-
-def wait_for_right_advance(
-    device: str,
-    *,
-    hid_factory=None,
-    clock=time.monotonic,
-    sleep=time.sleep,
-) -> bool:
-    """Wait for the manual right-button 2-second stage-advance gesture.
-
-    The left child has already exited before this function opens hidraw, so
-    the parent never competes with a running GDK/SpaceMouse owner.
-    """
-    try:
-        from .spacemouse_input import CompactHID
-        from .spacemouse_takeover import RIGHT_LONG_PRESS_S, SpaceMouseGestureState, TakeoverEvent
-    except ImportError:
-        from spacemouse_input import CompactHID
-        from spacemouse_takeover import RIGHT_LONG_PRESS_S, SpaceMouseGestureState, TakeoverEvent
-
-    factory = CompactHID if hid_factory is None else hid_factory
-    gestures = SpaceMouseGestureState()
-    with factory(device) as source:
-        while True:
-            now = clock()
-            result = gestures.update(source.poll(), now)
-            if TakeoverEvent.ADVANCE_RIGHT in result.events:
-                return True
-            sleep(min(0.02, RIGHT_LONG_PRESS_S / 10.0))
 
 
 def build_stage_commands(args: argparse.Namespace) -> tuple[list[str], list[str]]:
@@ -184,28 +142,9 @@ def main(argv=None) -> int:
     if left_result.returncode not in (0, EXIT_ADVANCE_RIGHT):
         print(json.dumps({"event": "left_stage_failed", "returncode": left_result.returncode}, ensure_ascii=False), file=sys.stderr, flush=True)
         return int(left_result.returncode)
-    if left_result.returncode == 0:
-        print(json.dumps({
-            "event": "left_stage_complete_waiting_for_manual_next",
-            "source": "spacemouse_right_long_press_2s",
-        }, ensure_ascii=False), flush=True)
-        try:
-            wait_for_right_advance(args.device)
-        except KeyboardInterrupt:
-            print("等待右手启动时收到 Ctrl-C；不启动右手流程。", file=sys.stderr, flush=True)
-            return 130
-        except Exception as exc:
-            print(json.dumps({
-                "event": "manual_right_advance_failed",
-                "error": str(exc),
-            }, ensure_ascii=False), file=sys.stderr, flush=True)
-            return 1
-    handoff_command = build_handoff_command(args)
-    print(json.dumps({"event": "left_handoff_start", "command": handoff_command}, ensure_ascii=False), flush=True)
-    handoff_result = subprocess.run(handoff_command, cwd=PROJECT_ROOT)
-    if handoff_result.returncode != 0:
-        print(json.dumps({"event": "left_handoff_failed", "returncode": handoff_result.returncode}), file=sys.stderr, flush=True)
-        return int(handoff_result.returncode)
+    if left_result.returncode != EXIT_ADVANCE_RIGHT:
+        print("左手进程未完成进程内交接；拒绝启动右手。", file=sys.stderr, flush=True)
+        return 1
     print(json.dumps({"event": "right_stage_start", "left_returncode": left_result.returncode, "command": right_command}, ensure_ascii=False), flush=True)
     right_result = subprocess.run(right_command, cwd=PROJECT_ROOT)
     if right_result.returncode != 0:

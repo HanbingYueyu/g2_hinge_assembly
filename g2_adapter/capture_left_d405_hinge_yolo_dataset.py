@@ -75,7 +75,7 @@ setInterval(()=>{if(!frozen)load('/frame.jpg');},350); load('/frame.jpg');
 
 
 class CaptureStore:
-    def __init__(self, out_dir: Path, *, target_name: str) -> None:
+    def __init__(self, out_dir: Path, *, target_name: str, source: str = "G2 left D405 native colour frames") -> None:
         self.out_dir = out_dir
         self.image_dir = out_dir / "images_all"
         self.label_dir = out_dir / "labels_all"
@@ -92,7 +92,7 @@ class CaptureStore:
         self.image_dir.mkdir(parents=True, exist_ok=True)
         self.label_dir.mkdir(parents=True, exist_ok=True)
         (out_dir / "dataset_info.json").write_text(
-            json.dumps({"class_names": [target_name], "source": "G2 left D405 native colour frames"}, ensure_ascii=False, indent=2),
+            json.dumps({"class_names": [target_name], "source": source}, ensure_ascii=False, indent=2),
             encoding="utf-8",
         )
 
@@ -240,7 +240,7 @@ class SamAssistant:
         return [item[0] for item in proposals], [round(item[1], 4) for item in proposals]
 
 
-def handler_class(store: CaptureStore, sam_assistant: SamAssistant):
+def handler_class(store: CaptureStore, sam_assistant: SamAssistant, *, camera_label: str = "左 D405"):
     class Handler(BaseHTTPRequestHandler):
         def _json(self, status: int, data: dict[str, Any]) -> None:
             body = json.dumps(data, ensure_ascii=False).encode("utf-8")
@@ -263,7 +263,7 @@ def handler_class(store: CaptureStore, sam_assistant: SamAssistant):
 
         def do_GET(self) -> None:  # noqa: N802
             if self.path.split("?", 1)[0] == "/":
-                body = PAGE.encode("utf-8")
+                body = PAGE.replace("G2 左 D405", f"G2 {camera_label}").encode("utf-8")
                 self.send_response(200)
                 self.send_header("Content-Type", "text/html; charset=utf-8")
                 self.send_header("Content-Length", str(len(body)))
@@ -321,8 +321,9 @@ def handler_class(store: CaptureStore, sam_assistant: SamAssistant):
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="G2 左 D405 原生图像的只读 YOLO-seg 数据采集与浏览器标注。")
-    parser.add_argument("--out-dir", type=Path, default=PROJECT_ROOT / "datasets" / "left_d405_hinge_yolo_raw_g2_v1")
+    parser = argparse.ArgumentParser(description="G2 彩色相机的只读 YOLO-seg 数据采集与 SAM 浏览器辅助标注。")
+    parser.add_argument("--camera", choices=("left", "head"), default="left", help="采集左手 D405 或头部彩色相机")
+    parser.add_argument("--out-dir", type=Path, default=None, help="默认按 --camera 使用独立数据目录")
     parser.add_argument("--target-name", default="hinge")
     parser.add_argument("--host", default="0.0.0.0")
     parser.add_argument("--port", type=int, default=8770)
@@ -335,6 +336,11 @@ def parse_args() -> argparse.Namespace:
 
 def run() -> int:
     args = parse_args()
+    if args.out_dir is None:
+        args.out_dir = PROJECT_ROOT / "datasets" / (
+            "head_hinge_yolo_raw_g2_v1" if args.camera == "head"
+            else "left_d405_hinge_yolo_raw_g2_v1"
+        )
     if args.warmup < 0 or not 0 < args.port < 65536 or not 0 <= args.sam_threshold <= 1:
         print("参数错误：warmup、port 或 SAM 阈值无效。", file=sys.stderr)
         return 2
@@ -349,8 +355,14 @@ def run() -> int:
     except Exception as exc:
         print(f"SAM 标注助手启动失败：{exc}", file=sys.stderr)
         return 2
-    store = CaptureStore(args.out_dir.resolve(), target_name=args.target_name)
-    server = ThreadingHTTPServer((args.host, args.port), handler_class(store, sam_assistant))
+    camera_label = "头部彩色相机" if args.camera == "head" else "左 D405"
+    store = CaptureStore(
+        args.out_dir.resolve(), target_name=args.target_name,
+        source=f"G2 {camera_label} native colour frames",
+    )
+    server = ThreadingHTTPServer(
+        (args.host, args.port), handler_class(store, sam_assistant, camera_label=camera_label),
+    )
     threading.Thread(target=server.serve_forever, daemon=True).start()
     print(f"浏览器标注页：http://{args.host}:{args.port}")
     print(f"输出目录：{args.out_dir.resolve()}")
@@ -362,7 +374,11 @@ def run() -> int:
         if agibot_gdk.gdk_init() != agibot_gdk.GDKRes.kSuccess:
             raise RuntimeError("GDK 初始化失败")
         initialized = True
-        color_type = agibot_gdk.CameraType.kHandLeftColor
+        color_type = (
+            agibot_gdk.CameraType.kHeadColor
+            if args.camera == "head"
+            else agibot_gdk.CameraType.kHandLeftColor
+        )
         camera = agibot_gdk.Camera([color_type])
         for _ in range(args.warmup):
             camera.get_latest_image(color_type, 1000.0)
@@ -371,13 +387,13 @@ def run() -> int:
             rgb = decode_color_rgb(image, agibot_gdk)
             ok, jpeg = cv2.imencode(".jpg", cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR), [cv2.IMWRITE_JPEG_QUALITY, 95])
             if not ok:
-                raise RuntimeError("无法编码左 D405 图像")
+                raise RuntimeError(f"无法编码{camera_label}图像")
             store.update_latest(jpeg.tobytes(), int(image.timestamp_ns))
     except KeyboardInterrupt:
         print("收到 Ctrl-C，停止只读数据采集。")
         return 0
     except Exception as exc:
-        print(f"左 D405 数据采集失败：{exc}", file=sys.stderr)
+        print(f"{camera_label}数据采集失败：{exc}", file=sys.stderr)
         return 1
     finally:
         server.shutdown()
