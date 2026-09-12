@@ -454,8 +454,6 @@ def held_part_gate_step(
 
 
 HELD_PART_AREA_UNSTABLE_REASON = "held_target_mask_area_unstable_during_lift"
-
-
 def held_part_area_instability(
     samples: Sequence[tuple[float, float]],
     *,
@@ -3308,6 +3306,13 @@ def run_left_cycle(*, services=None, argv=None) -> int:
                                 sample for sample in monitor["area_samples"]
                                 if observed_at - sample[0] <= history_limit_s
                             ]
+                            # Diagnostic only: with a wrist camera a held part
+                            # keeps its image centre while a part left behind
+                            # slides away, so log the drift next to the area.
+                            monitor["center_drift_px"] = float(np.linalg.norm(
+                                np.asarray(observation["center_px"], dtype=np.float64)
+                                - np.asarray(monitor["reference_center_px"], dtype=np.float64)
+                            ))
                             instability = held_part_area_instability(
                                 monitor["area_samples"],
                                 now=observed_at,
@@ -3340,6 +3345,7 @@ def run_left_cycle(*, services=None, argv=None) -> int:
                                         "utc": datetime.now(timezone.utc).isoformat(),
                                         "reason": instability["reason"],
                                         "area": instability,
+                                        "center_drift_px": monitor.get("center_drift_px"),
                                         "unstable_streak": monitor["area_unstable_streak"],
                                         "confirmations": args.post_grasp_lift_area_confirmations,
                                         "action": "cancel_lift_open_gripper_and_regrasp",
@@ -3442,6 +3448,7 @@ def run_left_cycle(*, services=None, argv=None) -> int:
                             "actual_delta_base_m": [float(value) for value in delta],
                             "same_target_monitor_samples": monitor["mailbox_sequence"],
                             "area_monitor": monitor.get("area_instability"),
+                            "area_monitor_center_drift_px": monitor.get("center_drift_px"),
                             "area_monitor_samples": len(monitor["area_samples"]),
                             "area_monitor_max_spread_fraction": monitor["max_area_spread_fraction"],
                             "area_monitor_grace_s": args.post_grasp_lift_area_grace_s,
