@@ -27,19 +27,20 @@
 
 **Files:**
 - Modify: `dianpi/dp/Control.py`
-- Create: `dianpi/dp/test_control.py`
+- Create: `dianpi/dp/test_dianpi_control.py`
 
 **Interfaces:**
 - `DianpiController(*, scan_fn=Device_Scan, open_fn=Device_Open, close_fn=Device_Close, init_fn=IO_InitMultiPin, read_fn=IO_ReadMultiPin, write_fn=IO_WriteMultiPin, sleep_fn=time.sleep, monotonic_fn=time.monotonic, output_fn=print)`；所有参数均可替换为测试替身。
 - `DianpiController.open() -> None` 扫描第一台设备、初始化既有引脚并写入安全初始电平；失败抛出 `DianpiError` 子类并尽量关闭已打开设备。
 - `DianpiController.read_inputs() -> dict[int, int] | None` 返回 P3/P4/P10 状态。
 - `DianpiController.run_cycle() -> None` 在锁内执行 P9 低 50 ms、等待 2 s、P8 低 10 s 且第 2 s 将 P0 低、到第 10 s 同时恢复 P0/P8 高；周期中持续读取并输出 P3/P4，第二次调用抛出 `DianpiBusyError`。
+- `DianpiController.stop_cycle() -> None` 请求当前周期尽快停止；周期的 `finally` 路径恢复 P0/P8/P9 安全电平。
 - `DianpiController.close() -> None` 幂等地恢复 P0/P1/P2/P8/P9 高、P11 低并关闭设备。
 - `main()` 仅负责 P10 下降沿轮询和生命周期调用 `open/read_inputs/run_cycle/close`，不再直接编排 GPIO 时序。
 
 - [ ] **Step 1: Write the failing pure-logic tests**
 
-  在 `dianpi/dp/test_control.py` 建立 FakeClock/FakeIO：记录每次写 pin、初始化配置、读状态和 sleep 时间；覆盖以下断言：
+  在 `dianpi/dp/test_dianpi_control.py` 建立 FakeClock/FakeIO：记录每次写 pin、初始化配置、读状态和 sleep 时间；覆盖以下断言：
 
   ```python
   def test_open_initializes_existing_pins_and_safe_levels():
@@ -71,7 +72,7 @@
 
 - [ ] **Step 2: Run the focused tests and verify they fail**
 
-  Run: `pytest -q dianpi/dp/test_control.py`
+  Run: `pytest -q dianpi/dp/test_dianpi_control.py`
 
   Expected: FAIL because `DianpiController`, `DianpiBusyError`, and the injectable lifecycle do not yet exist.
 
@@ -81,14 +82,14 @@
 
 - [ ] **Step 4: Run the focused tests and compile check**
 
-  Run: `pytest -q dianpi/dp/test_control.py && python -m py_compile dianpi/dp/Control.py`
+  Run: `pytest -q dianpi/dp/test_dianpi_control.py && python -m py_compile dianpi/dp/Control.py`
 
   Expected: all controller tests PASS and compilation exits 0.
 
 - [ ] **Step 5: Commit the controller extraction**
 
   ```bash
-  git add dianpi/dp/Control.py dianpi/dp/test_control.py
+  git add dianpi/dp/Control.py dianpi/dp/test_dianpi_control.py
   git commit -m "refactor: expose dianpi cycle controller"
   ```
 
@@ -205,7 +206,7 @@
 
 - [ ] **Step 3: Implement lazy threaded lifecycle**
 
-  Guard state with a lock; set the active flag before starting the daemon thread so a second chord cannot race the first. The thread constructs/imports the controller on its first run, calls `open()` once, calls `run_cycle()`, emits `{"event": "dianpi_started"}`/`dianpi_finished`/`dianpi_busy`/`dianpi_error` records, and stores exceptions instead of re-raising. Keep a successfully opened controller for later cycles and close it only from `close()`.
+  Guard state with a lock; set the active flag before starting the daemon thread so a second chord cannot race the first. The thread constructs/imports the controller on its first run, calls `open()` once, calls `run_cycle()`, emits `{"event": "dianpi_started"}`/`dianpi_finished`/`dianpi_busy`/`dianpi_error` records, and stores exceptions instead of re-raising. On `close()`, call `stop_cycle()` before joining so an active 12-second sequence restores safe outputs before the controller is closed. Keep a successfully opened controller for later cycles and close it only from `close()`.
 
 - [ ] **Step 4: Run runner tests and compile check**
 
@@ -293,13 +294,13 @@
 
 - [ ] **Step 2: Run the complete relevant verification**
 
-  Run: `pytest -q g2_adapter/test_spacemouse_takeover.py g2_adapter/test_spacemouse_teleop.py g2_adapter/test_bilateral_workflow.py dianpi/dp/test_control.py g2_adapter/test_dianpi_runner.py && python -m compileall -q dianpi/dp g2_adapter`
+  Run: `pytest -q g2_adapter/test_spacemouse_takeover.py g2_adapter/test_spacemouse_teleop.py g2_adapter/test_bilateral_workflow.py dianpi/dp/test_dianpi_control.py g2_adapter/test_dianpi_runner.py && python -m compileall -q dianpi/dp g2_adapter`
 
   Expected: all tests PASS and compileall exits 0.
 
 - [ ] **Step 3: Inspect the diff for scope and safety**
 
-  Run: `git diff --check && git diff --stat -- dianpi/dp/Control.py dianpi/dp/test_control.py g2_adapter/dianpi_runner.py g2_adapter/test_dianpi_runner.py g2_adapter/spacemouse_takeover.py g2_adapter/test_spacemouse_takeover.py g2_adapter/left_grasp_gdk.py g2_adapter/right_apriltag_grasp_gdk.py 常用命令.md g2_adapter/SPACEMOUSE.md`
+  Run: `git diff --check && git diff --stat -- dianpi/dp/Control.py dianpi/dp/test_dianpi_control.py g2_adapter/dianpi_runner.py g2_adapter/test_dianpi_runner.py g2_adapter/spacemouse_takeover.py g2_adapter/test_spacemouse_takeover.py g2_adapter/left_grasp_gdk.py g2_adapter/right_apriltag_grasp_gdk.py 常用命令.md g2_adapter/SPACEMOUSE.md`
 
   Expected: no whitespace errors; only the listed integration files are part of this feature.
 
