@@ -8,6 +8,19 @@ from typing import Sequence
 import numpy as np
 
 
+def relief_translation_speed_mps(automatic_speed_mps: float) -> float:
+    """Return the unloading-lift speed used after force contact.
+
+    The automatic visual/force motion speed is the single operator-facing
+    setting.  Unloading must be gentler, so it runs at exactly half that
+    speed; callers restore the automatic speed after the lift attempt.
+    """
+    speed = float(automatic_speed_mps)
+    if not math.isfinite(speed) or speed <= 0.0:
+        raise ValueError("automatic translation speed must be positive and finite")
+    return speed * 0.5
+
+
 def base_position_after_delta(
     end_link_position_m: Sequence[float], base_delta_m: Sequence[float]
 ) -> tuple[float, float, float]:

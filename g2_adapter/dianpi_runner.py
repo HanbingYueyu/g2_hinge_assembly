@@ -15,8 +15,8 @@ class DianpiTriggerResult(str, Enum):
 
 
 def _default_controller_factory():
-    # Keep the RM1010 shared-library import out of G2 startup.  The first
-    # accepted chord is the explicit point at which the device is needed.
+    # Keep the RM1010 shared-library import inside the runner.  The integrated
+    # workflow opens it from the P10 monitor or the first SpaceMouse trigger.
     module = importlib.import_module("dianpi.dp.Control")
     return module.DianpiController()
 
@@ -24,10 +24,10 @@ def _default_controller_factory():
 class DianpiCycleRunner:
     """Own one RM1010 controller and run cycles away from G2 threads.
 
-    A controller is opened lazily on the first trigger and remains open until
-    ``close`` so later chords do not rescan the USB bus.  Hardware exceptions
-    are stored and emitted as events; ``trigger`` never raises them into the
-    SpaceMouse worker.
+    A controller is opened lazily by the P10 monitor or the first trigger and
+    remains open until ``close`` so later events do not rescan the USB bus.
+    Hardware exceptions are stored and emitted as events; ``trigger`` never
+    raises them into the SpaceMouse worker.
     """
 
     def __init__(
@@ -41,8 +41,11 @@ class DianpiCycleRunner:
         self._event_sink = event_sink
         self._thread_factory = thread_factory
         self._lock = threading.Lock()
+        self._open_lock = threading.Lock()
         self._controller = None
         self._thread: threading.Thread | None = None
+        self._monitor_thread: threading.Thread | None = None
+        self._monitor_stop = threading.Event()
         self._running = False
         self._closed = False
         self._last_error: BaseException | None = None
@@ -63,6 +66,43 @@ class DianpiCycleRunner:
         except Exception:
             # Logging must never affect G2 or SpaceMouse control.
             pass
+
+    def _ensure_controller(self):
+        """Return the shared controller, opening it at most once."""
+        with self._lock:
+            if self._closed:
+                raise RuntimeError("runner closed")
+            controller = self._controller
+        if controller is not None:
+            return controller
+
+        # The monitor and a SpaceMouse trigger can start at the same time.
+        # Serialize the scan/open sequence so they cannot create two RM1010
+        # owners or close one another's controller.
+        with self._open_lock:
+            with self._lock:
+                if self._closed:
+                    raise RuntimeError("runner closed")
+                controller = self._controller
+            if controller is not None:
+                return controller
+
+            local_controller = None
+            try:
+                local_controller = self._controller_factory()
+                local_controller.open()
+                with self._lock:
+                    if self._closed:
+                        raise RuntimeError("runner closed")
+                    self._controller = local_controller
+                return local_controller
+            except BaseException:
+                if local_controller is not None:
+                    try:
+                        local_controller.close()
+                    except Exception:
+                        pass
+                raise
 
     def trigger(self) -> DianpiTriggerResult:
         with self._lock:
@@ -90,17 +130,64 @@ class DianpiCycleRunner:
                 return DianpiTriggerResult.ERROR
         return DianpiTriggerResult.STARTED
 
-    def _run(self) -> None:
-        local_controller = None
-        try:
-            with self._lock:
-                controller = self._controller
-            if controller is None:
-                local_controller = self._controller_factory()
-                local_controller.open()
+    def start_p10_monitor(self, *, poll_period_s: float = 0.05) -> None:
+        """Poll the RM1010 P10 falling edge using the shared controller.
+
+        The monitor is intentionally opt-in so standalone unit users and the
+        SpaceMouse-only tool do not open an RM1010 unexpectedly.  Integrated
+        G2 workflows start it after creating the runner; a missing device is
+        reported and retried without affecting G2 motion.
+        """
+        period = float(poll_period_s)
+        if period <= 0.0:
+            raise ValueError("poll_period_s must be positive")
+        with self._lock:
+            if self._closed:
+                raise RuntimeError("runner closed")
+            if self._monitor_thread is not None and self._monitor_thread.is_alive():
+                return
+            self._monitor_stop.clear()
+            thread = self._thread_factory(
+                target=self._monitor_loop,
+                args=(period,),
+                name="g2-dianpi-p10-monitor",
+                daemon=True,
+            )
+            self._monitor_thread = thread
+            try:
+                thread.start()
+            except BaseException:
+                self._monitor_thread = None
+                raise
+
+    def _monitor_loop(self, poll_period_s: float) -> None:
+        previous_start = 1
+        while not self._monitor_stop.is_set():
+            try:
+                controller = self._ensure_controller()
+                states = controller.read_inputs()
+                if states is None:
+                    raise RuntimeError("RM1010 输入读取失败")
+                current_start = int(states.get(10, 1))
+                if current_start == 0 and previous_start == 1:
+                    self.trigger()
+                previous_start = current_start
+            except BaseException as exc:
+                if self._monitor_stop.is_set():
+                    return
                 with self._lock:
-                    self._controller = local_controller
-                controller = local_controller
+                    self._last_error = exc
+                self._emit({"event": "dianpi_error", "source": "p10_monitor", "error": str(exc)})
+                # A missed read must not suppress a real low edge on the
+                # next successful read.
+                previous_start = 1
+                self._monitor_stop.wait(max(0.5, poll_period_s))
+                continue
+            self._monitor_stop.wait(poll_period_s)
+
+    def _run(self) -> None:
+        try:
+            controller = self._ensure_controller()
             self._emit({"event": "dianpi_started"})
             controller.run_cycle()
             self._emit({"event": "dianpi_finished"})
@@ -108,16 +195,6 @@ class DianpiCycleRunner:
             with self._lock:
                 self._last_error = exc
             self._emit({"event": "dianpi_error", "error": str(exc)})
-            if local_controller is not None:
-                # An open failure may occur before the controller is retained;
-                # still give the device a chance to restore safe outputs.
-                with self._lock:
-                    retained = self._controller is local_controller
-                if not retained:
-                    try:
-                        local_controller.close()
-                    except Exception:
-                        pass
         finally:
             with self._lock:
                 self._running = False
@@ -128,8 +205,14 @@ class DianpiCycleRunner:
             if self._closed:
                 return
             self._closed = True
+            monitor_thread = self._monitor_thread
+            self._monitor_stop.set()
             thread = self._thread
             controller = self._controller
+        if monitor_thread is not None and monitor_thread is not threading.current_thread():
+            monitor_thread.join(timeout=max(0.0, float(timeout_s)))
+        if monitor_thread is not None and monitor_thread.is_alive():
+            self._emit({"event": "dianpi_error", "error": "P10 监控线程未能在关闭期限内停止"})
         if thread is not None and thread.is_alive() and controller is not None:
             stop_cycle = getattr(controller, "stop_cycle", None)
             if stop_cycle is not None:

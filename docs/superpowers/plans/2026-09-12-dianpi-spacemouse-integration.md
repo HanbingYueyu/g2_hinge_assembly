@@ -4,7 +4,7 @@
 
 **Goal:** 将 `dianpi/dp/Control.py` 的 RM1010 电批周期接入双臂 SpaceMouse 流程，用双键组合异步触发，并保留 P10 下降沿触发。
 
-**Architecture:** 把电批 GPIO 时序封装为可注入 IO 的 `DianpiController`，独立保留 `Control.py` 的 P10 主循环；新增懒加载、单周期互斥的 `DianpiCycleRunner`，由 SpaceMouse worker 非阻塞触发。手势状态机在确认双键组合后屏蔽全部单键语义，避免夹爪、切手和阶段推进冲突。
+**Architecture:** 把电批 GPIO 时序封装为可注入 IO 的 `DianpiController`，独立保留 `Control.py` 的 P10 主循环；新增单周期互斥的 `DianpiCycleRunner`，由 SpaceMouse worker 或集成流程的 P10 监控线程非阻塞触发。手势状态机在确认组合后屏蔽全部单键语义，避免夹爪、切手和阶段推进冲突。
 
 **Tech Stack:** Python 3.12, `ctypes` RM1010 public API, `threading`, pytest, 现有 `SpaceMouseTakeoverWorker`/GDK 控制器。
 
@@ -15,8 +15,8 @@
 - 不修改 RM1010 引脚编号、模式、上下拉配置，也不增加硬件连线。
 - P10 保持上拉输入、低电平下降沿触发；P0/P1/P2/P8/P9 输出初始 HIGH，P11 输出初始 LOW。
 - 电批周期不能调用或暂停 G2 运动，也不能阻塞 SpaceMouse 50 Hz 读写。
-- 双键组合必须在两键按下时间差不超过 150 ms、持续至少 300 ms、六轴回中时触发一次；两键释放前不得再次触发。
-- 双键组合从两键重叠开始屏蔽单击、双击、左键长按和右键长按；组合期间手臂只保持当前实测位姿。
+- 电批组合要求左键先长按约 400 ms，再在保持左键时按下右键；两键释放前不得再次触发。
+- 两键重叠从候选开始屏蔽单击、双击、左键长按和右键长按；组合期间手臂只保持当前实测位姿。
 - 周期运行中再次组合只返回 `DIANPI_BUSY`，不得并发执行第二个周期。
 - 集成失败只记录 `dianpi_error`，不得让 G2 视觉阶段退出；独立运行 `Control.py` 的 P10 兼容行为保持不变。
 - 只提交本功能相关文件，保留工作区已有的其他修改。
@@ -101,39 +101,30 @@
 
 **Interfaces:**
 - Extend `TakeoverEvent` with `START_DIANPI = "start_dianpi"`.
-- Add `DIANPI_CHORD_WINDOW_S = 0.15` and `DIANPI_CHORD_HOLD_S = 0.30`.
-- `SpaceMouseGestureState.update(frame, now)` returns one `START_DIANPI` at most per two-button hold, with `consumed_buttons == (0, 1)` for every frame while the chord is blocked.
+- `SpaceMouseGestureState.update(frame, now)` returns one `START_DIANPI` when the left button has been held for the long-press threshold and the right button is pressed, with `consumed_buttons == (0, 1)` for every frame while the combination is blocked.
 
 - [ ] **Step 1: Write failing gesture tests**
 
-  Add tests for a valid chord, delayed second button, too-short hold, non-neutral axes, release/re-arm, and conflict suppression:
+  Add tests for a valid left-hold/right-press combination, early right press, release/re-arm, and conflict suppression:
 
   ```python
-  def test_dual_button_chord_emits_once_after_neutral_hold():
+  def test_left_hold_then_right_press_emits_once():
       state = SpaceMouseGestureState()
       assert state.update(frame(0.00, buttons=(True, False)), 0.00).events == ()
-      assert state.update(frame(0.10, buttons=(True, True)), 0.10).events == ()
-      result = state.update(frame(0.41, buttons=(True, True)), 0.41)
+      assert state.update(frame(0.41, buttons=(True, False)), 0.41).events == ()
+      result = state.update(frame(0.42, buttons=(True, True)), 0.42)
       assert result.events == (TakeoverEvent.START_DIANPI,)
       assert state.update(frame(0.50, buttons=(True, True)), 0.50).events == ()
 
-  def test_chord_suppresses_takeover_gripper_and_advance_events():
-      state = SpaceMouseGestureState()
-      state.update(frame(0.00, buttons=(True, True)), 0.00)
-      result = state.update(frame(2.00, buttons=(True, True)), 2.00)
-      assert TakeoverEvent.START_DIANPI in result.events
-      assert TakeoverEvent.ADVANCE_RIGHT not in result.events
-      state.update(frame(2.10, buttons=(False, False)), 2.10)
-      assert state.update(frame(2.20, pressed=(1,)), 2.20).events == ()
-
-  def test_chord_requires_window_hold_and_neutral_axes():
+  def test_combination_suppresses_takeover_gripper_and_advance_events():
       state = SpaceMouseGestureState()
       state.update(frame(0.00, buttons=(True, False)), 0.00)
-      state.update(frame(0.20, buttons=(True, True)), 0.20)
-      assert state.update(frame(0.60, buttons=(True, True)), 0.60).events == ()
-      state.update(frame(1.00, buttons=(False, False)), 1.00)
-      state.update(frame(1.10, buttons=(True, True), axes=(0.5, 0, 0, 0, 0, 0)), 1.10)
-      assert state.update(frame(1.50, buttons=(True, True)), 1.50).events == (TakeoverEvent.START_DIANPI,)
+      state.update(frame(0.41, buttons=(True, False)), 0.41)
+      result = state.update(frame(0.42, buttons=(True, True)), 0.42)
+      assert TakeoverEvent.START_DIANPI in result.events
+      assert TakeoverEvent.ADVANCE_RIGHT not in result.events
+      state.update(frame(0.50, buttons=(False, False)), 0.50)
+      assert state.update(frame(0.60, pressed=(1,)), 0.60).events == ()
   ```
 
 - [ ] **Step 2: Run the new tests and verify they fail**
@@ -144,7 +135,7 @@
 
 - [ ] **Step 3: Implement the chord state machine**
 
-  Track the time each button went down, a chord candidate/blocked flag, and whether the start event was emitted. On first overlap, clear pending single-click/long-press state and consume both buttons. Emit only after the press-time difference is at most 150 ms, the hold duration is at least 300 ms, and all axes are within `deadzone`; keep consuming until both buttons are released. Do not pass chord frames to any individual gesture path.
+  Track the left hold state and a combination blocked flag. On first overlap, clear pending single-click/long-press state and consume both buttons. Emit when the left hold has crossed the long-press threshold and the right-button edge arrives; keep consuming until both buttons are released. Do not pass combination frames to any individual gesture path.
 
 - [ ] **Step 4: Run gesture and existing SpaceMouse tests**
 
@@ -168,6 +159,7 @@
 **Interfaces:**
 - `DianpiTriggerResult` enum values: `STARTED`, `BUSY`, `ERROR`.
 - `DianpiCycleRunner(*, controller_factory=None, event_sink=print, thread_factory=threading.Thread)`; default factory imports `dianpi.dp.Control.DianpiController` lazily.
+- `start_p10_monitor(poll_period_s=0.05)` starts a retrying P10 falling-edge monitor that shares the runner's controller with SpaceMouse triggers.
 - `trigger() -> DianpiTriggerResult` never raises hardware exceptions; it starts a daemon worker once, returns `BUSY` while a cycle is active, and returns `ERROR` only when a prior/open/run failure prevents starting.
 - `close(timeout_s=1.0) -> None` rejects new triggers, joins the worker, calls controller `close()` once, and is idempotent.
 - `running -> bool` and `last_error -> BaseException | None` expose state for logs/tests.
@@ -285,7 +277,7 @@
 - Test: existing focused suites and Python compilation
 
 **Interfaces:**
-- Documentation must state the exact dual-button chord: press both within 150 ms, hold 300 ms with axes centered, release both before retry; chord suppresses other button actions and reports busy when a cycle is already running.
+- Documentation must state the exact combination: hold the left button for about 400 ms, press the right button while holding left, and release both before retry; the combination suppresses other button actions and reports busy when a cycle is already running.
 - Documentation must state that P10 remains available for standalone `dianpi/dp/Control.py`, and the integrated process must not run concurrently with another RM1010 owner.
 
 - [ ] **Step 1: Add concise user-facing instructions**

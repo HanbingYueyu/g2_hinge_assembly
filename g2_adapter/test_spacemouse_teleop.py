@@ -71,6 +71,18 @@ class TeleopTests(unittest.TestCase):
         self.assertAlmostEqual(quaternion_angle_deg(start.orientation_xyzw, target.orientation_xyzw), math.degrees(.004))
         self.assertAlmostEqual(np.linalg.norm(target.orientation_xyzw), 1)
 
+    def test_motion_step_uses_elapsed_period_when_feedback_loop_is_slow(self):
+        robot = BilateralRobot()
+        session = TeleopSession(
+            G2Controller(FakeGdk, robot, allow_motion=True),
+            TeleopConfig(side='right', speed_m_s=.03, axis_map=(1, 2, 3, 4, 5, 6)),
+        )
+        session.tick(frame(1.0), 1.0)
+        session.tick(frame(1.04, axes=(1, 0, 0, 0, 0, 0)), 1.04)
+        # 30 mm/s for the actual 40 ms interval is 1.2 mm, rather than the
+        # 0.6 mm produced by applying a fixed 20 ms interval.
+        self.assertAlmostEqual(robot.requests[-1].right_end_effector_pose.position.x, .0012)
+
     def test_rotation_uses_base_frame_and_normalizes_quaternion(self):
         start = CartesianPoseTarget((0, 0, 0), (0, 0, math.sqrt(2), math.sqrt(2)))
         target = integrate_pose(start, (0, 0, 0, 1, 0, 0), .02, .01, .2)

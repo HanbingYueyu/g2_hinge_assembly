@@ -14,8 +14,8 @@ from live_left_d405_sam3_web import SharedView, handler_class
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--yolo-model", default="models/left_d405_hinge_shaft_yolo/best.pt")
-    parser.add_argument("--confidence", type=float, default=.25)
+    parser.add_argument("--yolo-model", default="models/head_hinge_yolo/best.pt")
+    parser.add_argument("--confidence", type=float, default=.50)
     parser.add_argument("--imgsz", type=int, default=640)
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--host", default="0.0.0.0")

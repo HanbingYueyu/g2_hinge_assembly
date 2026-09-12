@@ -4,9 +4,9 @@ STEP 模式的粗对准和精对准现使用连续 XY 伺服：每帧目标从�
 
 闭爪后的反馈确认不再经过 STEP 孔位门槛，避免夹爪遮孔阻塞上抬。下探和闭爪阶段的只读视觉监控检查整件目标是否丢失，不要求孔位持续可见；夹爪反馈、抓取验证及搬运监控仍保留。
 
-最终下探阶段固定 XY，不再根据视觉误差横向修正；所有 XY 对准在下探前完成。`--final-descent-visual-servo` 兼容保留为下探视觉监控入口，仍检查目标丢失，力反馈停止与卸力逻辑保持。下探引起的像素位置变化不会再触发横向追踪。
+最终下探阶段可用 `--final-descent-visual-servo` 对下探前锁定的同一 YOLO 目标持续做受限 XY 修正；估计水平误差不超过 5 mm 时保持，超过后才修正。力反馈接近接触时冻结横向修正，下探的 Z 距离仍只由力控逻辑决定。
 
-启用 STEP 的流程先用原 YOLO/SAM 分割中心和原配置像素基准做水平粗对准，粗对准不要求孔位匹配。到达后切换 STEP 精定位；STEP 未通过时等待，不下探。两阶段使用连续有限前瞻目标，最终对准后确认实际到位。日志 `alignment_stage` 为 `coarse_yolo` 或 `fine_step`；`--stop-after xy` 等待精对准完成才结束，重抓从粗对准重新开始。
+启用 STEP 的流程先用原 YOLO 分割中心和原配置像素基准做水平粗对准，粗对准不要求孔位匹配。到达后切换 STEP 精定位；STEP 未通过时等待，不下探。两阶段使用连续有限前瞻目标，最终对准后确认实际到位。日志 `alignment_stage` 为 `coarse_yolo` 或 `fine_step`；`--stop-after xy` 等待精对准完成才结束，重抓从粗对准重新开始。
 
 ## 近似夹持中心直接 XY 对准
 
@@ -72,7 +72,22 @@ cd /home/flyfuture/traditional_auto_flow_g2_migration
 
 ## 新目标标定与实机测试
 
-先人工把张开的左夹爪对准红色夹持区域，并停在最终下探前的高度。视野内只保留一个可识别铰链，保持机器人和工件静止。停止其他相机预览后采集 20 帧基准（只读，不发运动）：
+### 三高度像素标定
+
+斜视相机会让同一个夹持中心在 10 cm、5 cm 和夹取面出现在不同像素位置。先保持左夹爪张开，视野内只保留一个可识别铰链，启动下面的只读标定命令；程序会持续更新网页。按照终端提示，手动把夹爪中心依次放到铰链抓取点上方 100 mm、50 mm、0 mm，每个位置按一次回车，程序采集 5 个通过 STEP PnP 的 RGB 帧并取中位数。整个过程不发送机器人或夹爪命令。
+
+```bash
+./scripts/run_gdk_sam3_python.sh g2_adapter/run_left_step_rgb.py \
+  --profile g2_adapter/left_step_profile.json \
+  --yolo-model models/left_d405_hinge_yolo/best.pt \
+  --save-height-reference g2_adapter/left_step_reference.json \
+  --height-capture-frames 5 \
+  --web-host 0.0.0.0 --web-port 8777
+```
+
+网页：`http://127.0.0.1:8777`。保存的 `left_step_reference.json` 含三个高度、每个高度的相机距离和目标像素。运行抓取时，程序按当前 STEP PnP 的 `grasp_xyz_camera_m` 距离在相邻标定点之间线性插值；超出 0–100 mm 范围时使用最近端点。日志字段 `height_reference` 会记录当前使用的上下端点和插值比例。旧的单点 `sample_count >= 20` 文件仍可继续使用，但不会做高度补偿。
+
+如需兼容旧流程，也可以只在最终下探前采集一个 20 帧基准（只读，不发运动）；该方式没有高度补偿：
 
 ```bash
 ./scripts/run_gdk_sam3_python.sh g2_adapter/run_left_step_rgb.py \

@@ -6,6 +6,7 @@ from visual_servo import (
     base_position_after_delta,
     empirical_horizontal_base_delta_from_pixel_error,
     horizontal_base_delta_from_camera_displacement,
+    relief_translation_speed_mps,
 )
 
 
@@ -48,6 +49,15 @@ class EmpiricalHorizontalVisualServoTests(unittest.TestCase):
         )
         self.assertEqual(float(result[2]), 0.0)
         self.assertLessEqual(float(np.linalg.norm(result[:2])), 0.0020000001)
+
+
+class ReliefSpeedTests(unittest.TestCase):
+    def test_relief_uses_half_of_automatic_translation_speed(self):
+        self.assertAlmostEqual(relief_translation_speed_mps(0.030), 0.015)
+
+    def test_relief_rejects_non_positive_speed(self):
+        with self.assertRaises(ValueError):
+            relief_translation_speed_mps(0.0)
 
 
 class EndLinkTargetTests(unittest.TestCase):

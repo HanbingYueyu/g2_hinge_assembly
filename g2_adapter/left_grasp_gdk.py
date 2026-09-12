@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""Final-position left D405 visual grasp using only GDK and SAM3.
+"""Final-position left D405 visual grasp using GDK and YOLO only.
 
 By default P2/P3 remain outside this program, so it can be used as a
 final-detection-position-only grasp tool. ``--full-cycle`` makes this the
-single GDK/SAM3 process for P1→P2→grasp→+Z lift→P4: SAM3 is loaded before
+single GDK process for P1→P2→grasp→+Z lift→P4: YOLO runs on every
 P2 is requested and GDK is initialized exactly once. Without ``--allow-motion``
 it is still a perception preview: it never changes a GDK control mode or sends
 an arm/Omnipicker request. With that one flag it refuses an uncalibrated
@@ -15,10 +15,10 @@ from __future__ import annotations
 import argparse
 import json
 import math
-import subprocess
 import sys
 import threading
 import time
+from collections.abc import Sequence
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from http.server import ThreadingHTTPServer
@@ -30,21 +30,31 @@ import torch
 
 try:
     from .left_step_xy import xy_error, bounded_xy
+    from .bilateral_rgbd_geometry import apply_transform
     from .left_step_rgb import OcclusionTrackerPool
     from .apriltag_workpiece import transform_from_dict
     from .left_step_rgb import load_profile, load_alignment_reference, detect_hole_centres, match_holes
+    from .left_step_height import (
+        camera_distance_from_base_point, interpolate_target_pixel, load_height_samples,
+        target_pixel_for_step_pose,
+    )
     from .camera import align_depth_to_color, decode_color_rgb, decode_depth_u16, intrinsic_to_dict, transform_to_dict
     from .contact_detection import ForceContactDetector, ForceContactParameters
-    from .control import CartesianPoseTarget, G2Controller, LeftEndEffectorPositionStream
+    from .control import CartesianPoseTarget, G2Controller, LeftEndEffectorPositionStream, quaternion_angle_deg
     from .left_grasp_state import GraspParameters, GraspPhase, LeftGraspState, Observation, requires_calibrated_config
-    from .live_left_d405_sam3_web import SharedView, handler_class
-    from .localize_left_d405_sam3 import draw_overlay, eligible_candidates, parse_roi, stats_for_mask
+    from .live_left_d405_sam3_web import CompositeSharedView, SharedView, handler_class
+    from .localize_left_d405_sam3 import depth_points, draw_overlay, eligible_candidates, parse_roi, stats_for_mask
+    from .move_left_above_head_hinge_gdk import (
+        base_from_head_at, dominant_sample_cluster, fixed_forward_down_orientation,
+        draw_head_coarse_overlay, gripper_end_target, select_leftmost_hinge, wait_actual_left_target,
+    )
     from .safety import SafetyError
     from .sam_crop import center_crop_bounds, center_crop_image, draw_crop_box, expand_crop_masks
-    from .visual_servo import base_position_after_delta, empirical_horizontal_base_delta_from_pixel_error
+    from .visual_servo import base_position_after_delta, empirical_horizontal_base_delta_from_pixel_error, relief_translation_speed_mps
     from .xy_mapping import choose_candidate_by_left_rank
     from .yolo_hinge import associate_shaft_to_hinge, infer_yolo_masks, load_yolo_segmentation_model, review_matches, reviewed_target_matches_selected, split_yolo_candidates
     from .record_pose import DEFAULT_OUTPUT as DEFAULT_POSES_OUTPUT
+    from .workflow_home import WORKFLOW_HOME_POSE_NAME, load_workflow_home, move_workflow_home
     from .inspect_left_gripper_urdf import audit as audit_left_gripper_urdf
     from .run_left_premove_sequence import HANDOFF_PRESETS, load_presets as load_premove_presets, open_handoff_gripper
     from .run_left_post_grasp_sequence import (
@@ -57,21 +67,31 @@ try:
     from .spacemouse_teleop import TeleopConfig
 except ImportError:
     from left_step_xy import xy_error, bounded_xy
+    from bilateral_rgbd_geometry import apply_transform
     from left_step_rgb import OcclusionTrackerPool
     from apriltag_workpiece import transform_from_dict
     from left_step_rgb import load_profile, load_alignment_reference, detect_hole_centres, match_holes
+    from left_step_height import (
+        camera_distance_from_base_point, interpolate_target_pixel, load_height_samples,
+        target_pixel_for_step_pose,
+    )
     from camera import align_depth_to_color, decode_color_rgb, decode_depth_u16, intrinsic_to_dict, transform_to_dict
     from contact_detection import ForceContactDetector, ForceContactParameters
-    from control import CartesianPoseTarget, G2Controller, LeftEndEffectorPositionStream
+    from control import CartesianPoseTarget, G2Controller, LeftEndEffectorPositionStream, quaternion_angle_deg
     from left_grasp_state import GraspParameters, GraspPhase, LeftGraspState, Observation, requires_calibrated_config
-    from live_left_d405_sam3_web import SharedView, handler_class
-    from localize_left_d405_sam3 import draw_overlay, eligible_candidates, parse_roi, stats_for_mask
+    from live_left_d405_sam3_web import CompositeSharedView, SharedView, handler_class
+    from localize_left_d405_sam3 import depth_points, draw_overlay, eligible_candidates, parse_roi, stats_for_mask
+    from move_left_above_head_hinge_gdk import (
+        base_from_head_at, dominant_sample_cluster, fixed_forward_down_orientation,
+        draw_head_coarse_overlay, gripper_end_target, select_leftmost_hinge, wait_actual_left_target,
+    )
     from safety import SafetyError
     from sam_crop import center_crop_bounds, center_crop_image, draw_crop_box, expand_crop_masks
-    from visual_servo import base_position_after_delta, empirical_horizontal_base_delta_from_pixel_error
+    from visual_servo import base_position_after_delta, empirical_horizontal_base_delta_from_pixel_error, relief_translation_speed_mps
     from xy_mapping import choose_candidate_by_left_rank
     from yolo_hinge import associate_shaft_to_hinge, infer_yolo_masks, load_yolo_segmentation_model, review_matches, reviewed_target_matches_selected, split_yolo_candidates
     from record_pose import DEFAULT_OUTPUT as DEFAULT_POSES_OUTPUT
+    from workflow_home import WORKFLOW_HOME_POSE_NAME, load_workflow_home, move_workflow_home
     from inspect_left_gripper_urdf import audit as audit_left_gripper_urdf
     from run_left_premove_sequence import HANDOFF_PRESETS, load_presets as load_premove_presets, open_handoff_gripper
     from run_left_post_grasp_sequence import (
@@ -89,8 +109,8 @@ DEPTH_SCALE_M = 0.001
 # GDK's kLeftHandRGBDToArmLEndLink external calibration terminates here.  GDK
 # mode-1 end-effector pose control uses the same flange link by default.
 LEFT_VISUAL_TIP_LINK = "arm_l_end_link"
-# SAM3 inference itself sets the cadence (about a few Hz on the current GPU).
-# Do not add a material artificial delay between display-only descent frames.
+# Camera/model inference sets the cadence. Do not add an artificial delay
+# between display-only frames.
 FORCE_DESCENT_SAM_PREVIEW_PERIOD_S = 0.01
 _PREFERRED_G2_HINGE_SHAFT_YOLO = PROJECT_ROOT / "models" / "left_d405_hinge_shaft_yolo" / "best.pt"
 _ROLLBACK_G2_HINGE_YOLO = PROJECT_ROOT / "models" / "left_d405_hinge_yolo" / "best.pt"
@@ -105,20 +125,64 @@ DEFAULT_G2_URDF = PROJECT_ROOT / "robot_description" / "G2_t2v2_crsB_omnipicker.
 EXIT_ADVANCE_RIGHT = 20
 HINGE_CLASS_ID = 0
 SHAFT_CLASS_ID = 1
+SCREEN_GRIPPER_TARGET_HEIGHT_FRACTION = 0.45
+# The object grasp landmark is measured upward from the bottom of the YOLO
+# box.  Thus 0.55 means 55% up from the box bottom (45% down from its top).
+YOLO_GRASP_BOTTOM_UP_FRACTION = 0.55
+YOLO_CENTER_CROP_FRACTION = 0.70
 
 
-def yolo_box_fraction_grasp_pixel(item: dict, height_fraction: float = 0.55) -> list[float]:
-    """Return the YOLO box centre at a fractional height from top to bottom."""
-    if not 0.0 <= height_fraction <= 1.0:
-        raise ValueError("YOLO box grasp height fraction must be in [0, 1]")
+def prepare_yolo_input(
+    color_rgb: np.ndarray,
+    valid_fraction: float = YOLO_CENTER_CROP_FRACTION,
+) -> tuple[np.ndarray, tuple[int, int, int, int]]:
+    """Prepare a full-frame YOLO input and the central valid-target ROI.
+
+    YOLO must see the complete camera image so detections near the image edge
+    are available for diagnostics.  Only detections whose center lies in the
+    returned ROI are eligible for grasping or visual servoing.
+    """
+    image = np.asarray(color_rgb)
+    if image.ndim < 3 or image.shape[2] != 3:
+        raise ValueError("color_rgb must be an HxWx3 image")
+    return cv2.cvtColor(image, cv2.COLOR_RGB2BGR), center_crop_bounds(
+        image.shape, fraction=valid_fraction,
+    )
+
+
+def yolo_box_fraction_grasp_pixel(
+    item: dict, bottom_up_fraction: float = YOLO_GRASP_BOTTOM_UP_FRACTION,
+) -> list[float]:
+    """Return the box centre horizontally and a point measured up from bottom."""
+    if not 0.0 <= bottom_up_fraction <= 1.0:
+        raise ValueError("YOLO box bottom-up grasp fraction must be in [0, 1]")
     box = np.asarray(item.get("bbox_xyxy"), dtype=np.float64)
     if box.shape != (4,) or not np.isfinite(box).all() or box[2] <= box[0] or box[3] <= box[1]:
         raise ValueError("YOLO grasp target requires a finite non-empty bbox_xyxy")
-    return [float((box[0] + box[2]) / 2.0), float(box[1] + height_fraction * (box[3] - box[1]))]
+    return [
+        float((box[0] + box[2]) / 2.0),
+        float(box[3] - bottom_up_fraction * (box[3] - box[1])),
+    ]
+
+
+def screen_gripper_target_pixel(
+    image_shape: tuple[int, ...], height_fraction: float = SCREEN_GRIPPER_TARGET_HEIGHT_FRACTION,
+) -> np.ndarray:
+    """Return the fixed image point where the gripper grasp point should appear.
+
+    The default is 55% of the image height measured upward from the bottom,
+    i.e. 45% down from the top.
+    """
+    if len(image_shape) < 2:
+        raise ValueError("image_shape must contain height and width")
+    height, width = int(image_shape[0]), int(image_shape[1])
+    if height <= 0 or width <= 0 or not 0.0 <= height_fraction <= 1.0:
+        raise ValueError("invalid image shape or screen target height fraction")
+    return np.asarray((width * 0.5, height * float(height_fraction)), dtype=np.float64)
 
 
 def servo_pixel(item: dict) -> list[float]:
-    """Use the YOLO-box grasp landmark; STEP/CAD offsets are legacy only."""
+    """Use the YOLO box grasp landmark; legacy STEP data is ignored."""
     if "yolo_box_grasp_pixel_px" in item:
         return item["yolo_box_grasp_pixel_px"]
     return item["center_px"]
@@ -181,6 +245,78 @@ class AdaptiveGripperCloseParameters:
             raise ValueError("adaptive_close.additional_close_rad 必须在 [0, 0.10]")
 
 
+@dataclass(frozen=True)
+class GripperCloseDecision:
+    """Decision made from one real gripper feedback sample and its history."""
+
+    action: str
+    reason: str
+    hold_target_rad: float | None = None
+    close_travel_rad: float | None = None
+    stall_angle_rad: float | None = None
+
+
+def decide_gripper_close(
+    *,
+    position_rad: float | None,
+    gripper_open_rad: float,
+    tolerance_rad: float,
+    parameters: AdaptiveGripperCloseParameters,
+    samples: list[tuple[float, float]],
+    now: float,
+) -> GripperCloseDecision:
+    """Choose whether to keep closing, or hold a confirmed close target.
+
+    Reaching the configured mechanical close endpoint is not proof that the
+    hinge was missed: a thin hinge may still be held when the reported angle
+    is near ``seek_target_rad``.  Keep that endpoint closed and let the
+    post-grasp visual/lift monitor decide whether the part is actually held.
+    """
+    if position_rad is None:
+        return GripperCloseDecision(action="wait", reason="gripper_feedback_unavailable")
+
+    close_travel_rad = float(position_rad) - float(gripper_open_rad)
+    if abs(float(position_rad) - parameters.seek_target_rad) <= tolerance_rad:
+        return GripperCloseDecision(
+            action="hold",
+            reason="full_close_hold_pending_visual_verification",
+            hold_target_rad=parameters.seek_target_rad,
+            close_travel_rad=close_travel_rad,
+        )
+
+    if close_travel_rad < parameters.minimum_close_travel_rad:
+        return GripperCloseDecision(
+            action="wait",
+            reason="minimum_close_travel_not_reached",
+            close_travel_rad=close_travel_rad,
+        )
+
+    stall_angle = stalled_gripper_position(
+        samples,
+        now=now,
+        window_s=parameters.stall_window_s,
+        position_delta_rad=parameters.stall_position_delta_rad,
+    )
+    if stall_angle is None:
+        return GripperCloseDecision(
+            action="wait",
+            reason="waiting_for_variable_stall",
+            close_travel_rad=close_travel_rad,
+        )
+
+    hold_target_rad = min(
+        parameters.seek_target_rad,
+        stall_angle + parameters.additional_close_rad,
+    )
+    return GripperCloseDecision(
+        action="hold",
+        reason="variable_stall_hold",
+        hold_target_rad=hold_target_rad,
+        close_travel_rad=close_travel_rad,
+        stall_angle_rad=stall_angle,
+    )
+
+
 class FinalDescentVisualMailbox:
     """Thread-safe latest-only visual correction handoff.
 
@@ -214,12 +350,15 @@ def held_part_monitor_failure(
     reference_area_px: int,
     max_center_drift_px: float,
     max_area_change_fraction: float,
+    check_geometry: bool = True,
 ) -> dict | None:
     """Return a transport-veto record when the locked held part is unhealthy.
 
     This is deliberately a visual *continuity* check, not a new detection or
     a request to substitute another hinge.  During transport the only valid
-    object is the one that was verified immediately after the grasp.
+    object is the one that was verified immediately after the grasp.  Callers
+    may disable geometry rejection with ``check_geometry=False`` when mask
+    occlusion is expected and only timeout-confirmed loss is actionable.
     """
     # ``valid=None`` means that this is a fresh frame in which the locked
     # instance is temporarily missing.  It is evidence to count, but not
@@ -231,6 +370,12 @@ def held_part_monitor_failure(
             "reason": observation.get("reason", "locked_target_lost"),
             "observation": observation,
         }
+    # Once the gripper has closed, changes in the visible mask are expected:
+    # the fingers occlude the part and the view changes during lifting.  The
+    # caller can therefore defer the only actionable decision to the explicit
+    # target-lost timeout; verification metrics remain diagnostic only.
+    if not check_geometry:
+        return None
     try:
         center_drift_px = float(np.linalg.norm(
             np.asarray(observation["center_px"], dtype=np.float64)
@@ -361,13 +506,13 @@ def stalled_gripper_position(
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="G2 左手最终检测位 D405/SAM3 闭环抓取")
+    parser = argparse.ArgumentParser(description="G2 左手最终检测位 D405/YOLO 闭环抓取")
     parser.add_argument("--config", type=Path, default=PROJECT_ROOT / "g2_adapter" / "left_grasp.example.json")
-    parser.add_argument("--urdf", type=Path, default=DEFAULT_G2_URDF, help="用于计算左夹爪对称中心的 G2 URDF。")
+    parser.add_argument("--urdf", type=Path, default=DEFAULT_G2_URDF, help="兼容旧命令；当前视觉对准不使用 URDF 夹爪中心。")
     parser.add_argument(
         "--prompt",
         default="silver triangular hinge",
-        help="SAM3 text prompt used to review the YOLO-selected hinge.",
+        help="兼容旧命令的参数；YOLO 模式不使用。",
     )
     parser.add_argument("--threshold", type=float, default=0.10)
     parser.add_argument(
@@ -399,14 +544,26 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--yolo-imgsz", type=int, default=640)
     parser.add_argument("--yolo-device", default="cuda:0")
-    parser.add_argument("--sam-review-interval-s", type=float, default=0.50)
-    parser.add_argument("--sam-review-ttl-s", type=float, default=1.50)
-    parser.add_argument("--sam-review-max-pixel-error", type=float, default=80.0)
+    parser.add_argument(
+        "--yolo-center-fraction",
+        type=float,
+        default=YOLO_CENTER_CROP_FRACTION,
+        help="左手 YOLO 全图推理时的中央有效目标区域宽高比例，默认 0.70（四周各排除 15%%）。",
+    )
+    parser.add_argument("--sam-review-interval-s", type=float, default=0.50, help="兼容旧命令；YOLO 模式不使用。")
+    parser.add_argument("--sam-review-ttl-s", type=float, default=1.50, help="兼容旧命令；YOLO 模式不使用。")
+    parser.add_argument("--sam-review-max-pixel-error", type=float, default=80.0, help="兼容旧命令；YOLO 模式不使用。")
     parser.add_argument(
         "--yolo-box-height-fraction",
         type=float,
-        default=0.55,
-        help="YOLO 框从底部向上 45%%（即从顶部向下 55%%）；横坐标取检测框中心。",
+        default=YOLO_GRASP_BOTTOM_UP_FRACTION,
+        help="YOLO 框从底部向上比例，默认 0.55（55%%）；横坐标取检测框中心。",
+    )
+    parser.add_argument(
+        "--height-reference",
+        type=Path,
+        default=None,
+        help="10 cm/5 cm/抓取点三点像素标定；不依赖 STEP/PnP，使用头部三维点估计距离。",
     )
     parser.add_argument("--step-profile", type=Path, help="Use RGB STEP grasp point for XY alignment")
     parser.add_argument("--step-reference", type=Path, help="New manually aligned STEP pixel reference")
@@ -415,7 +572,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--step-compensation-xy-mm", default="0,0", help="Base X,Y target compensation, mm")
     parser.add_argument("--step-xy-tolerance-mm", type=float, default=2.0)
     parser.add_argument("--xy-speed-mm-s", type=float, default=15.0, help="Continuous STEP/coarse XY speed; descent still uses --speed-mm-s")
-    parser.add_argument("--sam-review-max-depth-error-m", type=float, default=0.05)
+    parser.add_argument("--sam-review-max-depth-error-m", type=float, default=0.05, help="兼容旧命令；YOLO 模式不使用。")
     parser.add_argument("--min-area", type=int, default=1)
     parser.add_argument("--min-valid-depth-pixels", type=int, default=50)
     parser.add_argument("--roi", default="none", metavar="X0,Y0,X1,Y1")
@@ -431,7 +588,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--warmup", type=int, default=5)
     parser.add_argument("--max-frames", type=int, default=0, help="0 表示持续运行。")
     parser.add_argument("--single-xy-step", action="store_true", help="等待有效目标；最多只发送一次 XY 纠偏后立即停止。")
-    parser.add_argument("--checkpoint", default="checkpoints/sam3.1_multiplex.pt")
+    parser.add_argument("--checkpoint", default="checkpoints/sam3.1_multiplex.pt", help="兼容旧命令；YOLO 模式不加载。")
     parser.add_argument("--control-period-s", type=float, default=0.02)
     parser.add_argument(
         "--pre-final-settle-timeout-s",
@@ -442,7 +599,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--final-descent-visual-servo",
         action="store_true",
-        help="下探期间对已锁定的同一铰链执行受限 XY 复位；力接触仍然优先并会冻结纠偏。",
+        help="下探期间对已锁定的同一 YOLO 铰链执行受限 XY 复位；力接触仍然优先并会冻结纠偏。",
+    )
+    parser.add_argument(
+        "--final-descent-visual-tolerance-mm",
+        type=float,
+        default=5.0,
+        help="下探视觉伺服的估计水平误差死区，默认 5 mm；超过后才发送 XY 修正。",
     )
     parser.add_argument(
         "--final-descent-visual-max-step-m",
@@ -460,7 +623,7 @@ def parse_args() -> argparse.Namespace:
         "--final-descent-target-lost-frames",
         type=int,
         default=2,
-        help="下探期间同一锁定目标连续丢失多少个 SAM3 帧后撤回并重新对准，默认 2。",
+        help="下探期间同一锁定目标连续丢失多少个 YOLO 帧后撤回并重新对准，默认 2。",
     )
     parser.add_argument(
         "--regrasp-retract-m",
@@ -504,23 +667,46 @@ def parse_args() -> argparse.Namespace:
         default=2.0,
         help="抓取后的运输监控最长允许多久没有新的同一目标观测，默认 2 秒；超时只暂停并保持闭爪，明确丢失才重夹。",
     )
+    parser.add_argument(
+        "--post-grasp-target-lost-timeout-s",
+        type=float,
+        default=3.0,
+        help="抓取后同一目标连续不可见多久才重新抓取，默认 3 秒。",
+    )
     parser.add_argument("--log", type=Path, default=None, help="默认写入 logs/left_grasp_*.jsonl")
     parser.add_argument("--web-host", default="127.0.0.1", help="内嵌只读网页监听地址。")
-    parser.add_argument("--web-port", type=int, default=0, help="内嵌 SAM3 网页端口；0 表示关闭。")
+    parser.add_argument("--web-port", type=int, default=0, help="内嵌 YOLO 网页端口；0 表示关闭。")
     parser.add_argument("--stop-after", choices=("none", "xy", "descend"), default="none", help="受看护测试的停止阶段；descend 会完成配置的定时下探但不闭爪。")
     parser.add_argument(
         "--full-cycle",
         action="store_true",
-        help="执行启动接近、SAM3 抓取、+Z 上抬 150 mm、P3→P4；可用 --head-coarse-approach 替换 P1→P2。",
+        help="执行启动接近、YOLO 抓取、+Z 上抬 150 mm、P3→P4；可用 --head-coarse-approach 替换 P1→P2。",
     )
     parser.add_argument(
         "--head-coarse-approach",
         action="store_true",
         help="全流程开始时先用头部 RGB-D 定位并移动到最左铰链上方，跳过旧 P1→P2 预移动。",
     )
-    parser.add_argument("--head-yolo-model", type=Path, default=PROJECT_ROOT / "runs/head_hinge_yolo_seg/head_from_scratch_v1/weights/best.pt")
-    parser.add_argument("--head-above-mm", type=float, default=150.0)
+    parser.add_argument("--head-yolo-model", type=Path, default=PROJECT_ROOT / "models" / "head_hinge_yolo" / "best.pt")
+    parser.add_argument(
+        "--head-yolo-confidence",
+        type=float,
+        default=0.50,
+        help="头部 YOLO 接受检测的最低置信度，默认 0.50。",
+    )
+    parser.add_argument(
+        "--head-above-mm",
+        type=float,
+        default=100.0,
+        help="头部粗定位后，夹爪抓取中心位于铰链上方的距离，默认 100 mm。",
+    )
     parser.add_argument("--head-xy-tolerance-mm", type=float, default=50.0)
+    parser.add_argument("--head-samples", type=int, default=15,
+                        help="头部粗定位候选样本数；会从中保留空间一致的主簇。")
+    parser.add_argument("--head-min-inlier-samples", type=int, default=8,
+                        help="头部粗定位主簇最少样本数。")
+    parser.add_argument("--head-max-sample-spread-mm", type=float, default=50.0,
+                        help="头部粗定位主簇相对中位数的最大距离。")
     parser.add_argument("--head-forward-yaw-deg", type=float, default=0.0,
                         help="头部粗定位时末端 +Z 相对 base_link +X 的水平偏航角。")
     parser.add_argument("--head-gripper-pitch-deg", type=float, default=30.0,
@@ -532,7 +718,8 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="全流程完成后保持 GDK、SpaceMouse 接管和 Web 服务，等待右按钮长按 2 秒进入右手流程。",
     )
-    parser.add_argument("--poses", type=Path, default=DEFAULT_POSES_OUTPUT, help="包含左 P1/P2/P3/P4 的 recorded_poses.json。")
+    parser.add_argument("--poses", type=Path, default=DEFAULT_POSES_OUTPUT, help="包含流程点位和双臂 workflow_home 的 recorded_poses.json。")
+    parser.add_argument("--home-pose-name", default=WORKFLOW_HOME_POSE_NAME, help="全流程启动前使用的双臂归位点名称。")
     parser.add_argument("--preset-velocity-rad-s", type=float, default=0.08, help="全流程 P1/P2/P3/P4 的规划关节速度。")
     parser.add_argument(
         "--auto-preset-velocity-rad-s",
@@ -544,7 +731,7 @@ def parse_args() -> argparse.Namespace:
         "--speed-mm-s",
         type=float,
         default=None,
-        help="整体机器人运动速度（mm/s）；当前配置默认 10 mm/s，可设置 1～18 mm/s。",
+        help="整体机器人运动速度（mm/s）；必须为正数。",
     )
     parser.add_argument("--speed-scale", type=float, default=None, help=argparse.SUPPRESS)
     parser.add_argument("--preset-arrival-tolerance-rad", type=float, default=0.03, help="全流程预设点到位关节容差。")
@@ -776,9 +963,13 @@ def compact_record(record: dict) -> dict:
         for key in (
             "event", "frame", "utc", "state", "reason", "error",
             "command_source", "motion_command_sent", "regrasp_attempt", "test_stop",
-            "post_grasp_verify", "perception_gate", "tracking", "selected_mask_index",
+            "post_grasp_verify", "force_relief_speed", "perception_gate", "tracking", "selected_mask_index",
             "tracking_lock_reset", "step_pose", "pixel_error_px", "delta_base_m", "alignment_stage",
-            "actual_xy_error_m", "end_link_target_before_base_link", "end_link_target_after_base_link",
+            "actual_xy_error_m", "actual_end_link_before_base_link", "target_follow_error_mm",
+            "screen_gripper_target_pixel_px",
+            "gripper_position_rad", "adaptive_gripper_close_travel_rad", "adaptive_gripper_stall",
+            "height_reference",
+            "end_link_target_before_base_link", "end_link_target_after_base_link",
         )
         if key in record
     }
@@ -788,17 +979,6 @@ def compact_record(record: dict) -> dict:
             key: selected[key]
             for key in ("center_px", "depth_median_m", "yolo_confidence")
             if key in selected
-        }
-    review = record.get("sam_review")
-    if isinstance(review, dict):
-        summary["sam_review"] = {
-            key: review[key]
-            for key in (
-                "accepted", "fresh", "reason", "pixel_error", "depth_error_m",
-                "age_s", "yolo_center_px", "current_target_distance_px",
-                "reviewed_same_target",
-            )
-            if key in review
         }
     force = record.get("force_contact")
     if isinstance(force, dict) and "maximum_delta_force_n" in force:
@@ -1019,9 +1199,7 @@ def publish_web_preview(
         "shaft": record.get("shaft"),
         "shaft_association": record.get("shaft_association"),
         "tracking": record.get("tracking"),
-        "detector": record.get("detector", "sam3"),
-        "sam_center_crop_xyxy": list(crop_bounds),
-        "sam_center_crop_fraction": 0.70,
+        "detector": record.get("detector", "yolo"),
         "grasp_reason": record.get("reason"),
         "motion_enabled": record["motion_enabled"],
         "safety": "网页仅显示本抓取进程的同一帧检测结果；不提供机器人或夹爪控制接口。",
@@ -1047,12 +1225,11 @@ def compact_detection(statistics: list[dict], index: int | None) -> dict | None:
 
 
 class PersistentPerception:
-    """The sole owner of the hand camera and the YOLO/SAM3 model instances.
+    """The sole owner of the hand camera, YOLO model, and left web pane.
 
-    Motion code must never call GDK Camera or either model.  It waits for a
-    snapshot from this object instead.  YOLO runs for every acquired frame;
-    SAM3 runs at the configured review cadence (or every frame in SAM3-only
-    mode).  The same loop is also the only publisher for the web preview.
+    Motion code must never call GDK Camera or the model. It waits for a
+    snapshot from this object instead. YOLO runs for every acquired frame and
+    this loop publishes the left pane of the composite web preview.
     """
 
     def __init__(self, *, camera, color_type, depth_type, gdk, tf, processor, yolo_model,
@@ -1064,6 +1241,8 @@ class PersistentPerception:
         self._latest: dict | None = None
         self._sequence = 0
         self._phase = {"state": "perception_starting", "reason": ""}
+        self._target_pixel_override: np.ndarray | None = None
+        self._target_pixel_detail: dict | None = None
         self._stop = threading.Event()
         self._failure: Exception | None = None
         self._thread: threading.Thread | None = None
@@ -1080,6 +1259,19 @@ class PersistentPerception:
     def set_phase(self, state: str, reason: str = "") -> None:
         with self._condition:
             self._phase = {"state": state, "reason": reason}
+
+    def set_target_pixel_override(self, target: Sequence[float] | None, detail: dict | None = None) -> None:
+        """Update the web marker target used by the dynamic height reference."""
+        with self._condition:
+            if target is None:
+                self._target_pixel_override = None
+                self._target_pixel_detail = None
+                return
+            values = np.asarray(tuple(float(value) for value in target), dtype=np.float64)
+            if values.shape != (2,) or not np.isfinite(values).all():
+                raise ValueError("target pixel override must contain two finite values")
+            self._target_pixel_override = values
+            self._target_pixel_detail = None if detail is None else dict(detail)
 
     def newer_than(self, sequence: int, timeout_s: float = 1.5) -> dict | None:
         deadline = time.monotonic() + timeout_s
@@ -1153,13 +1345,24 @@ class PersistentPerception:
                     depth_to_color = candidate_depth_to_color
                     end_link_transform = candidate_end_link_transform
                 aligned_depth = np.zeros(color_rgb.shape[:2], dtype=np.uint16) if use_step else align_depth_to_color(depth_u16, depth_intrinsic=depth_intrinsic, color_intrinsic=color_intrinsic, depth_to_color=depth_to_color, depth_scale_m=DEPTH_SCALE_M)
-                urdf_target_pixel_px = project_end_point_to_color_pixel(
-                    self.args.urdf_gripper_center_end_m,
-                    end_link_transform,
-                    color_intrinsic,
-                )
-                crop_bounds = center_crop_bounds(color_rgb.shape)
-                roi = intersect_roi(parse_roi(self.args.roi, color_rgb.shape[:2]), crop_bounds)
+                screen_target_pixel_px = screen_gripper_target_pixel(color_rgb.shape)
+                with self._condition:
+                    if self._target_pixel_override is not None:
+                        screen_target_pixel_px = self._target_pixel_override.copy()
+                        height_reference_detail = dict(self._target_pixel_detail or {})
+                    else:
+                        height_reference_detail = None
+                # Run YOLO on the complete image.  The central region is a
+                # target-validity gate only, so edge detections remain visible
+                # for diagnostics without entering the grasp state machine.
+                crop_bounds = None
+                roi = parse_roi(self.args.roi, color_rgb.shape[:2])
+                yolo_valid_roi = None
+                if self.args.detector in {"yolo", "yolo-sam"}:
+                    yolo_valid_roi = center_crop_bounds(
+                        color_rgb.shape, fraction=self.args.yolo_center_fraction,
+                    )
+                    roi = intersect_roi(roi, yolo_valid_roi)
                 if self.args.detector == "sam3":
                     sam_input, _ = center_crop_image(color_rgb)
                     with torch.inference_mode(), torch.autocast(device_type="cuda", dtype=torch.bfloat16):
@@ -1176,9 +1379,12 @@ class PersistentPerception:
                     candidates = eligible_candidates(statistics, min_area=self.args.min_area, min_valid_depth_pixels=self.args.min_valid_depth_pixels, roi=roi, require_depth=False)
                     sam_review = {"accepted": True, "fresh": True, "reason": "sam3_primary"}
                 else:
+                    yolo_bgr, yolo_valid_roi = prepare_yolo_input(
+                        color_rgb, valid_fraction=self.args.yolo_center_fraction,
+                    )
                     masks, scores, class_ids = infer_yolo_masks(
                         self.yolo_model,
-                        cv2.cvtColor(color_rgb, cv2.COLOR_RGB2BGR),
+                        yolo_bgr,
                         confidence=self.args.yolo_confidence,
                         imgsz=self.args.yolo_imgsz,
                         device=self.args.yolo_device,
@@ -1305,6 +1511,20 @@ class PersistentPerception:
                             elif pose.get("accepted"):
                                 pose["base_xy_error_m"] = xy_error(base_end, transform_from_dict(end_link_transform), pose["grasp_xyz_camera_m"], self.args.step_tcp_m, self.args.step_compensation_m)
                 selected = choose_candidate(statistics, candidates, self.args.selection)
+                height_samples = getattr(self.args, "step_height_samples", None)
+                if use_step and selected is not None and height_samples:
+                    selected_pose = statistics[selected].get("step_pose", {})
+                    if selected_pose.get("accepted"):
+                        try:
+                            target, height_reference_detail = target_pixel_for_step_pose(
+                                height_samples, selected_pose,
+                            )
+                            screen_target_pixel_px = target
+                        except ValueError:
+                            # The normal STEP acceptance gate remains in
+                            # control; an invalid/missing interpolation input
+                            # falls back to the calibrated 0 mm target.
+                            height_reference_detail = None
                 shaft_association = associate_shaft_to_hinge(
                     statistics,
                     selected,
@@ -1315,7 +1535,7 @@ class PersistentPerception:
                 ) if self.args.detector in {"yolo", "yolo-sam"} else {"shaft_index": None, "reason": "sam3_mode"}
                 with self._condition:
                     self._sequence += 1
-                    snapshot = {"sequence": self._sequence, "color_rgb": color_rgb, "masks": masks, "statistics": statistics, "candidates": candidates, "hinge_candidates": candidates, "shaft_candidates": shaft_candidates if self.args.detector in {"yolo", "yolo-sam"} else [], "selected": selected, "shaft_association": shaft_association, "aligned_depth": aligned_depth, "color_intrinsic": color_intrinsic, "depth_intrinsic": depth_intrinsic, "depth_to_color": depth_to_color, "end_link_transform": end_link_transform, "urdf_gripper_center_pixel_px": urdf_target_pixel_px, "roi": roi, "crop_bounds": crop_bounds, "sam_review": dict(sam_review), "inference_ms": (time.monotonic() - started) * 1000.0}
+                    snapshot = {"sequence": self._sequence, "color_rgb": color_rgb, "masks": masks, "statistics": statistics, "candidates": candidates, "hinge_candidates": candidates, "shaft_candidates": shaft_candidates if self.args.detector in {"yolo", "yolo-sam"} else [], "selected": selected, "shaft_association": shaft_association, "aligned_depth": aligned_depth, "color_intrinsic": color_intrinsic, "depth_intrinsic": depth_intrinsic, "depth_to_color": depth_to_color, "end_link_transform": end_link_transform, "screen_gripper_target_pixel_px": screen_target_pixel_px, "height_reference": height_reference_detail, "roi": roi, "sam_review": dict(sam_review), "inference_ms": (time.monotonic() - started) * 1000.0}
                     self._latest = snapshot
                     phase = dict(self._phase)
                     self._condition.notify_all()
@@ -1326,25 +1546,65 @@ class PersistentPerception:
                             [masks[selected]], [statistics[selected]], 0,
                         )
                     else:
-                        overlay = draw_crop_box(draw_overlay(cv2.cvtColor(color_rgb, cv2.COLOR_RGB2BGR), masks, statistics, selected), crop_bounds)
-                    if selected is not None and "yolo_box_grasp_pixel_px" in statistics[selected]:
-                        point = tuple(np.round(servo_pixel(statistics[selected])).astype(int))
+                        overlay = draw_overlay(cv2.cvtColor(color_rgb, cv2.COLOR_RGB2BGR), masks, statistics, selected)
+                    if yolo_valid_roi is not None:
+                        x0, y0, x1, y1 = yolo_valid_roi
+                        cv2.rectangle(overlay, (x0, y0), (x1 - 1, y1 - 1), (0, 255, 255), 2)
+                        cv2.putText(
+                            overlay,
+                            f"YOLO valid target region {self.args.yolo_center_fraction:.0%}",
+                            (x0 + 8, max(y0 + 24, 24)),
+                            cv2.FONT_HERSHEY_SIMPLEX,
+                            0.6,
+                            (0, 255, 255),
+                            2,
+                            cv2.LINE_AA,
+                        )
+                    if selected is not None and (
+                        "yolo_box_grasp_pixel_px" in statistics[selected]
+                        or statistics[selected].get("step_pose", {}).get("accepted")
+                    ):
+                        selected_item = statistics[selected]
+                        point = tuple(np.round(servo_pixel(selected_item)).astype(int))
                         cv2.drawMarker(overlay, point, (0, 0, 255), cv2.MARKER_CROSS, 22, 2)
-                        source = "YOLO" if self.args.detector == "yolo" else "SAM"
-                        cv2.putText(overlay, f"{source} grasp bottom-45%", (point[0] + 10, point[1] - 10), cv2.FONT_HERSHEY_SIMPLEX, .55, (0, 0, 255), 2)
+                        step_pose = selected_item.get("step_pose", {})
+                        if step_pose.get("accepted"):
+                            for model_index, matched in zip(
+                                step_pose.get("matched_model_indices", []),
+                                step_pose.get("matched_pixels", []),
+                            ):
+                                hole_point = tuple(np.round(matched).astype(int))
+                                cv2.circle(overlay, hole_point, 5, (0, 255, 0), 2)
+                                cv2.putText(
+                                    overlay, str(model_index),
+                                    (hole_point[0] + 6, hole_point[1] - 6),
+                                    cv2.FONT_HERSHEY_SIMPLEX, .45, (0, 255, 0), 2,
+                                )
+                            cv2.putText(
+                                overlay, "STEP grasp projection",
+                                (point[0] + 10, point[1] - 10),
+                                cv2.FONT_HERSHEY_SIMPLEX, .55, (0, 0, 255), 2,
+                            )
+                        else:
+                            cv2.putText(
+                                overlay,
+                                f"YOLO grasp bottom-up-{self.args.yolo_box_height_fraction:.0%}",
+                                (point[0] + 10, point[1] - 10),
+                                cv2.FONT_HERSHEY_SIMPLEX, .55, (0, 0, 255), 2,
+                            )
                         sam_selected = sam_review.get("sam_selected")
                         if sam_selected is not None and sam_selected.get("bbox_xyxy") is not None:
                             x0, y0, x1, y1 = (int(round(value)) for value in sam_selected["bbox_xyxy"])
                             cv2.rectangle(overlay, (x0, y0), (x1, y1), (255, 0, 255), 2)
-                            cv2.putText(overlay, "SAM full mask bbox", (x0, max(20, y0 - 8)), cv2.FONT_HERSHEY_SIMPLEX, .55, (255, 0, 255), 2)
-                    target_pixel = urdf_target_pixel_px
+                            cv2.putText(overlay, "review bbox", (x0, max(20, y0 - 8)), cv2.FONT_HERSHEY_SIMPLEX, .55, (255, 0, 255), 2)
+                    target_pixel = screen_target_pixel_px
                     if target_pixel is not None:
                         target_point = tuple(np.round(target_pixel).astype(int))
                         cv2.drawMarker(overlay, target_point, (0, 255, 255), cv2.MARKER_TILTED_CROSS, 22, 2)
                         cv2.putText(overlay, "servo target", (target_point[0] + 10, target_point[1] + 20), cv2.FONT_HERSHEY_SIMPLEX, .55, (0, 255, 255), 2)
                     ok, encoded = cv2.imencode(".jpg", overlay, [cv2.IMWRITE_JPEG_QUALITY, 82])
                     if ok:
-                        self.shared.update(encoded.tobytes(), {"state": phase["state"], "sequence": self._sequence, "selected_mask_index": selected, "selected": None if selected is None else statistics[selected], "shaft_association": shaft_association, "detector": self.args.detector, "inference_ms": round(snapshot["inference_ms"], 1), "grasp_reason": phase["reason"], "safety": "常驻感知线程独占相机、YOLO/SAM3 与网页更新；动作状态机仅消费最新快照。"})
+                        self.shared.update(encoded.tobytes(), {"state": phase["state"], "sequence": self._sequence, "selected_mask_index": selected, "selected": None if selected is None else statistics[selected], "screen_gripper_target_pixel_px": screen_target_pixel_px.tolist(), "height_reference": height_reference_detail, "shaft_association": shaft_association, "detector": self.args.detector, "yolo_valid_roi_xyxy": None if yolo_valid_roi is None else list(yolo_valid_roi), "yolo_valid_region_fraction": None if yolo_valid_roi is None else self.args.yolo_center_fraction, "inference_ms": round(snapshot["inference_ms"], 1), "grasp_reason": phase["reason"], "safety": "常驻感知线程独占相机、YOLO 与网页更新；动作状态机仅消费最新快照。"})
         except Exception as exc:
             with self._condition:
                 self._failure = exc
@@ -1356,14 +1616,22 @@ class SnapshotVisualMailbox:
 
     def __init__(self, perception: PersistentPerception, *, initial_center_px, track_max_distance_px,
                  target_lost_frames, target_pixel_px=None, pixel_jacobian=None,
-                 pixel_tolerance_px=0.0, max_xy_step_m=0.0, allow_xy_correction=True):
+                 pixel_tolerance_px=0.0, max_xy_step_m=0.0, allow_xy_correction=True,
+                 target_lost_timeout_s: float | None = None,
+                 visual_tolerance_m: float = 0.0, target_pixel_provider=None):
         self.perception = perception
         self.center = np.asarray(initial_center_px, dtype=np.float64)
         self.track_max_distance_px = track_max_distance_px
         self.target_lost_frames = target_lost_frames
+        self.target_lost_timeout_s = target_lost_timeout_s
         self.target_pixel_px, self.pixel_jacobian = target_pixel_px, pixel_jacobian
+        self.target_pixel_provider = target_pixel_provider
         self.pixel_tolerance_px, self.max_xy_step_m = pixel_tolerance_px, max_xy_step_m
+        self.visual_tolerance_m = float(visual_tolerance_m)
+        if not math.isfinite(self.visual_tolerance_m) or self.visual_tolerance_m < 0.0:
+            raise ValueError("visual_tolerance_m must be finite and non-negative")
         self.lost_frames = 0
+        self.lost_since: float | None = None
         self.allow_xy_correction = allow_xy_correction
 
     def newer_than(self, sequence: int) -> dict | None:
@@ -1374,18 +1642,29 @@ class SnapshotVisualMailbox:
         selected = min(nearby, key=lambda index: float(np.linalg.norm(np.asarray(snapshot["statistics"][index]["center_px"], dtype=np.float64) - self.center)), default=None)
         if selected is None:
             self.lost_frames += 1
+            now = time.monotonic()
+            if self.lost_since is None:
+                self.lost_since = now
+            lost_duration_s = now - self.lost_since
+            lost = (
+                lost_duration_s >= self.target_lost_timeout_s
+                if self.target_lost_timeout_s is not None
+                else self.lost_frames >= self.target_lost_frames
+            )
             return {
                 "sequence": snapshot["sequence"],
-                "valid": False if self.lost_frames >= self.target_lost_frames else None,
+                "valid": False if lost else None,
                 "reason": (
                     "locked_target_lost"
-                    if self.lost_frames >= self.target_lost_frames
+                    if lost
                     else "locked_target_missing_pending"
                 ),
                 "lost_frames": self.lost_frames,
+                "lost_duration_s": round(lost_duration_s, 3),
                 "last_center_px": self.center.tolist(),
             }
         self.lost_frames = 0
+        self.lost_since = None
         item = snapshot["statistics"][selected]
         if self.allow_xy_correction and self.target_pixel_px is not None and "step_pose" in item and not item["step_pose"].get("accepted"):
             return {"sequence": snapshot["sequence"], "valid": False, "reason": "step_pose_lost"}
@@ -1393,6 +1672,14 @@ class SnapshotVisualMailbox:
         result = {"sequence": snapshot["sequence"], "valid": True, "selected_mask_index": selected, "center_px": self.center.tolist(), "area_px": int(item["area_px"]), "sam3_confidence": item.get("sam3_confidence"), "yolo_confidence": item.get("yolo_confidence")}
         if not self.allow_xy_correction:
             return result
+        if self.target_pixel_provider is not None:
+            target = self.target_pixel_provider(item)
+            if target is not None:
+                target = np.asarray(target, dtype=np.float64)
+                if target.shape != (2,) or not np.isfinite(target).all():
+                    raise ValueError("visual target pixel provider returned an invalid target")
+                self.target_pixel_px = target
+                result["target_pixel_px"] = target.tolist()
         if self.target_pixel_px is not None and self.pixel_jacobian is not None:
             metric = item.get("step_pose", {}).get("base_xy_error_m")
             if metric is not None:
@@ -1403,8 +1690,20 @@ class SnapshotVisualMailbox:
                 return result
             error = np.asarray(servo_pixel(item)) - np.asarray(self.target_pixel_px, dtype=np.float64)
             result["pixel_error_px"] = error.tolist()
-            if float(np.linalg.norm(error)) > self.pixel_tolerance_px:
-                result["delta_base_m"] = empirical_horizontal_base_delta_from_pixel_error(error, self.pixel_jacobian, max_step_m=self.max_xy_step_m).tolist()
+            if self.visual_tolerance_m > 0.0:
+                jacobian = np.asarray(self.pixel_jacobian, dtype=np.float64)
+                visual_delta = np.linalg.solve(jacobian, -error)
+                visual_error_m = float(np.linalg.norm(visual_delta))
+                if not math.isfinite(visual_error_m):
+                    raise ValueError("visual-servo estimated XY error is not finite")
+                result["visual_error_m"] = visual_error_m
+                if visual_error_m <= self.visual_tolerance_m:
+                    return result
+            elif float(np.linalg.norm(error)) <= self.pixel_tolerance_px:
+                return result
+            result["delta_base_m"] = empirical_horizontal_base_delta_from_pixel_error(
+                error, self.pixel_jacobian, max_step_m=self.max_xy_step_m
+            ).tolist()
         return result
 
 
@@ -1597,13 +1896,305 @@ def stop_force_descent_sam_preview(stop: threading.Event | None, worker: threadi
         worker.join(timeout=1.0)
 
 
+def run_head_coarse_approach_in_process(*, gdk, controller: G2Controller, tf, args, head_model_path: Path, log,
+                                        shared: SharedView | None = None) -> tuple[threading.Event | None, threading.Thread | None, dict]:
+    """Locate the leftmost head-camera hinge and move above it in this GDK session."""
+    try:
+        tcp_end_m = np.asarray([float(value) for value in args.step_tcp_end_mm.split(",")], dtype=float) / 1000.0
+        if tcp_end_m.shape != (3,) or not np.isfinite(tcp_end_m).all():
+            raise ValueError
+    except ValueError as exc:
+        raise SafetyError("--step-tcp-end-mm 必须是三个有限数值") from exc
+
+    fixed_orientation = fixed_forward_down_orientation(
+        forward_yaw_deg=args.head_forward_yaw_deg,
+        gripper_pitch_deg=args.head_gripper_pitch_deg,
+        gripper_roll_deg=args.head_gripper_roll_deg,
+    )
+    head_camera = gdk.Camera([gdk.CameraType.kHeadColor, gdk.CameraType.kHeadDepth])
+    head_model = None
+    head_preview_stop: threading.Event | None = None
+    head_preview_thread: threading.Thread | None = None
+    head_coarse_context: dict | None = None
+    preview_transferred = False
+    try:
+        head_model = load_yolo_segmentation_model(head_model_path, device=args.yolo_device)
+        depth_to_color = transform_to_dict(tf.get_tf_from_sensor(gdk.SensorExtrinsicType.kHeadDepthToHeadColor))
+        head_from_color = transform_to_dict(tf.get_tf_from_sensor(gdk.SensorExtrinsicType.kHeadRGBDToHeadLink3))
+        color_intrinsic = depth_intrinsic = None
+        observations: list[np.ndarray] = []
+        tf_modes: list[str] = []
+        tf_gaps_ms: list[float] = []
+        last_timestamp = None
+        # Keep collecting until the requested number of valid samples is
+        # available.  A temporary occlusion or a slow head-camera stream must
+        # not abort the whole workflow after an arbitrary wall-clock timeout.
+        while len(observations) < args.head_samples:
+            color = head_camera.get_latest_image(gdk.CameraType.kHeadColor, 1000.0)
+            timestamp_ns = int(color.timestamp_ns)
+            if timestamp_ns == last_timestamp:
+                time.sleep(0.01)
+                continue
+            last_timestamp = timestamp_ns
+            base_from_head, tf_mode, tf_gap_ms = base_from_head_at(tf, timestamp_ns)
+            depth = head_camera.get_nearest_image(gdk.CameraType.kHeadDepth, timestamp_ns, 1000.0)
+            bgr = cv2.cvtColor(decode_color_rgb(color, gdk), cv2.COLOR_RGB2BGR)
+            depth_u16 = decode_depth_u16(depth, gdk)
+            if color_intrinsic is None:
+                color_intrinsic = intrinsic_to_dict(
+                    head_camera.get_camera_intrinsic(gdk.CameraType.kHeadColor), width=int(color.width), height=int(color.height),
+                )
+                depth_intrinsic = intrinsic_to_dict(
+                    head_camera.get_camera_intrinsic(gdk.CameraType.kHeadDepth), width=int(depth.width), height=int(depth.height),
+                )
+            aligned = align_depth_to_color(
+                depth_u16, depth_intrinsic=depth_intrinsic, color_intrinsic=color_intrinsic,
+                depth_to_color=depth_to_color, depth_scale_m=DEPTH_SCALE_M,
+            )
+            masks, scores, classes = infer_yolo_masks(
+                head_model, bgr, confidence=args.head_yolo_confidence, imgsz=640, device=args.yolo_device,
+            )
+            selected = select_leftmost_hinge(masks, scores, classes)
+            if shared is not None:
+                overlay = draw_head_coarse_overlay(
+                    bgr, masks, scores, classes, selected, len(observations), args.head_samples,
+                )
+                ok, encoded = cv2.imencode(".jpg", overlay, [cv2.IMWRITE_JPEG_QUALITY, 82])
+                if ok:
+                    shared.update(encoded.tobytes(), {
+                        "state": "head_coarse_localizing",
+                        "source": "head_yolo",
+                        "sequence": int(time.monotonic_ns()),
+                        "selected_mask_index": selected,
+                        "collected_samples": len(observations),
+                        "required_samples": args.head_samples,
+                        "safety": "头部 RGB-D 正在定位最左铰链；尚未发送左手靠近目标。",
+                    })
+            if selected is None:
+                continue
+            _inliers, points = depth_points(masks[selected], aligned, DEPTH_SCALE_M, color_intrinsic)
+            if len(points) < 20:
+                continue
+            point_color = np.median(points, axis=0)
+            observations.append(np.asarray(apply_transform(
+                base_from_head, apply_transform(head_from_color, point_color),
+            ), dtype=float))
+            tf_modes.append(tf_mode)
+            tf_gaps_ms.append(tf_gap_ms)
+        hinge_base, inlier_mask, spread_m = dominant_sample_cluster(
+            np.asarray(observations), args.head_max_sample_spread_mm / 1000.0,
+        )
+        inlier_count = int(np.count_nonzero(inlier_mask))
+        if inlier_count < args.head_min_inlier_samples:
+            raise SafetyError(
+                f"头部铰链样本没有足够一致的主簇：{inlier_count}/{len(observations)} 个样本在 "
+                f"{args.head_max_sample_spread_mm:.1f} mm 内，至少需要 {args.head_min_inlier_samples} 个"
+            )
+        localization = {
+            "event": "head_leftmost_hinge_localized", "motion_enabled": True,
+            "samples": len(observations), "inlier_samples": inlier_count,
+            "rejected_samples": len(observations) - inlier_count,
+            "sample_spread_mm": round(spread_m * 1000.0, 2),
+            "max_sample_spread_mm": args.head_max_sample_spread_mm,
+            "tf_modes": [mode for mode, keep in zip(tf_modes, inlier_mask) if keep],
+            "max_tf_fallback_gap_ms": round(max(gap for gap, keep in zip(tf_gaps_ms, inlier_mask) if keep), 3),
+            "hinge_position_base_link_m": [float(value) for value in hinge_base],
+        }
+        print(json.dumps(localization, ensure_ascii=False), flush=True)
+        json_record(log, localization)
+
+        # Hand the already-open head camera/model to a read-only preview
+        # worker before the arm starts moving.  This keeps the head image live
+        # during the coarse approach as well as during the later hand motion,
+        # without initializing GDK or loading the model a second time.
+        if shared is not None:
+            head_preview_stop, head_preview_thread = start_head_camera_web_preview(
+                gdk=gdk, head_model_path=head_model_path, args=args, shared=shared,
+                camera=head_camera, model=head_model,
+            )
+            head_camera = None
+            head_model = None
+
+        controller.set_control_mode(1)
+        current = controller.read_end_effector_pose(LEFT_VISUAL_TIP_LINK)
+        orientation_error_deg = quaternion_angle_deg(current.orientation_xyzw, fixed_orientation)
+        if orientation_error_deg > 0.05:
+            stream = controller.start_left_end_effector_position_stream(
+                current, rate_hz=50.0, life_time_s=0.10, max_translation_velocity_mps=0.001,
+                allow_orientation_change=True, max_angular_velocity_rad_s=math.radians(20.0),
+            )
+            try:
+                orientation_target = CartesianPoseTarget(current.position_m, fixed_orientation)
+                stream.update_target(orientation_target)
+                timeout_s = max(5.0, orientation_error_deg / 20.0 + 3.0)
+                if not stream.wait_until_target(timeout_s):
+                    raise SafetyError("左手末端姿态调整命令未在限定时间内完成")
+                current = wait_actual_left_target(
+                    controller, stream, orientation_target, timeout_s=timeout_s + 5.0,
+                    tolerance_m=0.005, orientation_tolerance_deg=2.0,
+                )
+            finally:
+                stream.stop()
+        target = gripper_end_target(hinge_base, current.orientation_xyzw, tcp_end_m, args.head_above_mm / 1000.0)
+        travel_mm = float(np.linalg.norm(np.asarray(target.position_m) - np.asarray(current.position_m)) * 1000.0)
+        if travel_mm > 450.0:
+            raise SafetyError(f"当前末端到头部目标直线距离 {travel_mm:.1f} mm，超过 450.0 mm")
+        start = {"event": "left_above_hinge_motion_start", "travel_mm": round(travel_mm, 2),
+                 "xy_speed_mm_s": args.xy_speed_mm_s,
+                 "target_end_link_base_m": list(target.position_m), "orientation_xyzw": list(target.orientation_xyzw)}
+        print(json.dumps(start, ensure_ascii=False), flush=True)
+        json_record(log, start)
+        stream = controller.start_left_end_effector_position_stream(
+            current, rate_hz=50.0, life_time_s=0.10,
+            max_translation_velocity_mps=args.xy_speed_mm_s / 1000.0,
+        )
+        try:
+            stream.update_target(target)
+            if not stream.wait_until_target(travel_mm / args.xy_speed_mm_s + 2.0):
+                raise SafetyError("左手位姿流未在限定时间内发送到目标")
+            actual = wait_actual_left_target(
+                controller, stream, target, timeout_s=max(5.0, travel_mm / args.xy_speed_mm_s), tolerance_m=0.010,
+            )
+        finally:
+            stream.stop()
+        actual_center = gripper_end_target(np.asarray(actual.position_m), actual.orientation_xyzw, -tcp_end_m, 0.0).position_m
+        xy_error_mm = float(np.linalg.norm(np.asarray(actual_center[:2]) - hinge_base[:2]) * 1000.0)
+        if xy_error_mm > args.head_xy_tolerance_mm:
+            raise SafetyError(
+                f"夹持中心与头部铰链目标水平误差 {xy_error_mm:.1f} mm，"
+                f"超过 {args.head_xy_tolerance_mm:.1f} mm；不进入左手视觉伺服"
+            )
+        arrived = {"event": "left_above_hinge_arrived", "grasp_center_xy_error_mm": round(xy_error_mm, 2),
+                   "actual_end_link_base_m": list(actual.position_m), "gdk_session": "reused"}
+        print(json.dumps(arrived, ensure_ascii=False), flush=True)
+        json_record(log, arrived)
+        preview_transferred = True
+        return head_preview_stop, head_preview_thread, {
+            "hinge_position_base_link_m": [float(value) for value in hinge_base],
+            "target_end_link_base_m": [float(value) for value in target.position_m],
+            "actual_end_link_base_m": [float(value) for value in actual.position_m],
+        }
+    finally:
+        if not preview_transferred and head_preview_stop is not None:
+            stop_head_camera_web_preview(head_preview_stop, head_preview_thread)
+        if head_camera is not None:
+            try:
+                head_camera.close_camera()
+            except Exception:
+                pass
+        if head_model is not None:
+            del head_model
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
+
+def start_head_camera_web_preview(*, gdk, head_model_path: Path, args,
+                                  shared: SharedView | None, camera=None, model=None):
+    """Keep the head RGB/YOLO view updating during coarse approach.
+
+    Head preview is read-only: it never queries robot state or sends a
+    command.  It uses the same initialized GDK session as the grasp process;
+    the caller stops it before the left D405 perception stage begins.
+    """
+    if shared is None:
+        return None, None
+    stop = threading.Event()
+    provided_camera = camera
+    provided_model = model
+
+    def run() -> None:
+        camera = provided_camera
+        model = provided_model
+        sequence = 0
+        last_timestamp = None
+        try:
+            if camera is None:
+                camera = gdk.Camera([gdk.CameraType.kHeadColor])
+            if model is None:
+                model = load_yolo_segmentation_model(head_model_path, device=args.yolo_device)
+            while not stop.is_set():
+                try:
+                    image = camera.get_latest_image(gdk.CameraType.kHeadColor, 1000.0)
+                    timestamp_ns = int(image.timestamp_ns)
+                    if timestamp_ns == last_timestamp:
+                        stop.wait(0.01)
+                        continue
+                    last_timestamp = timestamp_ns
+                    bgr = cv2.cvtColor(decode_color_rgb(image, gdk), cv2.COLOR_RGB2BGR)
+                    masks, scores, classes = infer_yolo_masks(
+                        model, bgr, confidence=args.head_yolo_confidence,
+                        imgsz=640, device=args.yolo_device,
+                    )
+                    selected = select_leftmost_hinge(masks, scores, classes)
+                    overlay = draw_head_coarse_overlay(bgr, masks, scores, classes, selected, 0, 0)
+                    cv2.putText(
+                        overlay, "HEAD camera live during coarse approach",
+                        (12, 54), cv2.FONT_HERSHEY_SIMPLEX, 0.62,
+                        (0, 255, 255), 2, cv2.LINE_AA,
+                    )
+                    ok, encoded = cv2.imencode(".jpg", overlay, [cv2.IMWRITE_JPEG_QUALITY, 82])
+                    if not ok:
+                        raise RuntimeError("头部相机叠加图 JPEG 编码失败")
+                    sequence += 1
+                    shared.update(encoded.tobytes(), {
+                        "state": "head_camera_live",
+                        "source": "head_yolo_preview",
+                        "sequence": sequence,
+                        "camera_timestamp_ns": timestamp_ns,
+                        "selected_mask_index": selected,
+                        "detection_count": len(masks),
+                        "head_yolo_confidence": args.head_yolo_confidence,
+                        "safety": "头部相机仅用于实时网页预览，不参与左手运动控制。",
+                    })
+                except Exception as exc:
+                    sequence += 1
+                    shared.update(None, {
+                        "state": "head_camera_preview_error",
+                        "source": "head_yolo_preview",
+                        "sequence": sequence,
+                        "error": str(exc),
+                    })
+                    if stop.wait(0.25):
+                        break
+        except Exception as exc:
+            sequence += 1
+            shared.update(None, {
+                "state": "head_camera_preview_stopped",
+                "source": "head_yolo_preview",
+                "sequence": sequence,
+                "error": str(exc),
+            })
+        finally:
+            if camera is not None:
+                try:
+                    camera.close_camera()
+                except Exception:
+                    pass
+            del model
+
+    worker = threading.Thread(target=run, name="head-camera-web-preview", daemon=True)
+    worker.start()
+    return stop, worker
+
+
+def stop_head_camera_web_preview(stop: threading.Event | None,
+                                 worker: threading.Thread | None) -> None:
+    if stop is None:
+        return
+    stop.set()
+    if worker is not None and worker is not threading.current_thread():
+        worker.join(timeout=2.0)
+
+
 def main() -> int:
     args = parse_args()
     if not (
         0 <= args.threshold <= 1
         and 0 <= args.yolo_confidence <= 1
         and 0 <= args.yolo_target_confidence <= 1
+        and 0.5 <= args.head_yolo_confidence <= 1
         and args.yolo_imgsz > 0
+        and 0.0 < args.yolo_center_fraction <= 1.0
         and args.shaft_association_max_distance_px > 0
         and args.shaft_association_max_horizontal_distance_px > 0
         and args.shaft_association_ambiguity_margin_px >= 0
@@ -1612,6 +2203,8 @@ def main() -> int:
         and args.sam_review_max_pixel_error > 0
         and args.sam_review_max_depth_error_m > 0
         and 0.0 <= args.yolo_box_height_fraction <= 1.0
+        and math.isfinite(args.head_above_mm)
+        and 1.0 <= args.head_above_mm <= 500.0
         and args.min_area >= 1
         and args.min_valid_depth_pixels >= 1
         and args.warmup >= 0
@@ -1620,16 +2213,18 @@ def main() -> int:
         and 0.0 < args.track_max_depth_jump_m <= 0.20
         and args.track_hold_frames >= 0
         and 0 <= args.web_port <= 65535
-        and 0.0 < args.preset_velocity_rad_s <= 0.15
+        and 0.0 < args.preset_velocity_rad_s
         and (
             args.auto_preset_velocity_rad_s is None
-            or 0.0 < args.auto_preset_velocity_rad_s <= 0.15
+            or 0.0 < args.auto_preset_velocity_rad_s
         )
         and 0.001 <= args.preset_arrival_tolerance_rad <= 0.10
         and 1.0 <= args.preset_timeout_s <= 30.0
         and 1.0 <= args.pre_final_settle_timeout_s <= 10.0
         and 0.0 < args.final_descent_visual_max_step_m <= 0.002
         and 0.0 <= args.final_descent_visual_max_total_m <= 0.050
+        and math.isfinite(args.final_descent_visual_tolerance_mm)
+        and args.final_descent_visual_tolerance_mm > 0.0
         and 1 <= args.final_descent_target_lost_frames <= 10
         and 0.0 <= args.regrasp_retract_m <= 0.15
         and 0.005 <= args.post_grasp_verify_lift_m <= 0.050
@@ -1638,6 +2233,7 @@ def main() -> int:
         and 0.02 <= args.post_grasp_verify_area_change_fraction <= 0.50
         and 0.002 <= args.post_grasp_verify_depth_change_m <= 0.050
         and 0.50 <= args.post_grasp_monitor_max_stale_s <= 5.0
+        and 0.10 <= args.post_grasp_target_lost_timeout_s <= 30.0
     ):
         print("参数错误：检测、预热、跟踪参数无效。", file=sys.stderr)
         return 2
@@ -1655,9 +2251,12 @@ def main() -> int:
                 stop_after=args.stop_after,
             ),
         )
+        height_samples = None
+        if args.height_reference is not None:
+            height_samples = load_height_samples(args.height_reference)
         if args.step_profile is not None:
-            if (not args.step_metric_xy and args.step_reference is None) or parameters is None or args.detector != "yolo-sam":
-                raise ValueError("STEP mode requires --step-reference, calibrated config and yolo-sam detector")
+            if (not args.step_metric_xy and args.step_reference is None) or parameters is None or args.detector != "yolo":
+                raise ValueError("STEP mode requires --step-reference, calibrated config and YOLO detector")
             args.step_geometry = load_profile(args.step_profile)
             args.final_descent_visual_servo = True
             if args.step_metric_xy:
@@ -1667,19 +2266,16 @@ def main() -> int:
                     raise ValueError("invalid approximate TCP / XY compensation / tolerance")
             else:
                 args.step_alignment = load_alignment_reference(args.step_reference, args.step_geometry)
+                args.step_height_samples = args.step_alignment.get("height_samples")
                 parameters = replace(parameters, target_u_px=args.step_alignment["target_pixel_px"][0], target_v_px=args.step_alignment["target_pixel_px"][1])
         elif args.step_metric_xy:
             raise ValueError("--step-metric-xy requires --step-profile")
-        args.urdf_gripper_center_end_m = urdf_gripper_center_end_m(
-            args.urdf.expanduser().resolve(),
-            -0.51025 if gripper_open is None else gripper_open,
-        )
     except Exception as exc:
         print(f"抓取配置无效：{exc}", file=sys.stderr)
         return 2
     base_speed_mm_s = 10.0 if parameters is None else parameters.final_descent_speed_mps * 1000.0
-    if not math.isfinite(args.xy_speed_mm_s) or not 1 <= args.xy_speed_mm_s <= 30:
-        print("--xy-speed-mm-s must be in [1, 30]", file=sys.stderr)
+    if not math.isfinite(args.xy_speed_mm_s) or args.xy_speed_mm_s <= 0.0:
+        print("--xy-speed-mm-s must be a positive finite value", file=sys.stderr)
         return 2
     if args.speed_mm_s is not None and args.speed_scale is not None:
         print("--speed-mm-s 与旧兼容参数 --speed-scale 不能同时使用。", file=sys.stderr)
@@ -1688,8 +2284,8 @@ def main() -> int:
         speed_mm_s = base_speed_mm_s if args.speed_scale is None else base_speed_mm_s * args.speed_scale
     else:
         speed_mm_s = args.speed_mm_s
-    if not math.isfinite(speed_mm_s) or not 1.0 <= speed_mm_s <= 18.0:
-        print("参数错误：--speed-mm-s 必须在 1～18 mm/s 之间。", file=sys.stderr)
+    if not math.isfinite(speed_mm_s) or not speed_mm_s > 0.0:
+        print("参数错误：--speed-mm-s 必须是正的有限值。", file=sys.stderr)
         return 2
     if (
         not 1.0 <= args.spacemouse_speed_mm_s <= 30.0
@@ -1708,8 +2304,8 @@ def main() -> int:
         else args.auto_preset_velocity_rad_s
     )
     motion_preset_timeout_s = args.preset_timeout_s
-    if motion_preset_velocity_rad_s > 0.15:
-        print("参数错误：该速度会超过 GDK 预设关节速度上限 0.15 rad/s。", file=sys.stderr)
+    if not math.isfinite(motion_preset_velocity_rad_s) or motion_preset_velocity_rad_s <= 0.0:
+        print("参数错误：自动关节预设速度必须是正的有限值。", file=sys.stderr)
         return 2
     if parameters is not None:
         # The duration encodes the maximum descent distance, not a separate
@@ -1723,18 +2319,20 @@ def main() -> int:
     premove_presets: list[tuple[str, list[float]]] | None = None
     post_grasp_presets: list[tuple[str, list[float]]] | None = None
     handoff_presets: list[tuple[str, list[float]]] | None = None
+    workflow_home_target: list[float] | None = None
     if args.full_cycle:
         try:
+            workflow_home_target = load_workflow_home(args.poses, args.home_pose_name)
             if not args.head_coarse_approach:
                 premove_presets = load_premove_presets(args.poses)
             post_grasp_presets = load_post_grasp_presets(args.poses)
             if args.wait_for_next:
                 handoff_presets = load_premove_presets(args.poses, HANDOFF_PRESETS)
         except Exception as exc:
-            print(f"全流程姿态文件无效：{exc}", file=sys.stderr)
+            print(f"全流程姿态文件无效（含双臂归位点）：{exc}", file=sys.stderr)
             return 2
     if not torch.cuda.is_available():
-        print("未检测到 CUDA，不能运行实时 SAM3。", file=sys.stderr)
+        print("未检测到 CUDA，当前 YOLO 实时流程无法运行。", file=sys.stderr)
         return 2
     checkpoint = Path(args.checkpoint).expanduser().resolve()
     if args.detector in {"yolo-sam", "sam3"} and not checkpoint.is_file():
@@ -1744,6 +2342,7 @@ def main() -> int:
     if args.detector in {"yolo", "yolo-sam"} and not yolo_model_path.is_file():
         print(f"找不到 G2 原生 YOLO 权重：{yolo_model_path}", file=sys.stderr)
         return 2
+    head_model_path: Path | None = None
     if args.head_coarse_approach:
         if not args.full_cycle or not args.allow_motion:
             print("--head-coarse-approach 必须与 --full-cycle --allow-motion 共用。", file=sys.stderr)
@@ -1752,34 +2351,9 @@ def main() -> int:
         if not head_model_path.is_file():
             print(f"找不到头部 YOLO 权重：{head_model_path}", file=sys.stderr)
             return 2
-        command = [
-            sys.executable, str(PROJECT_ROOT / "g2_adapter" / "move_left_above_head_hinge_gdk.py"),
-            "--yolo-model", str(head_model_path),
-            "--above-mm", str(args.head_above_mm),
-            "--head-xy-tolerance-mm", str(args.head_xy_tolerance_mm),
-            "--forward-yaw-deg", str(args.head_forward_yaw_deg),
-            "--gripper-pitch-deg", str(args.head_gripper_pitch_deg),
-            "--gripper-roll-deg", str(args.head_gripper_roll_deg),
-            "--tcp-end-mm", args.step_tcp_end_mm,
-            "--poses", str(args.poses.expanduser()),
-            "--orientation-only",
-            "--speed-mm-s", str(args.xy_speed_mm_s),
-            "--preset-velocity-rad-s", str(motion_preset_velocity_rad_s),
-            "--allow-motion",
-        ]
-        print(json.dumps({"event":"head_coarse_approach_start", "command":command}, ensure_ascii=False), flush=True)
-        result = subprocess.run(command, cwd=PROJECT_ROOT)
-        if result.returncode != 0:
-            print("头部粗定位未到位；不启动左手 D405 视觉伺服。", file=sys.stderr)
-            return int(result.returncode)
-        print(json.dumps({"event":"head_coarse_approach_complete", "xy_tolerance_mm":args.head_xy_tolerance_mm}, ensure_ascii=False), flush=True)
-        # gdk_release() tears down DDS asynchronously.  Starting a new GDK
-        # client immediately can consume the previous config response and
-        # produce a UUID mismatch on the first camera-intrinsic request.
-        time.sleep(1.0)
-    # Importing agibot_gdk starts its DDS runtime even before gdk_init().  Keep
-    # this import after the coarse child has fully released GDK; otherwise the
-    # parent and child create overlapping python3.12_S1 DDS nodes.
+    # Head coarse localization and the left D405 grasp now share this one GDK
+    # client.  Do not create a child process: GDK camera/TF configuration is
+    # session-scoped and duplicate initialization can race its DDS responses.
     try:
         import agibot_gdk
     except ImportError:
@@ -1798,14 +2372,18 @@ def main() -> int:
         "selection": args.selection,
         "full_cycle": args.full_cycle,
         "speed_mm_s": speed_mm_s,
+        "xy_speed_mm_s": args.xy_speed_mm_s,
         "speed_scale": speed_scale,
         "preset_velocity_rad_s": motion_preset_velocity_rad_s,
+        "head_yolo_confidence": args.head_yolo_confidence if args.head_coarse_approach else None,
+        "head_above_mm": args.head_above_mm if args.head_coarse_approach else None,
+        "height_reference": None if args.height_reference is None else str(args.height_reference.expanduser().resolve()),
         "preset_timeout_s": motion_preset_timeout_s,
         "poses": None if not args.full_cycle else str(args.poses.expanduser().resolve()),
         "safety": (
-            (("head RGB-D coarse approach (orientation-only at current position)→visual grasp→+Z 150 mm→P3→P4; "
+            ((f"head RGB-D coarse approach ({args.head_above_mm:.0f} mm above hinge)→visual grasp→+Z 150 mm→P3→P4; "
               if args.head_coarse_approach else
-              "single process: preload SAM3, then P1/P2→visual grasp→+Z 150 mm→P3→P4; ")
+              "single process: YOLO P1/P2→visual grasp→+Z 150 mm→P3→P4; ")
              + "one GDK initialization and no extra gripper command after grasp")
             if args.full_cycle else "P1/P2/P3/P4 are not commanded by this program"
         ),
@@ -1820,18 +2398,23 @@ def main() -> int:
     force_preview_stop: threading.Event | None = None
     force_preview_thread: threading.Thread | None = None
     force_preview_phase: dict[str, str] | None = None
+    head_preview_stop: threading.Event | None = None
+    head_preview_thread: threading.Thread | None = None
     web_server: ThreadingHTTPServer | None = None
-    web_shared: SharedView | None = None
+    web_shared: SharedView | CompositeSharedView | None = None
     motion_gate: MotionPauseGate | None = None
     takeover_worker: SpaceMouseTakeoverWorker | None = None
     dianpi_runner: DianpiCycleRunner | None = None
     try:
         if args.web_port:
-            web_shared = SharedView()
-            web_server = ThreadingHTTPServer((args.web_host, args.web_port), handler_class(web_shared))
+            web_shared = CompositeSharedView()
+            web_server = ThreadingHTTPServer(
+                (args.web_host, args.web_port),
+                handler_class(web_shared, title="G2 左手 D405 / YOLO（头部粗定位阶段预览）"),
+            )
             threading.Thread(target=web_server.serve_forever, daemon=True).start()
             model_note = "YOLO 实时分割" if args.detector == "yolo" else "与抓取共用同一 SAM3 模型"
-            print(f"内嵌实时页面：http://{args.web_host}:{args.web_port}（{model_note}）")
+            print(f"内嵌实时页面：http://{args.web_host}:{args.web_port}（头部粗定位阶段双画面；左手阶段仅左手 D405：{model_note}）")
         if agibot_gdk.gdk_init() != agibot_gdk.GDKRes.kSuccess:
             raise RuntimeError("GDK 初始化失败")
         initialized = True
@@ -1848,9 +2431,69 @@ def main() -> int:
         )
         controller.checked_arm_state()
         if args.spacemouse_device:
+            # Keep the RM1010 P10 monitor alive for the whole integrated
+            # process, including the head-camera coarse stage.  The monitor
+            # and SpaceMouse chord share this runner/controller.
             dianpi_runner = DianpiCycleRunner(
                 event_sink=lambda event: print(json.dumps(event, ensure_ascii=False), flush=True),
             )
+            dianpi_runner.start_p10_monitor()
+        if args.full_cycle:
+            assert workflow_home_target is not None
+            print(json.dumps({
+                "event": "workflow_home_start",
+                "preset": args.home_pose_name,
+                "gdk_session": "reused",
+                "target_joint_positions_rad": workflow_home_target,
+            }, ensure_ascii=False), flush=True)
+            home_log = log_path.open("a", encoding="utf-8")
+            try:
+                home_record = move_workflow_home(
+                    controller,
+                    workflow_home_target,
+                    velocity_rad_s=motion_preset_velocity_rad_s,
+                    arrival_tolerance_rad=args.preset_arrival_tolerance_rad,
+                    timeout_s=motion_preset_timeout_s,
+                )
+                home_record["preset"] = args.home_pose_name
+                home_record["utc"] = datetime.now(timezone.utc).isoformat()
+                json_record(home_log, home_record)
+                print(json.dumps(home_record, ensure_ascii=False), flush=True)
+            except Exception as exc:
+                print(f"双臂归位失败：{exc}", file=sys.stderr)
+                return 1
+            finally:
+                home_log.close()
+        tf = agibot_gdk.TF()
+        if args.head_coarse_approach:
+            assert head_model_path is not None
+            print(json.dumps({"event": "head_coarse_approach_start", "gdk_session": "reused"}, ensure_ascii=False), flush=True)
+            # The main perception loop opens ``log`` later in this function.
+            # Use a short-lived handle here so head localization is recorded
+            # without creating a second GDK client or relying on that later
+            # lexical binding.
+            head_log = log_path.open("a", encoding="utf-8")
+            try:
+                head_preview_stop, head_preview_thread, head_coarse_context = run_head_coarse_approach_in_process(
+                    gdk=agibot_gdk, controller=controller, tf=tf, args=args,
+                    head_model_path=head_model_path, log=head_log,
+                    shared=None if web_shared is None else web_shared.pane("head"),
+                )
+            except Exception as exc:
+                print(f"头部铰链定位/左手预移动失败：{exc}", file=sys.stderr)
+                print("头部粗定位未到位；不启动左手 D405 视觉伺服。", file=sys.stderr)
+                return 1
+            finally:
+                head_log.close()
+            print(json.dumps({"event": "head_coarse_approach_complete", "xy_tolerance_mm": args.head_xy_tolerance_mm, "gdk_session": "reused"}, ensure_ascii=False), flush=True)
+            # The coarse head stage is complete.  Do not keep showing its
+            # frame while the left camera/model are being prepared.
+            if head_preview_stop is not None:
+                stop_head_camera_web_preview(head_preview_stop, head_preview_thread)
+                head_preview_stop = head_preview_thread = None
+                if isinstance(web_shared, CompositeSharedView):
+                    web_shared.hide_pane("head")
+        if args.spacemouse_device:
             takeover_worker = SpaceMouseTakeoverWorker(
                 controller,
                 motion_gate,
@@ -1868,18 +2511,17 @@ def main() -> int:
         camera_type = agibot_gdk.CameraType.kHandLeftColor
         depth_type = agibot_gdk.CameraType.kHandLeftDepth
         camera = agibot_gdk.Camera([camera_type] if args.step_profile is not None else [camera_type, depth_type])
-        tf = agibot_gdk.TF()
         processor = None
         yolo_model = None
         if args.detector in {"yolo", "yolo-sam"}:
             print(f"加载 G2 原生 YOLO 主检测器：{yolo_model_path}", flush=True)
             yolo_model = load_yolo_segmentation_model(yolo_model_path, device=args.yolo_device)
-        # From this point onward the worker is the sole camera/model owner.
-        # Do not add a second Camera reader or SAM3 thread for a motion phase.
+        # The left worker remains the sole owner of the hand camera/model.
         perception = PersistentPerception(
             camera=camera, color_type=camera_type, depth_type=depth_type,
             gdk=agibot_gdk, tf=tf, processor=processor, yolo_model=yolo_model,
-            args=args, shared=web_shared, yolo_model_path=yolo_model_path,
+            args=args, shared=None if web_shared is None else web_shared.pane("left"),
+            yolo_model_path=yolo_model_path,
         )
         perception.start()
         coarse_parameters = None
@@ -1891,6 +2533,12 @@ def main() -> int:
         color_intrinsic = depth_intrinsic = depth_to_color = end_link_transform = None
         tracked_center: np.ndarray | None = None
         tracked_depth_m: float | None = None
+        last_height_target_pixel: np.ndarray | None = None
+        last_height_target_detail: dict | None = None
+        if height_samples:
+            last_height_target_pixel, last_height_target_detail = interpolate_target_pixel(
+                height_samples, height_samples[-1]["camera_distance_m"],
+            )
         missed_frames = 0
         regrasp_attempts = 0
         last_end_link_target: CartesianPoseTarget | None = None
@@ -1911,6 +2559,7 @@ def main() -> int:
         post_grasp_p4_monitor: dict | None = None
         post_grasp_regrasp_open: dict | None = None
         post_grasp_verify_motion: dict | None = None
+        post_grasp_target_lost_since: float | None = None
         premove_sequence: NonBlockingLeftPresetSequence | None = None
         initial_gripper_open: dict | None = None
         single_xy_verification: dict | None = None
@@ -1936,11 +2585,15 @@ def main() -> int:
                 "speed_scale": speed_scale,
                 "preset_velocity_rad_s": motion_preset_velocity_rad_s,
                 "preset_timeout_s": motion_preset_timeout_s,
+                "height_reference": None if args.height_reference is None else str(args.height_reference.expanduser().resolve()),
+                "workflow_home_pose": args.home_pose_name if args.full_cycle else None,
                 "final_descent_speed_mps": None if parameters is None else parameters.final_descent_speed_mps,
                 "final_descent_duration_s": None if parameters is None else parameters.final_descent_duration_s,
+                "final_descent_visual_servo": args.final_descent_visual_servo,
+                "final_descent_visual_tolerance_mm": args.final_descent_visual_tolerance_mm,
+                "post_grasp_target_lost_timeout_s": args.post_grasp_target_lost_timeout_s,
                 "full_cycle": args.full_cycle,
-                "sam3_preloaded_before_premove": args.full_cycle and not args.head_coarse_approach,
-                "perception_architecture": "one persistent owner: camera + YOLO + periodic SAM3 + web; state machine consumes latest snapshots only",
+                "perception_architecture": "one GDK session; left perception owns hand camera + YOLO, head preview owns head camera + YOLO, state machine consumes latest snapshots only",
             })
             json_record(log, {"event": "gdk_motion_status_before_perception", **controller.motion_status_summary()})
             if args.full_cycle:
@@ -1956,10 +2609,10 @@ def main() -> int:
                 else:
                     assert premove_presets is not None
                     json_record(log, {
-                        "event": "premove_start_after_sam3_preload",
+                        "event": "premove_start_after_yolo_load",
                         "utc": datetime.now(timezone.utc).isoformat(),
                         "presets": [name for name, _ in premove_presets],
-                        "sam3": "loaded",
+                        "detector": "yolo",
                     })
                     premove_sequence = NonBlockingLeftPresetSequence(
                         premove_presets, motion_preset_velocity_rad_s,
@@ -2020,6 +2673,49 @@ def main() -> int:
                     if takeover_worker.advance_requested:
                         return execute_handoff_before_exit()
                     time.sleep(0.01)
+
+            def current_height_reference_target(
+                *, end_link_transform: dict | None, item: dict | None = None,
+            ) -> tuple[np.ndarray, dict] | None:
+                """Interpolate the calibrated screen target without hand depth."""
+                nonlocal last_height_target_pixel, last_height_target_detail
+                if not height_samples:
+                    return None
+                distance_m = None
+                source = None
+                if head_coarse_context is not None and end_link_transform is not None:
+                    try:
+                        actual_pose = measured_left_end_link_pose(controller)
+                        distance_m = camera_distance_from_base_point(
+                            head_coarse_context["hinge_position_base_link_m"],
+                            actual_pose.position_m,
+                            actual_pose.orientation_xyzw,
+                            end_link_transform,
+                        )
+                        source = "head_base_target_and_actual_end_link"
+                    except Exception:
+                        distance_m = None
+                if distance_m is None and item is not None:
+                    xyz = item.get("xyz_color_camera_m")
+                    if xyz is not None:
+                        try:
+                            candidate = float(np.linalg.norm(np.asarray(xyz, dtype=np.float64)))
+                            if math.isfinite(candidate) and candidate > 0.0:
+                                distance_m = candidate
+                                source = "left_hand_depth"
+                        except (TypeError, ValueError):
+                            pass
+                if distance_m is None:
+                    if last_height_target_pixel is None:
+                        return None
+                    detail = dict(last_height_target_detail or {})
+                    detail.update({"mode": "held_last_valid", "source": "last_valid_height_reference"})
+                    return last_height_target_pixel.copy(), detail
+                target, detail = interpolate_target_pixel(height_samples, distance_m)
+                detail = {**detail, "source": source}
+                last_height_target_pixel = target
+                last_height_target_detail = detail
+                return target.copy(), detail
 
             while args.max_frames == 0 or frame < args.max_frames:
                 if takeover_worker is not None:
@@ -2172,8 +2868,8 @@ def main() -> int:
                     continue
                 # Once the part has passed the short visual verification,
                 # transport is advanced by polling only.  Do not enter a
-                # nested wait/sleep loop: the SAM worker keeps the web page
-                # live and the mailbox can still veto the lift.
+                # nested wait/sleep loop: the perception worker keeps the web
+                # page live and the mailbox can still veto the lift.
                 if post_grasp_lift_monitor is not None:
                     assert position_stream is not None
                     position_stream.raise_if_failed()
@@ -2189,6 +2885,7 @@ def main() -> int:
                             reference_area_px=monitor["reference_area_px"],
                             max_center_drift_px=args.post_grasp_verify_center_drift_px,
                             max_area_change_fraction=args.post_grasp_verify_area_change_fraction,
+                            check_geometry=False,
                         )
                         stale_since = monitor.get("stale_since")
                         if stale_since is not None and monitor.get("failure") is None:
@@ -2236,9 +2933,9 @@ def main() -> int:
                         and float(np.linalg.norm(delta[:2])) <= PRE_P4_LIFT_TOLERANCE_M
                     )
                     if monitor.get("failure") is not None:
-                        # The nonblocking monitor detected a dropped/moved
-                        # part. Hold immediately; the existing recovery path
-                        # then opens and restarts visual acquisition.
+                        # The mailbox has confirmed target loss after the
+                        # configured timeout. Hold immediately; the existing
+                        # recovery path then opens and restarts acquisition.
                         position_stream.update_target(CartesianPoseTarget(
                             actual.position_m, last_end_link_target.orientation_xyzw,
                         ))
@@ -2247,7 +2944,7 @@ def main() -> int:
                         assert gripper_open is not None and gripper_tolerance is not None and gripper_close_timeout is not None
                         post_grasp_regrasp_open_stream = controller.start_left_gripper_position_stream(gripper_open)
                         post_grasp_regrasp_open = {
-                            "reason": "held_target_lost_or_changed_during_pre_p4_lift",
+                            "reason": "held_target_lost_after_timeout_during_pre_p4_lift",
                             "monitor": monitor["failure"],
                             "orientation_xyzw": last_end_link_target.orientation_xyzw,
                             "deadline": time.monotonic() + gripper_close_timeout,
@@ -2329,6 +3026,7 @@ def main() -> int:
                                 reference_area_px=monitor["reference_area_px"],
                                 max_center_drift_px=args.post_grasp_verify_center_drift_px,
                                 max_area_change_fraction=args.post_grasp_verify_area_change_fraction,
+                                check_geometry=False,
                             )
                             monitor["awaiting_fresh_observation"] = False
                             if monitor.get("paused"):
@@ -2369,9 +3067,10 @@ def main() -> int:
                             failure = monitor["failure"]
                             # The P4 request has not started yet, so it is
                             # safe to open and reacquire at the verified lift
-                            # pose. Once motion_started is latched below,
-                            # visual results are deliberately ignored until
-                            # the preset sequence arrives.
+                            # pose after the configured target-loss timeout.
+                            # Once motion_started is latched below, visual
+                            # results are deliberately ignored until the
+                            # preset sequence arrives.
                             assert not monitor.get("motion_started")
                             stop_force_descent_sam_preview(force_preview_stop, force_preview_thread)
                             force_preview_stop = force_preview_thread = None
@@ -2379,7 +3078,7 @@ def main() -> int:
                             assert gripper_open is not None and gripper_close_timeout is not None
                             post_grasp_regrasp_open_stream = controller.start_left_gripper_position_stream(gripper_open)
                             post_grasp_regrasp_open = {
-                                "reason": "held_target_lost_or_changed_before_p4",
+                                "reason": "held_target_lost_after_timeout_before_p4",
                                 "monitor": failure,
                                 "orientation_xyzw": last_end_link_target.orientation_xyzw,
                                 "deadline": time.monotonic() + gripper_close_timeout,
@@ -2454,20 +3153,25 @@ def main() -> int:
                     depth_intrinsic = snapshot["depth_intrinsic"]
                     depth_to_color = snapshot["depth_to_color"]
                     end_link_transform = snapshot["end_link_transform"]
-                    urdf_target_pixel_px = np.asarray(snapshot["urdf_gripper_center_pixel_px"], dtype=np.float64)
-                    record["urdf_gripper_center_end_m"] = args.urdf_gripper_center_end_m.tolist()
-                    record["urdf_gripper_center_pixel_px"] = urdf_target_pixel_px.tolist()
+                    screen_target_pixel_px = np.asarray(snapshot["screen_gripper_target_pixel_px"], dtype=np.float64)
+                    height_target = current_height_reference_target(
+                        end_link_transform=end_link_transform,
+                    )
+                    if height_target is not None:
+                        screen_target_pixel_px, record_height_detail = height_target
+                        record["height_reference"] = record_height_detail
+                        perception.set_target_pixel_override(screen_target_pixel_px, record_height_detail)
+                    record["screen_gripper_target_pixel_px"] = screen_target_pixel_px.tolist()
                     if state is not None and args.step_profile is None:
                         parameters = replace(
                             parameters,
-                            target_u_px=float(urdf_target_pixel_px[0]),
-                            target_v_px=float(urdf_target_pixel_px[1]),
+                            target_u_px=float(screen_target_pixel_px[0]),
+                            target_v_px=float(screen_target_pixel_px[1]),
                         )
                         state.fine_parameters = parameters
                         if not state.coarse_active:
                             state.parameters = parameters
                     roi = snapshot["roi"]
-                    crop_bounds = snapshot["crop_bounds"]
                     if args.detector in {"yolo", "yolo-sam"}:
                         record["yolo"] = {
                             "model": str(yolo_model_path),
@@ -2478,8 +3182,6 @@ def main() -> int:
                             "shaft_association": snapshot.get("shaft_association"),
                         }
                     record["eligible_candidate_indices"] = [int(index) for index in candidates]
-                    record["sam_center_crop_xyxy"] = list(crop_bounds)
-                    record["sam_center_crop_fraction"] = 0.70
                     record["effective_roi_xyxy"] = None if roi is None else list(roi)
                     record["candidate_diagnostics"] = [
                         {
@@ -2585,6 +3287,63 @@ def main() -> int:
                         ),
                     })
                     if selected is None:
+                        if (
+                            args.allow_motion
+                            and state is not None
+                            and state.phase == GraspPhase.GRASPED
+                            and gripper_sent_at is not None
+                        ):
+                            loss_now = time.monotonic()
+                            if post_grasp_target_lost_since is None:
+                                post_grasp_target_lost_since = loss_now
+                                record["post_grasp_target_loss"] = {
+                                    "state": "pending",
+                                    "lost_duration_s": 0.0,
+                                    "timeout_s": args.post_grasp_target_lost_timeout_s,
+                                }
+                            elif loss_now - post_grasp_target_lost_since >= args.post_grasp_target_lost_timeout_s:
+                                assert position_stream is not None
+                                assert last_end_link_target is not None
+                                assert gripper_open is not None and gripper_tolerance is not None
+                                assert gripper_close_timeout is not None and parameters is not None
+                                stop_force_descent_sam_preview(force_preview_stop, force_preview_thread)
+                                force_preview_stop = force_preview_thread = None
+                                force_preview_phase = None
+                                lost_duration_s = loss_now - post_grasp_target_lost_since
+                                position_stream, last_end_link_target, recovery = recover_for_visual_regrasp(
+                                    controller,
+                                    position_stream,
+                                    retract_m=args.regrasp_retract_m,
+                                    translation_speed_mps=parameters.final_descent_speed_mps,
+                                    fixed_orientation_xyzw=last_end_link_target.orientation_xyzw,
+                                    gripper_open_rad=gripper_open,
+                                    gripper_tolerance_rad=gripper_tolerance,
+                                    gripper_timeout_s=gripper_close_timeout,
+                                )
+                                regrasp_attempts += 1
+                                state.reset_for_regrasp()
+                                tracked_center = tracked_depth_m = None
+                                missed_frames = 0
+                                gripper_sent_at = adaptive_hold_target_rad = adaptive_hold_sent_at = None
+                                gripper_position_samples.clear()
+                                post_grasp_target_lost_since = None
+                                post_grasp_verify_baseline = None
+                                post_grasp_verify_samples.clear()
+                                post_grasp_verified = False
+                                active_regrasp_mailbox = None
+                                record.update({
+                                    "state": "regrasp_reacquiring",
+                                    "reason": "post_grasp_target_lost_timeout",
+                                    "lost_duration_s": round(lost_duration_s, 3),
+                                    "regrasp_timeout_s": args.post_grasp_target_lost_timeout_s,
+                                    "regrasp_attempt": regrasp_attempts,
+                                    "regrasp_recovery": recovery,
+                                })
+                                json_record(log, record)
+                                print_compact_record(record)
+                                continue
+                        else:
+                            post_grasp_target_lost_since = None
                         if args.step_profile is not None and step_xy_pending is not None:
                             actual = measured_left_end_link_pose(controller)
                             last_end_link_target = CartesianPoseTarget(actual.position_m, last_end_link_target.orientation_xyzw)
@@ -2608,8 +3367,6 @@ def main() -> int:
                         record["perception_gate"] = {
                             "candidate_count": len(candidates),
                             "tracking": tracking,
-                            "sam_review_accepted": record.get("sam_review", {}).get("accepted"),
-                            "sam_review_fresh": record.get("sam_review", {}).get("fresh"),
                         }
                         record["state"] = "waiting_for_selected_depth"
                         record["reason"] = f"{unavailable_reason}; holding_current_pose"
@@ -2618,6 +3375,7 @@ def main() -> int:
                         print_compact_record(record)
                         continue
                     item = statistics[selected]
+                    post_grasp_target_lost_since = None
                     coarse_active = state is not None and state.coarse_active
                     gripper_closing = state is not None and state.phase == GraspPhase.GRASPED
                     if state is not None:
@@ -2628,7 +3386,11 @@ def main() -> int:
                     record["alignment_stage"] = (
                         "coarse_yolo"
                         if coarse_active
-                        else ("fine_step" if args.step_profile is not None else "sam_fraction")
+                        else (
+                            "fine_step"
+                            if args.step_profile is not None
+                            else ("yolo_box_fraction" if args.detector == "yolo" else "sam_fraction")
+                        )
                     )
                     if args.step_profile is not None and not gripper_closing:
                         record["step_pose"] = item.get("step_pose", {})
@@ -2644,6 +3406,19 @@ def main() -> int:
                             json_record(log, record)
                             print_compact_record(record)
                             continue
+                    if (
+                        args.step_profile is not None
+                        and state is not None
+                        and not state.coarse_active
+                        and getattr(args, "step_height_samples", None)
+                        and item.get("step_pose", {}).get("accepted")
+                    ):
+                        dynamic_target, height_detail = target_pixel_for_step_pose(
+                            args.step_height_samples, item["step_pose"],
+                        )
+                        state.set_fine_target_pixel(dynamic_target)
+                        parameters = state.parameters
+                        record["height_reference"] = height_detail
                     if single_xy_verification is not None:
                         post_center = np.asarray(servo_pixel(item), dtype=np.float64)
                         pre_center = np.asarray(single_xy_verification["before_center_px"], dtype=np.float64)
@@ -2681,6 +3456,7 @@ def main() -> int:
                         float(color_intrinsic["ppx"]), float(color_intrinsic["ppy"]),
                         base_xy_error_m=item.get("step_pose", {}).get("base_xy_error_m"),
                         xy_tolerance_m=args.step_xy_tolerance_mm / 1000,
+                        target_pixel_px=(float(parameters.target_u_px), float(parameters.target_v_px)),
                     )
                     step = state.update(observation, now=time.monotonic())
                     if args.step_profile is not None and step.camera_delta_m is None and step_xy_pending is not None and not gripper_closing:
@@ -2727,6 +3503,7 @@ def main() -> int:
                                 command_source = "gdk_end_effector_pose_mode1_step_metric_xy"
                                 record["base_xy_error_m"] = item["step_pose"]["base_xy_error_m"]
                             record["pixel_error_px"] = [float(value) for value in pixel_error]
+                            record["xy_step_limit_mm"] = parameters.max_xy_step_m * 1000.0
                             record["pixel_jacobian_px_per_m"] = empirical_pixel_jacobian.tolist()
                         else:
                             assert step.base_delta_m is not None
@@ -2773,7 +3550,36 @@ def main() -> int:
                                 "consecutive_samples_required": contact_parameters.consecutive_samples,
                                 "sample_period_s": contact_parameters.sample_period_s,
                             }
-                        if last_end_link_target is None:
+                        # Rebase every visual correction on the measured end-link
+                        # pose.  Accumulating from the previous *requested*
+                        # target lets a stalled or rate-limited GDK stream run
+                        # away from the real robot while the image error stays
+                        # unchanged.  The stream still slews at 50 Hz; this
+                        # only prevents an unbounded open-loop look-ahead.
+                        if step.camera_delta_m is not None and args.allow_motion:
+                            actual_before_update = measured_left_end_link_pose(controller)
+                            if last_end_link_target is not None:
+                                record["target_follow_error_mm"] = round(
+                                    float(
+                                        np.linalg.norm(
+                                            np.asarray(last_end_link_target.position_m, dtype=np.float64)
+                                            - np.asarray(actual_before_update.position_m, dtype=np.float64)
+                                        )
+                                    )
+                                    * 1000.0,
+                                    3,
+                                )
+                            record["actual_end_link_before_base_link"] = list(actual_before_update.position_m)
+                            orientation = (
+                                last_end_link_target.orientation_xyzw
+                                if last_end_link_target is not None
+                                else actual_before_update.orientation_xyzw
+                            )
+                            last_end_link_target = CartesianPoseTarget(
+                                actual_before_update.position_m,
+                                orientation,
+                            )
+                        elif last_end_link_target is None:
                             last_end_link_target = measured_left_end_link_pose(controller)
                         if args.step_profile is not None and step.camera_delta_m is not None and args.allow_motion:
                             actual = measured_left_end_link_pose(controller)
@@ -2816,6 +3622,23 @@ def main() -> int:
                                     # descent.  It never changes Z, and the
                                     # force guard freezes it well before
                                     # contact takes priority.
+                                    height_target_provider = None
+                                    if height_samples and args.step_profile is None:
+                                        def height_target_provider(_item):
+                                            current = current_height_reference_target(
+                                                end_link_transform=end_link_transform,
+                                                item=_item,
+                                            )
+                                            return None if current is None else current[0]
+                                    elif getattr(args, "step_height_samples", None):
+                                        def height_target_provider(step_item):
+                                            pose = step_item.get("step_pose", {})
+                                            if not pose.get("accepted"):
+                                                return None
+                                            target, _detail = target_pixel_for_step_pose(
+                                                args.step_height_samples, pose,
+                                            )
+                                            return target
                                     visual_mailbox = (SnapshotVisualMailbox(
                                         perception,
                                         initial_center_px=item["center_px"],
@@ -2825,7 +3648,9 @@ def main() -> int:
                                         pixel_jacobian=empirical_pixel_jacobian,
                                         pixel_tolerance_px=parameters.pixel_tolerance,
                                         max_xy_step_m=args.final_descent_visual_max_step_m,
-                                        allow_xy_correction=False,
+                                        visual_tolerance_m=args.final_descent_visual_tolerance_mm / 1000.0,
+                                        allow_xy_correction=True,
+                                        target_pixel_provider=height_target_provider,
                                     ) if args.final_descent_visual_servo else None)
                                     # Start after the frame used to initiate
                                     # descent; an old frame must not count as
@@ -2913,54 +3738,77 @@ def main() -> int:
                                                 ),
                                                 last_end_link_target.orientation_xyzw,
                                             )
+                                            relief_speed_mps = relief_translation_speed_mps(
+                                                parameters.final_descent_speed_mps
+                                            )
+                                            position_stream.set_translation_velocity(relief_speed_mps)
+                                            record["force_relief_speed"] = {
+                                                "automatic_speed_mps": parameters.final_descent_speed_mps,
+                                                "automatic_speed_mm_s": parameters.final_descent_speed_mps * 1000.0,
+                                                "relief_speed_mps": relief_speed_mps,
+                                                "relief_speed_mm_s": relief_speed_mps * 1000.0,
+                                                "ratio": 0.5,
+                                            }
                                             position_stream.update_target(relief_target)
                                             last_end_link_target = relief_target
                                             relief_deadline = time.monotonic() + (
                                                 contact_detector.parameters.relief_max_lift_m
-                                                / parameters.final_descent_speed_mps
+                                                / relief_speed_mps
                                                 + 0.35
                                             )
                                             relief_hits = 0
                                             latest_relief_force_n: np.ndarray | None = None
                                             latest_relief_delta_force_n: float | None = None
-                                            while time.monotonic() < relief_deadline:
-                                                position_stream.raise_if_failed()
-                                                _status, relief_force_n = read_wrench_force(robot, contact_detector.parameters.frame_name)
-                                                relief_delta_force_n = float(np.linalg.norm(
-                                                    relief_force_n - contact_detector.baseline_force_n
-                                                ))
-                                                latest_relief_force_n = relief_force_n
-                                                latest_relief_delta_force_n = relief_delta_force_n
-                                                if relief_delta_force_n <= contact_detector.parameters.relief_force_delta_threshold_n:
-                                                    relief_hits += 1
-                                                else:
-                                                    relief_hits = 0
-                                                if relief_hits >= contact_detector.parameters.relief_consecutive_samples:
-                                                    relief_pose = measured_left_end_link_pose(controller)
-                                                    relief_hold_target = CartesianPoseTarget(
-                                                        relief_pose.position_m,
-                                                        last_end_link_target.orientation_xyzw,
-                                                    )
-                                                    position_stream.update_target(relief_hold_target)
-                                                    last_end_link_target = relief_hold_target
-                                                    # This is a cancellation of
-                                                    # the remaining upward
-                                                    # relief target at the
-                                                    # measured pose.  As above,
-                                                    # a fixed virtual-target
-                                                    # wait would reject valid
-                                                    # contact cases without
-                                                    # checking physical motion.
+                                            try:
+                                                while time.monotonic() < relief_deadline:
                                                     position_stream.raise_if_failed()
-                                                    force_relief_completed = True
-                                                    break
-                                                time.sleep(contact_detector.parameters.sample_period_s)
+                                                    _status, relief_force_n = read_wrench_force(robot, contact_detector.parameters.frame_name)
+                                                    relief_delta_force_n = float(np.linalg.norm(
+                                                        relief_force_n - contact_detector.baseline_force_n
+                                                    ))
+                                                    latest_relief_force_n = relief_force_n
+                                                    latest_relief_delta_force_n = relief_delta_force_n
+                                                    if relief_delta_force_n <= contact_detector.parameters.relief_force_delta_threshold_n:
+                                                        relief_hits += 1
+                                                    else:
+                                                        relief_hits = 0
+                                                    if relief_hits >= contact_detector.parameters.relief_consecutive_samples:
+                                                        relief_pose = measured_left_end_link_pose(controller)
+                                                        relief_hold_target = CartesianPoseTarget(
+                                                            relief_pose.position_m,
+                                                            last_end_link_target.orientation_xyzw,
+                                                        )
+                                                        position_stream.update_target(relief_hold_target)
+                                                        last_end_link_target = relief_hold_target
+                                                        # This is a cancellation of
+                                                        # the remaining upward
+                                                        # relief target at the
+                                                        # measured pose.  As above,
+                                                        # a fixed virtual-target
+                                                        # wait would reject valid
+                                                        # contact cases without
+                                                        # checking physical motion.
+                                                        position_stream.raise_if_failed()
+                                                        force_relief_completed = True
+                                                        break
+                                                    time.sleep(contact_detector.parameters.sample_period_s)
+                                            finally:
+                                                # The slower rate applies only
+                                                # to unloading.  All following
+                                                # motion, including a failed
+                                                # relief retreat, uses the
+                                                # configured automatic speed.
+                                                position_stream.set_translation_velocity(
+                                                    parameters.final_descent_speed_mps
+                                                )
                                             record["force_relief"] = {
                                                 "required": True,
                                                 "max_lift_m": contact_detector.parameters.relief_max_lift_m,
                                                 "force_delta_release_threshold_n": contact_detector.parameters.relief_force_delta_threshold_n,
                                                 "consecutive_samples_required": contact_detector.parameters.relief_consecutive_samples,
                                                 "released": force_relief_completed,
+                                                "speed_mps": relief_speed_mps,
+                                                "speed_mm_s": relief_speed_mps * 1000.0,
                                                 "latest_force_n": None if latest_relief_force_n is None else [float(value) for value in latest_relief_force_n],
                                                 "latest_delta_force_n": latest_relief_delta_force_n,
                                                 "consecutive_hits": relief_hits,
@@ -3009,8 +3857,8 @@ def main() -> int:
                                             if correction is not None:
                                                 visual_mailbox_sequence = int(correction["sequence"])
                                                 if correction.get("valid") is False:
-                                                    # The SAM worker only
-                                                    # reports this for the
+                                                    # The perception mailbox
+                                                    # only reports this for the
                                                     # exact target that was
                                                     # locked before descent;
                                                     # do not search sideways
@@ -3059,6 +3907,7 @@ def main() -> int:
                                                         "sequence": visual_mailbox_sequence,
                                                         "accepted": False,
                                                         "reason": "xy_within_tolerance",
+                                                        "visual_error_m": correction.get("visual_error_m"),
                                                     })
                                                     continue
                                                 if delta_force_n >= contact_detector.parameters.force_delta_threshold_n * 0.5:
@@ -3117,17 +3966,19 @@ def main() -> int:
                                                         visual_total_base_delta = proposed_total
                                                         visual_corrections.append({
                                                             "sequence": visual_mailbox_sequence,
-                                                            "accepted": True,
-                                                            "selected_mask_index": correction["selected_mask_index"],
-                                                            "pixel_error_px": correction["pixel_error_px"],
-                                                            "delta_base_m": correction["delta_base_m"],
+                                                        "accepted": True,
+                                                        "selected_mask_index": correction["selected_mask_index"],
+                                                        "pixel_error_px": correction["pixel_error_px"],
+                                                        "visual_error_m": correction.get("visual_error_m"),
+                                                        "delta_base_m": correction["delta_base_m"],
                                                             "cumulative_horizontal_m": float(np.linalg.norm(visual_total_base_delta[:2])),
                                                         })
                                         time.sleep(contact_detector.parameters.sample_period_s)
                                     record["final_descent_visual_servo"] = {
                                         "enabled": visual_mailbox is not None,
-                                        "target_lock": "same SAM target nearest to pre-descent YOLO/SAM selection; never re-rank left/right during descent",
+                                        "target_lock": "same YOLO target nearest to pre-descent selection; never re-rank left/right during descent",
                                         "max_step_m": args.final_descent_visual_max_step_m,
+                                        "tolerance_m": args.final_descent_visual_tolerance_mm / 1000.0,
                                         "max_total_horizontal_m": (
                                             None
                                             if args.final_descent_visual_max_total_m == 0.0
@@ -3372,10 +4223,9 @@ def main() -> int:
                             held_with_gripper = (
                                 median_center_delta_px <= args.post_grasp_verify_center_drift_px
                                 # A correctly gripped hinge is frequently partly hidden
-                                # by the closing fingers.  Its YOLO mask area may change
-                                # sharply, whereas its camera-relative depth remains
-                                # stable.  A part left on the table fails both checks
-                                # after the controlled +Z verification lift.
+                                # by the closing fingers.  Its YOLO mask geometry can
+                                # change during the controlled +Z verification lift;
+                                # these values are retained for diagnosis only.
                                 and (area_stable or depth_stable)
                             )
                             verification = {
@@ -3391,41 +4241,11 @@ def main() -> int:
                                 "depth_stable": depth_stable,
                                 "held_with_gripper": held_with_gripper,
                             }
-                            if not held_with_gripper:
-                                assert position_stream is not None and gripper_open is not None and gripper_tolerance is not None
-                                # The verification lift already created the
-                                # requested clearance.  Re-open and restart
-                                # XY alignment from there; do not add the
-                                # retired 100-mm visual-recovery lift.
-                                position_stream, last_end_link_target, recovery = recover_for_visual_regrasp(
-                                    controller,
-                                    position_stream,
-                                    retract_m=0.0,
-                                    translation_speed_mps=parameters.final_descent_speed_mps,
-                                    fixed_orientation_xyzw=last_end_link_target.orientation_xyzw,
-                                    gripper_open_rad=gripper_open,
-                                    gripper_tolerance_rad=gripper_tolerance,
-                                    gripper_timeout_s=gripper_close_timeout,
-                                )
-                                regrasp_attempts += 1
-                                state.reset_for_regrasp()
-                                tracked_center = tracked_depth_m = None
-                                missed_frames = 0
-                                gripper_sent_at = adaptive_hold_target_rad = adaptive_hold_sent_at = None
-                                gripper_position_samples.clear()
-                                post_grasp_verify_baseline = None
-                                post_grasp_verify_samples.clear()
-                                post_grasp_verified = False
-                                record.update({
-                                    "state": "regrasp_reacquiring",
-                                    "reason": "post_grasp_visual_verification_failed",
-                                    "regrasp_attempt": regrasp_attempts,
-                                    "post_grasp_verify": verification,
-                                    "regrasp_recovery": recovery,
-                                })
-                                json_record(log, record)
-                                print_compact_record(record)
-                                continue
+                            # A mask geometry change is not a drop decision:
+                            # occlusion by the fingers is expected.  Keep the
+                            # jaw closed and let the explicit post-grasp
+                            # lost-target timeout decide whether to regrasp.
+                            verification["action"] = "continue_closed_until_target_loss_timeout"
                             post_grasp_verify_baseline = None
                             post_grasp_verify_samples.clear()
                             post_grasp_verified = True
@@ -3433,8 +4253,8 @@ def main() -> int:
                         # Continue observing the same target while the jaw is
                         # closing.  A loss at this point is treated as a
                         # failed attempt, never as permission to transport an
-                        # assumed grasp.  The worker is still using the one
-                        # SAM3 model loaded before P2/P3.
+                        # assumed grasp.  The perception worker remains the
+                        # sole owner of the camera and YOLO model.
                         if active_regrasp_mailbox is not None:
                             close_tracking = active_regrasp_mailbox.newer_than(active_regrasp_mailbox_sequence)
                             if close_tracking is not None:
@@ -3498,65 +4318,28 @@ def main() -> int:
                                 if now - sample[0] <= history_limit_s
                             ]
                         if position is not None and adaptive_hold_target_rad is None:
-                            close_travel_rad = position - gripper_open
-                            record["adaptive_gripper_close_travel_rad"] = close_travel_rad
-                            # Near-zero is the documented fully closed end.
-                            # It means the jaws did not encounter a hinge, so
-                            # it is a failed attempt, not a reason to
-                            # transport an empty gripper.  Retract/open and
-                            # return to continuous visual alignment instead.
-                            if abs(position - adaptive_gripper.seek_target_rad) <= gripper_tolerance:
+                            decision = decide_gripper_close(
+                                position_rad=position,
+                                gripper_open_rad=gripper_open,
+                                tolerance_rad=gripper_tolerance,
+                                parameters=adaptive_gripper,
+                                samples=gripper_position_samples,
+                                now=now,
+                            )
+                            record["adaptive_gripper_close_travel_rad"] = decision.close_travel_rad
+                            if decision.hold_target_rad is not None:
+                                adaptive_hold_target_rad = decision.hold_target_rad
                                 assert position_stream is not None
-                                stop_force_descent_sam_preview(force_preview_stop, force_preview_thread)
-                                force_preview_stop = force_preview_thread = None
-                                force_preview_phase = None
-                                position_stream, last_end_link_target, recovery = recover_for_visual_regrasp(
-                                    controller,
-                                    position_stream,
-                                    retract_m=args.regrasp_retract_m,
-                                    translation_speed_mps=parameters.final_descent_speed_mps,
-                                    fixed_orientation_xyzw=last_end_link_target.orientation_xyzw,
-                                    gripper_open_rad=gripper_open,
-                                    gripper_tolerance_rad=gripper_tolerance,
-                                    gripper_timeout_s=gripper_close_timeout,
-                                )
-                                regrasp_attempts += 1
-                                state.reset_for_regrasp()
-                                tracked_center = tracked_depth_m = None
-                                missed_frames = 0
-                                gripper_sent_at = adaptive_hold_target_rad = adaptive_hold_sent_at = None
-                                gripper_position_samples.clear()
-                                record.update({
-                                    "state": "regrasp_reacquiring",
-                                    "reason": "empty_gripper_full_close",
-                                    "regrasp_attempt": regrasp_attempts,
-                                    "regrasp_recovery": recovery,
-                                })
-                                json_record(log, record)
-                                print_compact_record(record)
-                                continue
-                            if close_travel_rad >= adaptive_gripper.minimum_close_travel_rad:
-                                stall_angle = stalled_gripper_position(
-                                    gripper_position_samples,
-                                    now=now,
-                                    window_s=adaptive_gripper.stall_window_s,
-                                    position_delta_rad=adaptive_gripper.stall_position_delta_rad,
-                                )
-                                if stall_angle is not None:
-                                    adaptive_hold_target_rad = min(
-                                        adaptive_gripper.seek_target_rad,
-                                        stall_angle + adaptive_gripper.additional_close_rad,
-                                    )
-                                    assert position_stream is not None
-                                    position_stream.set_left_gripper_target(adaptive_hold_target_rad)
-                                    adaptive_hold_sent_at = now
-                                    record["adaptive_gripper_stall"] = {
-                                        "stall_angle_rad": stall_angle,
-                                        "hold_target_rad": adaptive_hold_target_rad,
-                                        "additional_close_rad": adaptive_gripper.additional_close_rad,
-                                        "window_s": adaptive_gripper.stall_window_s,
-                                        "position_delta_rad": adaptive_gripper.stall_position_delta_rad,
-                                    }
+                                position_stream.set_left_gripper_target(adaptive_hold_target_rad)
+                                adaptive_hold_sent_at = now
+                                record["adaptive_gripper_stall"] = {
+                                    "reason": decision.reason,
+                                    "stall_angle_rad": decision.stall_angle_rad,
+                                    "hold_target_rad": adaptive_hold_target_rad,
+                                    "additional_close_rad": adaptive_gripper.additional_close_rad,
+                                    "window_s": adaptive_gripper.stall_window_s,
+                                    "position_delta_rad": adaptive_gripper.stall_position_delta_rad,
+                                }
                         if (
                             position is not None
                             and adaptive_hold_target_rad is not None
@@ -3608,8 +4391,8 @@ def main() -> int:
                                 print_compact_record(record)
                                 continue
                             # Post-grasp verification needs the outer loop to
-                            # own the camera briefly.  Reuse the same already
-                            # loaded SAM3 worker for the subsequent +Z lift,
+                            # own the camera briefly.  Reuse the same
+                            # perception worker for the subsequent +Z lift,
                             # but now hand its locked-target observations to
                             # the lift monitor as well as the web preview.
                             if args.full_cycle:
@@ -3619,13 +4402,15 @@ def main() -> int:
                                     "state": "post_grasp_monitored_lift",
                                     "overlay_note": (
                                         "same-target held-part monitoring during +Z lift; "
-                                        "confirmed loss or geometric change cancels transport and regraspes; stale holds closed"
+                                        "confirmed target loss after timeout cancels transport and regraspes; "
+                                        "mask geometry changes are diagnostic only; stale holds closed"
                                     ),
                                 }
                                 transport_mailbox = SnapshotVisualMailbox(
                                     perception, initial_center_px=item["center_px"],
                                     track_max_distance_px=args.track_max_distance_px,
                                     target_lost_frames=args.final_descent_target_lost_frames,
+                                    target_lost_timeout_s=args.post_grasp_target_lost_timeout_s,
                                 )
                                 perception.set_phase("post_grasp_monitored_lift", force_preview_phase["overlay_note"])
                             json_record(log, record)
@@ -3656,6 +4441,7 @@ def main() -> int:
                                     "pre_p4_lift_m": PRE_P4_LIFT_M,
                                     "monitor_center_drift_px": args.post_grasp_verify_center_drift_px,
                                     "monitor_area_change_fraction": args.post_grasp_verify_area_change_fraction,
+                                    "target_lost_timeout_s": args.post_grasp_target_lost_timeout_s,
                                     "presets": [name for name, _ in post_grasp_presets],
                                 })
                                 post_grasp_lift_monitor = {
@@ -3734,6 +4520,7 @@ def main() -> int:
             takeover_worker.stop()
         if dianpi_runner is not None:
             dianpi_runner.close()
+        stop_head_camera_web_preview(head_preview_stop, head_preview_thread)
         stop_force_descent_sam_preview(force_preview_stop, force_preview_thread)
         if perception is not None:
             perception.stop()

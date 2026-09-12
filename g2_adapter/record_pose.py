@@ -27,6 +27,7 @@ try:
         reorder_arm_positions,
         validate_robot_status,
     )
+    from .workflow_home import WORKFLOW_HOME_POSE_NAME
 except ImportError:
     from safety import (
         ARM_JOINT_NAMES,
@@ -35,6 +36,7 @@ except ImportError:
         reorder_arm_positions,
         validate_robot_status,
     )
+    from workflow_home import WORKFLOW_HOME_POSE_NAME
 
 POSE_NAMES = (
     "left_p1",
@@ -54,7 +56,12 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="只读当前 G2 姿态；不会调用任何运动或夹爪控制 API。"
     )
-    parser.add_argument("--name", required=True, choices=POSE_NAMES)
+    parser.add_argument("--name", required=True, choices=(*POSE_NAMES, WORKFLOW_HOME_POSE_NAME))
+    parser.add_argument(
+        "--both-arms",
+        action="store_true",
+        help=f"记录左右两臂 14 个关节；必须与 --name {WORKFLOW_HOME_POSE_NAME} 一起使用。",
+    )
     parser.add_argument("--save", action="store_true", help="写入 recorded_poses.json")
     parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT)
     return parser.parse_args()
@@ -114,6 +121,12 @@ def _atomic_json(path: Path, payload: dict) -> None:
 
 def main() -> int:
     args = parse_args()
+    if (args.name == WORKFLOW_HOME_POSE_NAME) != bool(args.both_arms):
+        print(
+            f"--both-arms 只能与 --name {WORKFLOW_HOME_POSE_NAME} 一起使用。",
+            file=sys.stderr,
+        )
+        return 2
     try:
         import agibot_gdk
     except ImportError as exc:
@@ -137,16 +150,17 @@ def main() -> int:
             if name and math.isfinite(value):
                 all_joints[name] = value
         end_state = dict(robot.get_end_state())
-        side = "left" if args.name.startswith("left_") else "right"
+        is_home = args.name == WORKFLOW_HOME_POSE_NAME
+        side = "both" if is_home else ("left" if args.name.startswith("left_") else "right")
         selected_names = LEFT_ARM_JOINT_NAMES if side == "left" else RIGHT_ARM_JOINT_NAMES
         offset = 0 if side == "left" else 7
-        end_link_pose = _end_link_pose(motion, side)
+        end_link_pose = None if is_home else _end_link_pose(motion, side)
         record = {
             "name": args.name,
             "captured_at_utc": datetime.now(timezone.utc).isoformat(),
             "side": side,
-            "joint_names": list(selected_names),
-            "joint_positions_rad": list(arms[offset : offset + 7]),
+            "joint_names": list(ARM_JOINT_NAMES if is_home else selected_names),
+            "joint_positions_rad": list(arms if is_home else arms[offset : offset + 7]),
             "both_arms_rad": dict(zip(ARM_JOINT_NAMES, arms)),
             "all_gdk_motor_positions_rad": all_joints,
             "left_omnipicker_names": _gripper_names(end_state, "left"),

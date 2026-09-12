@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
-# Run GDK + SAM3 under the project-local CPython 3.12 binding.
+# Run GDK under the project-local CPython 3.12 binding. The historical
+# filename is kept so existing commands remain compatible; it does not load
+# SAM3 by itself.
 # The official env.sh appends to variables that can be initially unset.
 set -eo pipefail
 

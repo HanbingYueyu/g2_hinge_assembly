@@ -68,6 +68,129 @@ class SharedView:
             return self.overlay_jpeg, dict(self.status)
 
 
+class _CameraPane:
+    """A small publisher facade for one pane of a composite web view."""
+
+    def __init__(self, owner: "CompositeSharedView", name: str) -> None:
+        self._owner = owner
+        self._name = name
+
+    def update(self, overlay_jpeg: bytes | None, status: dict) -> None:
+        self._owner.update_pane(self._name, overlay_jpeg, status)
+
+
+class CompositeSharedView:
+    """Keep head and hand previews live in one browser image.
+
+    The existing HTTP endpoint serves one JPEG.  This view preserves that
+    endpoint while giving each camera its own latest frame, so a fast hand
+    perception loop cannot overwrite a slower head-camera stream.
+    """
+
+    def __init__(self) -> None:
+        self.lock = threading.Lock()
+        self._panes: dict[str, tuple[bytes | None, dict]] = {
+            "head": (None, {"state": "head_waiting", "source": "head_camera"}),
+            "left": (None, {"state": "left_waiting", "source": "left_camera"}),
+        }
+        self._sequence = 0
+        self.overlay_jpeg: bytes | None = None
+        self.status: dict = {"state": "starting", "sequence": 0, "camera_views": {}}
+
+    def pane(self, name: str) -> _CameraPane:
+        if name not in self._panes:
+            raise ValueError(f"unknown camera pane: {name}")
+        return _CameraPane(self, name)
+
+    def update(self, overlay_jpeg: bytes | None, status: dict) -> None:
+        """Preserve the SharedView API; unqualified updates belong to left."""
+        self.update_pane("left", overlay_jpeg, status)
+
+    @staticmethod
+    def _decode(jpeg: bytes | None) -> np.ndarray | None:
+        if not jpeg:
+            return None
+        image = cv2.imdecode(np.frombuffer(jpeg, dtype=np.uint8), cv2.IMREAD_COLOR)
+        return None if image is None else image
+
+    @staticmethod
+    def _label(image: np.ndarray, text: str) -> np.ndarray:
+        output = image.copy()
+        cv2.rectangle(output, (0, 0), (min(output.shape[1] - 1, 310), 38), (25, 25, 25), -1)
+        cv2.putText(output, text, (10, 26), cv2.FONT_HERSHEY_SIMPLEX, 0.72,
+                    (0, 255, 255), 2, cv2.LINE_AA)
+        return output
+
+    def _compose(self) -> bytes | None:
+        head = self._decode(self._panes["head"][0])
+        left = self._decode(self._panes["left"][0])
+        if head is None and left is None:
+            return None
+        if head is None:
+            canvas = self._label(left, "LEFT D405 / YOLO")
+        elif left is None:
+            canvas = self._label(head, "HEAD RGB / YOLO")
+        else:
+            target_height = max(head.shape[0], left.shape[0])
+            def fit(image: np.ndarray) -> np.ndarray:
+                if image.shape[0] == target_height:
+                    return image
+                width = max(1, int(round(image.shape[1] * target_height / image.shape[0])))
+                return cv2.resize(image, (width, target_height), interpolation=cv2.INTER_AREA)
+            head = self._label(fit(head), "HEAD RGB / YOLO")
+            left = self._label(fit(left), "LEFT D405 / YOLO")
+            divider = np.full((target_height, 6, 3), 80, dtype=np.uint8)
+            canvas = np.hstack((head, divider, left))
+        ok, encoded = cv2.imencode(".jpg", canvas, [cv2.IMWRITE_JPEG_QUALITY, 82])
+        return encoded.tobytes() if ok else None
+
+    def update_pane(self, name: str, overlay_jpeg: bytes | None, status: dict) -> None:
+        with self.lock:
+            self._panes[name] = (overlay_jpeg, dict(status))
+            self._sequence += 1
+            composed = self._compose()
+            pane_status = {key: dict(value[1]) for key, value in self._panes.items()}
+            active = dict(status)
+            active.pop("sequence", None)
+            self.overlay_jpeg = composed
+            self.status = {
+                **active,
+                "sequence": self._sequence,
+                "active_source": name,
+                "camera_views": pane_status,
+            }
+
+    def hide_pane(self, name: str) -> None:
+        """Stop displaying a pane while retaining its status for diagnostics.
+
+        A hidden pane has no JPEG, so ``_compose`` naturally falls back to the
+        remaining camera at its native size.  Marking it in ``camera_views``
+        lets the browser status panel explain why the layout changed.
+        """
+        with self.lock:
+            if name not in self._panes:
+                raise ValueError(f"unknown camera pane: {name}")
+            _, previous_status = self._panes[name]
+            hidden_status = dict(previous_status)
+            hidden_status.update({"state": f"{name}_view_hidden", "hidden": True})
+            self._panes[name] = (None, hidden_status)
+            self._sequence += 1
+            self.overlay_jpeg = self._compose()
+            pane_status = {key: dict(value[1]) for key, value in self._panes.items()}
+            active = dict(self._panes["left"][1])
+            active.pop("sequence", None)
+            self.status = {
+                **active,
+                "sequence": self._sequence,
+                "active_source": "left",
+                "camera_views": pane_status,
+            }
+
+    def snapshot(self) -> tuple[bytes | None, dict]:
+        with self.lock:
+            return self.overlay_jpeg, dict(self.status)
+
+
 def handler_class(shared: SharedView, *, title: str = "G2 左手 D405 / SAM3（只读）"):
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, format: str, *args) -> None:

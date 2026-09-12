@@ -1,11 +1,13 @@
 import unittest
 from pathlib import Path
+import json
+import tempfile
 
 import cv2
 import numpy as np
 
 from extract_left_step_profile import extract_marked
-from left_step_rgb import detect_hole_centres, match_holes, solve_correspondences, OcclusionTracker, OcclusionTrackerPool
+from left_step_rgb import detect_hole_centres, load_alignment_reference, match_holes, solve_correspondences, OcclusionTracker, OcclusionTrackerPool
 
 
 class LeftStepRgbTests(unittest.TestCase):
@@ -70,6 +72,25 @@ class LeftStepRgbTests(unittest.TestCase):
         result = solve_correspondences(self.points, self.pixels, self.intrinsic, self.target)
         self.assertIsNotNone(result)
         np.testing.assert_allclose(result["grasp_xyz_camera_m"], self.rotation @ self.target + self.tvec, atol=1e-5)
+
+    def test_height_reference_is_loaded_without_single_point_sample_count(self):
+        reference = {
+            "schema_version": 2,
+            "source_sha256": self.profile["source_sha256"],
+            "grasp_center_m": self.profile["grasp_center_m"],
+            "height_samples": [
+                {"height_mm": 100, "camera_distance_m": .30, "target_pixel_px": [640, 460]},
+                {"height_mm": 50, "camera_distance_m": .20, "target_pixel_px": [630, 500]},
+                {"height_mm": 0, "camera_distance_m": .10, "target_pixel_px": [620, 540]},
+            ],
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "height-reference.json"
+            path.write_text(json.dumps(reference))
+            loaded = load_alignment_reference(path, self.profile)
+        self.assertEqual(loaded["schema_version"], 2)
+        self.assertEqual(loaded["target_pixel_px"], [620.0, 540.0])
+        self.assertEqual(len(loaded["height_samples"]), 3)
 
     def test_unordered_candidates_with_distractors(self):
         pixels = np.vstack([self.pixels[[3, 0, 6, 1, 5, 2, 4]], [[400, 300], [800, 650]]])

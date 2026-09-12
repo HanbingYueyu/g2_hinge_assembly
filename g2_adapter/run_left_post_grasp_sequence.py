@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import sys
 import time
 from datetime import datetime, timezone
@@ -118,7 +119,12 @@ def lift_before_p4(controller: G2Controller) -> dict:
 
 def main() -> int:
     args = parse_args()
-    if not (0 < args.velocity_rad_s <= 0.15 and 0.001 <= args.arrival_tolerance_rad <= 0.10 and 1.0 <= args.timeout_per_preset_s <= 30.0):
+    if not (
+        math.isfinite(args.velocity_rad_s)
+        and args.velocity_rad_s > 0.0
+        and 0.001 <= args.arrival_tolerance_rad <= 0.10
+        and 1.0 <= args.timeout_per_preset_s <= 30.0
+    ):
         print("参数错误：速度、到位容差或超时超出安全范围。", file=sys.stderr)
         return 2
     try:

@@ -7,12 +7,15 @@ from dianpi_runner import DianpiCycleRunner, DianpiTriggerResult
 
 
 class FakeController:
-    def __init__(self, *, block=False, fail_open=False, fail_cycle=False):
+    def __init__(self, *, block=False, fail_open=False, fail_cycle=False, input_states=None):
         self.block = block
         self.fail_open = fail_open
         self.fail_cycle = fail_cycle
+        self.input_states = list(input_states or [])
+        self.last_input_state = {3: 1, 4: 1, 10: 1}
         self.open_calls = 0
         self.cycle_calls = 0
+        self.read_calls = 0
         self.close_calls = 0
         self.stop_calls = 0
         self.cycle_started = threading.Event()
@@ -32,6 +35,12 @@ class FakeController:
         if self.block:
             self.release.wait(1.0)
         self.cycle_finished.set()
+
+    def read_inputs(self):
+        self.read_calls += 1
+        if self.input_states:
+            self.last_input_state = self.input_states.pop(0)
+        return self.last_input_state
 
     def close(self):
         self.close_calls += 1
@@ -114,3 +123,32 @@ def test_close_stops_active_cycle_before_closing_controller():
 
     assert controller.stop_calls == 1
     assert controller.close_calls == 1
+
+
+def test_p10_monitor_triggers_cycle_on_falling_edge():
+    controller = FakeController(input_states=[{3: 1, 4: 1, 10: 1}, {3: 1, 4: 1, 10: 0}])
+    runner, _controller, factory_calls = make_runner(controller=controller)
+
+    runner.start_p10_monitor(poll_period_s=0.001)
+    wait_until(lambda: controller.cycle_finished.is_set())
+
+    assert factory_calls == [True]
+    assert controller.open_calls == 1
+    assert controller.cycle_calls == 1
+    runner.close()
+    assert controller.close_calls == 1
+
+
+def test_p10_monitor_and_spacemouse_trigger_share_one_controller():
+    controller = FakeController(input_states=[{3: 1, 4: 1, 10: 1}])
+    runner, _controller, factory_calls = make_runner(controller=controller)
+
+    runner.start_p10_monitor(poll_period_s=0.001)
+    wait_until(lambda: controller.open_calls == 1)
+    assert runner.trigger() is DianpiTriggerResult.STARTED
+    wait_until(lambda: controller.cycle_finished.is_set())
+
+    assert factory_calls == [True]
+    assert controller.open_calls == 1
+    assert controller.cycle_calls == 1
+    runner.close()

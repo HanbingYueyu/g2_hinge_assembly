@@ -71,6 +71,7 @@ class FakeRobot:
         self.right_end_pose = FakePose()
         self.left_gripper_position = -0.2
         self.right_gripper_position = -0.785
+        self.follow_left_pose = True
         self.follow_left_gripper = True
         self.follow_right_pose = True
         self.follow_right_gripper = True
@@ -138,8 +139,16 @@ class FakeRobot:
 
     def end_effector_pose_control(self, request):
         self.requests.append(request)
-        if request.group == FakeGdk.EndEffectorControlGroup.kLeftArm and request.end_effector_joint_names and self.follow_left_gripper:
-            self.left_gripper_position = float(request.end_effector_joint_positions[0])
+        if request.group == FakeGdk.EndEffectorControlGroup.kLeftArm:
+            if self.follow_left_pose:
+                source = request.left_end_effector_pose
+                target = self.left_end_pose
+                target.position.x, target.position.y, target.position.z = source.position.x, source.position.y, source.position.z
+                target.orientation.x, target.orientation.y, target.orientation.z, target.orientation.w = (
+                    source.orientation.x, source.orientation.y, source.orientation.z, source.orientation.w,
+                )
+            if request.end_effector_joint_names and self.follow_left_gripper:
+                self.left_gripper_position = float(request.end_effector_joint_positions[0])
         if request.group == FakeGdk.EndEffectorControlGroup.kRightArm and self.follow_right_pose:
             source = request.right_end_effector_pose
             target = self.right_end_pose
@@ -200,7 +209,7 @@ class ControlTests(unittest.TestCase):
     def test_left_stream_can_rotate_without_translating(self):
         robot = FakeRobot()
         controller = G2Controller(FakeGdk, robot, allow_motion=True)
-        initial = CartesianPoseTarget((0.1, -0.2, 0.3), (0.0, 0.0, 0.0, 1.0))
+        initial = CartesianPoseTarget((0.1, 0.2, 0.3), (0.0, 0.0, 0.0, 1.0))
         target = CartesianPoseTarget(
             initial.position_m,
             (0.0, 0.0, math.sin(math.pi / 4.0), math.cos(math.pi / 4.0)),
@@ -221,7 +230,7 @@ class ControlTests(unittest.TestCase):
         self.assertGreater(len(poses), 1)
         self.assertEqual(
             [(pose.position.x, pose.position.y, pose.position.z) for pose in poses[-3:]],
-            [(0.1, -0.2, 0.3)] * min(3, len(poses)),
+            [(0.1, 0.2, 0.3)] * min(3, len(poses)),
         )
         self.assertAlmostEqual(poses[-1].orientation.z, math.sin(math.pi / 4.0), places=6)
         self.assertAlmostEqual(poses[-1].orientation.w, math.cos(math.pi / 4.0), places=6)
@@ -305,6 +314,16 @@ class ControlTests(unittest.TestCase):
         self.assertEqual(request.joint_names[0], "idx61_arm_r_joint1")
         self.assertEqual(request.joint_names[-1], "idx67_arm_r_joint7")
         self.assertEqual(request.joint_velocities, [0.05] * 7)
+
+    def test_bilateral_planning_request_uses_all_arm_names(self):
+        robot = FakeRobot()
+        controller = G2Controller(FakeGdk, robot, allow_motion=True)
+        target = [0.1] * 14
+        controller.move_bilateral_preset(target, velocity_rad_s=0.05)
+        request = robot.requests[0]
+        self.assertEqual(request.joint_names, list(ARM_JOINT_NAMES))
+        self.assertEqual(request.joint_positions, target)
+        self.assertEqual(request.joint_velocities, [0.05] * 14)
 
     def test_gripper_uses_gdk_group(self):
         robot = FakeRobot()
@@ -410,7 +429,8 @@ class ControlTests(unittest.TestCase):
                 gate = MotionPauseGate()
                 controller = G2Controller(FakeGdk, FakeRobot(), allow_motion=True, motion_gate=gate)
                 factory = getattr(controller, f"start_{side}_end_effector_position_stream")
-                stream = factory(CartesianPoseTarget((0.1, 0.2, 0.3), (0, 0, 0, 1)))
+                initial_y = 0.2 if side == "left" else -0.2
+                stream = factory(CartesianPoseTarget((0.1, initial_y, 0.3), (0, 0, 0, 1)))
                 try:
                     gate.request_advance()
                     self.assertTrue(stream._stop.wait(1.0))
@@ -532,6 +552,143 @@ class ControlTests(unittest.TestCase):
         self.assertAlmostEqual(x_positions[-1], 0.101)
         self.assertTrue(all(abs(second - first) <= 0.0002001 for first, second in zip(x_positions, x_positions[1:])))
 
+    def test_left_stream_pauses_command_progress_when_actual_pose_lags(self):
+        robot = FakeRobot()
+        robot.left_end_pose.position.x, robot.left_end_pose.position.y, robot.left_end_pose.position.z = (0.1, 0.2, 0.3)
+        robot.follow_left_pose = False
+        controller = G2Controller(FakeGdk, robot, allow_motion=True)
+        stream = controller.start_left_end_effector_position_stream(
+            CartesianPoseTarget((0.1, 0.2, 0.3), (0.0, 0.0, 0.0, 1.0)),
+            max_translation_velocity_mps=0.03,
+        )
+        try:
+            stream.update_target(CartesianPoseTarget((0.15, 0.2, 0.3), (0.0, 0.0, 0.0, 1.0)))
+            time.sleep(0.45)
+            x_positions = [request.left_end_effector_pose.position.x for request in robot.requests]
+            self.assertLessEqual(max(x_positions) - 0.1, 0.006)
+            self.assertFalse(stream.is_target_reached())
+        finally:
+            stream.stop()
+
+    def test_left_stream_does_not_report_arrival_from_command_only(self):
+        robot = FakeRobot()
+        robot.left_end_pose.position.x, robot.left_end_pose.position.y, robot.left_end_pose.position.z = (0.1, 0.2, 0.3)
+        robot.follow_left_pose = False
+        controller = G2Controller(FakeGdk, robot, allow_motion=True)
+        stream = controller.start_left_end_effector_position_stream(
+            CartesianPoseTarget((0.1, 0.2, 0.3), (0.0, 0.0, 0.0, 1.0)),
+            max_translation_velocity_mps=0.03,
+        )
+        try:
+            stream.update_target(CartesianPoseTarget((0.115, 0.2, 0.3), (0.0, 0.0, 0.0, 1.0)))
+            self.assertFalse(stream.wait_until_target(0.25))
+        finally:
+            stream.stop()
+
+    def test_left_stream_does_not_fabricate_arrival_before_feedback(self):
+        robot = FakeRobot()
+        controller = G2Controller(FakeGdk, robot, allow_motion=True)
+        feedback_gate = threading.Event()
+        def blocked_read(_frame):
+            feedback_gate.wait()
+            return CartesianPoseTarget((0.1, 0.2, 0.3), (0.0, 0.0, 0.0, 1.0))
+        controller.read_end_effector_pose = blocked_read
+        stream = controller.start_left_end_effector_position_stream(
+            CartesianPoseTarget((0.1, 0.2, 0.3), (0.0, 0.0, 0.0, 1.0))
+        )
+        try:
+            self.assertFalse(stream.is_target_reached())
+            self.assertFalse(stream.wait_until_target(0.05))
+        finally:
+            feedback_gate.set()
+            stream.stop()
+
+    def test_left_stream_revokes_arrival_after_actual_drift(self):
+        robot = FakeRobot()
+        controller = G2Controller(FakeGdk, robot, allow_motion=True)
+        initial = CartesianPoseTarget((0.1, 0.2, 0.3), (0.0, 0.0, 0.0, 1.0))
+        stream = controller.start_left_end_effector_position_stream(initial, max_translation_velocity_mps=0.01)
+        try:
+            stream.update_target(CartesianPoseTarget((0.101, 0.2, 0.3), initial.orientation_xyzw))
+            self.assertTrue(stream.wait_until_target(0.5))
+            robot.follow_left_pose = False
+            robot.left_end_pose.position.x += 0.1
+            time.sleep(0.15)
+            self.assertFalse(stream.is_target_reached())
+        finally:
+            stream.stop()
+
+    def test_left_stream_rejects_restart_while_feedback_reader_is_blocked(self):
+        robot = FakeRobot()
+        controller = G2Controller(FakeGdk, robot, allow_motion=True)
+        feedback_gate = threading.Event()
+        def blocked_read(_frame):
+            feedback_gate.wait()
+            return CartesianPoseTarget((0.1, 0.2, 0.3), (0.0, 0.0, 0.0, 1.0))
+        controller.read_end_effector_pose = blocked_read
+        initial = CartesianPoseTarget((0.1, 0.2, 0.3), (0.0, 0.0, 0.0, 1.0))
+        stream = controller.start_left_end_effector_position_stream(initial)
+        try:
+            stream.stop()
+            with self.assertRaises(RuntimeError):
+                stream.start(initial)
+        finally:
+            feedback_gate.set()
+            stream.stop()
+
+    def test_position_stream_does_not_burst_after_delayed_feedback(self):
+        for side in ("left", "right"):
+            with self.subTest(side=side):
+                robot = FakeRobot()
+                controller = G2Controller(FakeGdk, robot, allow_motion=True)
+                feedback_gate = threading.Event()
+                first_feedback = True
+                feedback_times = []
+                initial = CartesianPoseTarget((0.0, 0.0, 0.0), (0.0, 0.0, 0.0, 1.0))
+
+                def delayed_read(_frame):
+                    nonlocal first_feedback
+                    feedback_times.append(time.monotonic())
+                    if first_feedback:
+                        first_feedback = False
+                        feedback_gate.wait()
+                    time.sleep(0.005)
+                    return initial
+
+                controller.read_end_effector_pose = delayed_read
+                send_times = []
+                original_send = robot.end_effector_pose_control
+
+                def capture_send(request):
+                    send_times.append(time.monotonic())
+                    time.sleep(0.005)
+                    return original_send(request)
+
+                robot.end_effector_pose_control = capture_send
+                factory = getattr(controller, f"start_{side}_end_effector_position_stream")
+                stream = factory(initial, max_translation_velocity_mps=0.01)
+                try:
+                    stream.update_target(CartesianPoseTarget((0.02, 0.0, 0.0), initial.orientation_xyzw))
+                    time.sleep(0.22)
+                    feedback_gate.set()
+                    time.sleep(0.35)
+                finally:
+                    feedback_gate.set()
+                    stream.stop()
+                intervals = [second - first for first, second in zip(send_times, send_times[1:])]
+                self.assertGreaterEqual(len(intervals), 3)
+                self.assertGreaterEqual(min(intervals), 0.014)
+                median_interval = sorted(intervals)[len(intervals) // 2]
+                self.assertGreaterEqual(median_interval, 0.018)
+                self.assertLessEqual(median_interval, 0.024)
+                feedback_intervals = [
+                    second - first for first, second in zip(feedback_times, feedback_times[1:])
+                ]
+                regular_feedback_intervals = [interval for interval in feedback_intervals if interval < 0.15]
+                self.assertGreaterEqual(len(regular_feedback_intervals), 2)
+                self.assertGreaterEqual(min(regular_feedback_intervals), 0.08)
+                self.assertLessEqual(sum(regular_feedback_intervals) / len(regular_feedback_intervals), 0.14)
+
     def test_right_end_effector_position_stream_uses_right_group_and_slews(self):
         robot = FakeRobot()
         controller = G2Controller(FakeGdk, robot, allow_motion=True)
@@ -569,7 +726,7 @@ class ControlTests(unittest.TestCase):
         stream = controller.start_right_end_effector_position_stream(initial, max_translation_velocity_mps=0.01)
         try:
             stream.update_target(CartesianPoseTarget((0.101, -0.2, 0.3), (0.0, 0.0, 0.0, 1.0)))
-            self.assertTrue(stream.wait_until_target(0.5))
+            self.assertFalse(stream.wait_until_target(0.5))
             settled = stream.wait_until_actual_target(
                 CartesianPoseTarget((0.101, -0.2, 0.3), (0.0, 0.0, 0.0, 1.0)), 0.08,
                 position_tolerance_m=0.00001, orientation_tolerance_deg=0.1, stable_samples=1,

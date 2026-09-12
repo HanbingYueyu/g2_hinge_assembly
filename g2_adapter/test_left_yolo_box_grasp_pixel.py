@@ -4,7 +4,9 @@ from pathlib import Path
 import numpy as np
 
 from left_grasp_gdk import (
+    prepare_yolo_input,
     project_end_point_to_color_pixel,
+    screen_gripper_target_pixel,
     servo_pixel,
     urdf_gripper_center_end_m,
     yolo_box_fraction_grasp_pixel,
@@ -12,9 +14,20 @@ from left_grasp_gdk import (
 
 
 class YoloBoxGraspPixelTests(unittest.TestCase):
-    def test_uses_box_45_percent_up_from_bottom(self):
+    def test_yolo_inference_uses_full_frame_and_returns_central_valid_roi(self):
+        rgb = np.zeros((100, 200, 3), dtype=np.uint8)
+        bgr, valid_roi = prepare_yolo_input(rgb)
+        self.assertEqual(bgr.shape, rgb.shape)
+        self.assertEqual(valid_roi, (30, 15, 170, 85))
+
+    def test_uses_box_55_percent_up_from_bottom(self):
         item = {"bbox_xyxy": [3.0, 2.0, 18.0, 11.0]}
-        self.assertEqual(yolo_box_fraction_grasp_pixel(item), [10.5, 6.95])
+        result = yolo_box_fraction_grasp_pixel(item)
+        self.assertAlmostEqual(result[0], 10.5)
+        self.assertAlmostEqual(result[1], 6.05)
+
+    def test_gripper_target_is_screen_center_and_55_percent_up_from_bottom(self):
+        np.testing.assert_allclose(screen_gripper_target_pixel((1056, 1280, 3)), [640.0, 475.2])
 
     def test_supports_an_explicit_fraction(self):
         item = {"bbox_xyxy": [2.0, 1.0, 8.0, 9.0]}
@@ -22,6 +35,14 @@ class YoloBoxGraspPixelTests(unittest.TestCase):
 
     def test_servo_prefers_yolo_box_landmark(self):
         item = {"center_px": [2.0, 3.0], "yolo_box_grasp_pixel_px": [5.0, 7.0]}
+        self.assertEqual(servo_pixel(item), [5.0, 7.0])
+
+    def test_servo_uses_yolo_landmark_even_if_legacy_step_data_is_present(self):
+        item = {
+            "center_px": [2.0, 3.0],
+            "yolo_box_grasp_pixel_px": [5.0, 7.0],
+            "step_pose": {"accepted": True, "grasp_pixel_px": [11.0, 13.0]},
+        }
         self.assertEqual(servo_pixel(item), [5.0, 7.0])
 
     def test_urdf_center_is_midpoint_of_fixed_symmetric_anchors(self):

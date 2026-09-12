@@ -128,6 +128,23 @@ class RightPostGraspSequenceTests(unittest.TestCase):
         self.assertEqual(result["event"], "right_pr2_arrived")
         self.assertAlmostEqual(result["max_joint_error_rad"], 0.0)
 
+    def test_move_right_pr1_forwards_explicit_velocity_without_legacy_cap(self):
+        target = [0.1] * 7
+
+        class StubController:
+            def __init__(self):
+                self.request = None
+
+            def move_preset(self, side, positions, **kwargs):
+                self.request = (side, list(positions), kwargs)
+
+            def checked_arm_state(self):
+                return tuple([0.0] * 7 + target)
+
+        controller = StubController()
+        move_right_pr1(controller, target, velocity_rad_s=0.2, timeout_s=1.0)
+        self.assertAlmostEqual(controller.request[2]["velocity_rad_s"], 0.2)
+
     def test_post_grasp_transport_saves_then_lifts_then_moves_to_pr2(self):
         events = []
         saved = {

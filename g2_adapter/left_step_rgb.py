@@ -13,6 +13,11 @@ from pathlib import Path
 import cv2
 import numpy as np
 
+try:
+    from .left_step_height import HEIGHT_REFERENCE_SCHEMA_VERSION, validate_height_samples
+except ImportError:
+    from left_step_height import HEIGHT_REFERENCE_SCHEMA_VERSION, validate_height_samples
+
 
 def load_profile(path):
     profile = json.loads(Path(path).read_text())
@@ -38,11 +43,22 @@ def camera_matrix(intrinsic):
 
 def load_alignment_reference(path, profile):
     reference = json.loads(Path(path).read_text())
+    if reference.get("source_sha256") != profile["source_sha256"] or reference.get("grasp_center_m") != profile["grasp_center_m"]:
+        raise ValueError("STEP model/target changed: recapture alignment reference")
+    if "height_samples" in reference:
+        if reference.get("schema_version") != HEIGHT_REFERENCE_SCHEMA_VERSION:
+            raise ValueError("unsupported STEP height reference schema_version")
+        samples = validate_height_samples(reference["height_samples"])
+        # Keep the 0 mm anchor as a compatibility target for configuration
+        # and coarse state initialization. Runtime uses the interpolated value.
+        reference = dict(reference)
+        reference["height_samples"] = samples
+        reference.setdefault("target_pixel_px", samples[0]["target_pixel_px"])
+        reference.setdefault("sample_count", sum(sample.get("sample_count", 0) for sample in samples))
+        return reference
     pixel = np.asarray(reference["target_pixel_px"], dtype=float)
     if pixel.shape != (2,) or not np.isfinite(pixel).all():
         raise ValueError("invalid STEP alignment pixel")
-    if reference.get("source_sha256") != profile["source_sha256"] or reference.get("grasp_center_m") != profile["grasp_center_m"]:
-        raise ValueError("STEP model/target changed: recapture alignment reference")
     if reference.get("sample_count", 0) < 20:
         raise ValueError("STEP alignment requires 20 stationary frames")
     return reference

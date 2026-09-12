@@ -220,7 +220,12 @@ class TeleopSession:
     def _tick(self, frame, now):
         if not math.isfinite(now) or (self._last_time is not None and not 0 < now - self._last_time <= .08):
             raise SafetyError('遥操作循环超时或时钟异常')
-        dt = PERIOD_S if self._last_time is None else min(PERIOD_S, now - self._last_time)
+        # Preserve the configured velocity when GDK reads make one control
+        # iteration longer than the nominal 20 ms period.  The loop still
+        # targets 50 Hz, but using a fixed PERIOD_S here would silently scale
+        # the real speed by 20 ms / actual_iteration_time.  The upper bound
+        # keeps one delayed iteration from producing an unsafe large step.
+        dt = PERIOD_S if self._last_time is None else min(.08, now - self._last_time)
         self._last_time = self._tick_time = now
         raw = np.asarray(frame.axes, dtype=float)
         if raw.shape != (6,) or not np.all(np.isfinite(raw)):

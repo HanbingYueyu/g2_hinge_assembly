@@ -189,8 +189,8 @@ def move_right_preset(
     timeout_s: float = PRESET_TIMEOUT_S,
 ) -> dict:
     """Move the right arm to a named preset with feedback confirmation."""
-    if not 0.0 < velocity_rad_s <= 0.15:
-        raise ValueError(f"{preset_name} velocity must be in (0, 0.15] rad/s")
+    if not math.isfinite(float(velocity_rad_s)) or not float(velocity_rad_s) > 0.0:
+        raise ValueError(f"{preset_name} velocity must be a positive finite value in rad/s")
     if not 0.001 <= arrival_tolerance_rad <= 0.10:
         raise ValueError(f"{preset_name} arrival tolerance must be in [0.001, 0.10] rad")
     if not 1.0 <= timeout_s <= 30.0:

@@ -10,7 +10,7 @@ is the primary stop condition.
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from enum import Enum
 
 import numpy as np
@@ -57,6 +57,7 @@ class Observation:
     ppy: float
     base_xy_error_m: tuple[float, float] | None = None
     xy_tolerance_m: float = 0.002
+    target_pixel_px: tuple[float, float] | None = None
 
 
 @dataclass(frozen=True)
@@ -112,8 +113,9 @@ class LeftGraspState:
                 # Runtime dispatches XY corrections through the same bounded
                 # stream path; the vector is already in base coordinates.
                 return Step(self.phase, tuple(self._bounded(np.r_[error, 0.0], p.max_xy_step_m)), reason="metric_xy_correction")
+            target_pixel = observation.target_pixel_px or (p.target_u_px, p.target_v_px)
             pixel_error = np.asarray(
-                (observation.center_px[0] - p.target_u_px, observation.center_px[1] - p.target_v_px),
+                (observation.center_px[0] - target_pixel[0], observation.center_px[1] - target_pixel[1]),
                 dtype=np.float64,
             )
             if float(np.max(np.abs(pixel_error))) <= p.pixel_tolerance:
@@ -177,6 +179,19 @@ class LeftGraspState:
             return
         self.phase = GraspPhase.ALIGN_XY
         self.centered_frames = 0
+
+    def set_fine_target_pixel(self, pixel: tuple[float, float] | list[float]) -> None:
+        """Update the fine visual target without resetting the state machine."""
+        values = np.asarray(pixel, dtype=np.float64)
+        if values.shape != (2,) or not np.isfinite(values).all():
+            raise ValueError("fine target pixel must contain two finite values")
+        self.fine_parameters = replace(
+            self.fine_parameters,
+            target_u_px=float(values[0]),
+            target_v_px=float(values[1]),
+        )
+        if not self.coarse_active:
+            self.parameters = self.fine_parameters
 
     def reset_for_regrasp(self) -> None:
         """Start a new visual alignment after a confirmed failed attempt.

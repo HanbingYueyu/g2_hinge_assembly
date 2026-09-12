@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import sys
 import threading
 import time
@@ -174,7 +175,8 @@ def main() -> int:
         and args.imgsz > 0
         and args.max_frames >= 0
         and 0 <= args.web_port <= 65535
-        and 0.0 < args.velocity_rad_s <= 0.15
+        and math.isfinite(args.velocity_rad_s)
+        and args.velocity_rad_s > 0.0
         and 0.001 <= args.arrival_tolerance_rad <= 0.10
         and 1.0 <= args.premove_timeout_s <= 30.0
         and 0.0 < args.right_crop_percent <= 100.0

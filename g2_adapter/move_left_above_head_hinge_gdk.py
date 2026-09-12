@@ -42,13 +42,16 @@ TF_NEAR_LATEST_MS = 10.0
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--yolo-model", type=Path, default=PROJECT_ROOT / "runs/head_hinge_yolo_seg/head_from_scratch_v1/weights/best.pt")
-    parser.add_argument("--confidence", type=float, default=0.35)
+    parser.add_argument("--yolo-model", type=Path, default=PROJECT_ROOT / "models" / "head_hinge_yolo" / "best.pt")
+    parser.add_argument("--confidence", type=float, default=0.50)
     parser.add_argument("--imgsz", type=int, default=640)
     parser.add_argument("--device", default="cuda:0")
-    parser.add_argument("--samples", type=int, default=5)
-    parser.add_argument("--sample-timeout-s", type=float, default=15.0)
-    parser.add_argument("--max-sample-spread-mm", type=float, default=30.0)
+    parser.add_argument("--samples", type=int, default=15,
+                        help="头部 YOLO/RGB-D 候选三维样本数；默认 15。")
+    parser.add_argument("--min-inlier-samples", type=int, default=8,
+                        help="通过一致性检查所需的最少主簇样本数；默认 8。")
+    parser.add_argument("--max-sample-spread-mm", type=float, default=50.0,
+                        help="主簇样本距其中位数的最大允许距离，默认 50 mm。")
     parser.add_argument("--above-mm", type=float, default=200.0)
     parser.add_argument("--tcp-end-mm", default="0,0,145", help="夹持中心在 arm_l_end_link 下的近似 XYZ，毫米")
     parser.add_argument("--poses", type=Path, default=DEFAULT_OUTPUT)
@@ -94,6 +97,27 @@ def append_log(path: Path, event: dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("a", encoding="utf-8") as stream:
         stream.write(json.dumps({"utc": datetime.now(timezone.utc).isoformat(), **event}, ensure_ascii=False) + "\n")
+
+
+def dominant_sample_cluster(samples: np.ndarray, max_spread_m: float) -> tuple[np.ndarray, np.ndarray, float]:
+    """Return the dominant spatial cluster and discard distant detections."""
+    points = np.asarray(samples, dtype=float)
+    if points.ndim != 2 or points.shape[1] != 3 or len(points) == 0:
+        raise ValueError("samples 必须是非空的 Nx3 三维点数组")
+    if not (np.isfinite(max_spread_m) and max_spread_m > 0):
+        raise ValueError("max_spread_m 必须为正的有限值")
+    distances = np.linalg.norm(points[:, None, :] - points[None, :, :], axis=2)
+    counts = np.count_nonzero(distances <= max_spread_m, axis=1)
+    inliers = distances[int(np.argmax(counts))] <= max_spread_m
+    while True:
+        center = np.median(points[inliers], axis=0)
+        refined = np.linalg.norm(points - center, axis=1) <= max_spread_m
+        if np.array_equal(refined, inliers):
+            break
+        inliers = refined
+    center = np.median(points[inliers], axis=0)
+    spread_m = float(np.max(np.linalg.norm(points[inliers] - center, axis=1)))
+    return center, inliers, spread_m
 
 
 def load_left_preset(path: Path, name: str) -> list[float]:
@@ -176,6 +200,36 @@ def select_leftmost_hinge(masks, scores, classes):
         if rows.size:
             candidates.append((float(cols.mean()), index, float(score)))
     return None if not candidates else min(candidates)[1]
+
+
+def draw_head_coarse_overlay(
+    bgr: np.ndarray,
+    masks,
+    scores,
+    classes,
+    selected: int | None,
+    collected_samples: int,
+    required_samples: int,
+) -> np.ndarray:
+    """Render the head YOLO view while coarse localization is sampling."""
+    overlay = np.asarray(bgr).copy()
+    for index, (mask, score, class_id) in enumerate(zip(masks, scores, classes)):
+        if int(class_id) != 0:
+            continue
+        binary = np.asarray(mask, dtype=bool)
+        if binary.shape != overlay.shape[:2] or not np.any(binary):
+            continue
+        color = np.asarray((0, 255, 0) if index == selected else (0, 165, 255), dtype=np.uint8)
+        overlay[binary] = (0.65 * overlay[binary] + 0.35 * color).astype(np.uint8)
+        rows, cols = np.where(binary)
+        x0, y0, x1, y1 = int(cols.min()), int(rows.min()), int(cols.max()), int(rows.max())
+        cv2.rectangle(overlay, (x0, y0), (x1, y1), tuple(int(value) for value in color), 2)
+        label = "leftmost hinge" if index == selected else "hinge"
+        cv2.putText(overlay, f"{label} {float(score):.2f}", (x0, max(22, y0 - 7)),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, tuple(int(value) for value in color), 2)
+    cv2.putText(overlay, f"Head YOLO coarse localization {collected_samples}/{required_samples}",
+                (12, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 255, 255), 2)
+    return overlay
 
 
 def base_from_head_at(tf, timestamp_ns: int, *, max_fallback_gap_ms: float = TF_FALLBACK_MAX_GAP_MS):
@@ -268,7 +322,9 @@ def main() -> int:
     except ValueError:
         print("--tcp-end-mm 必须是三个有限数值，例如 0,0,145", file=sys.stderr)
         return 2
-    if not (0 < args.confidence <= 1 and 1 <= args.samples <= 30 and 0 < args.above_mm <= 500
+    if not (0.5 <= args.confidence <= 1 and 1 <= args.samples <= 30
+            and 1 <= args.min_inlier_samples <= args.samples
+            and 0 < args.max_sample_spread_mm <= 200 and 0 < args.above_mm <= 500
             and 0 < args.speed_mm_s <= 50 and 0 < args.max_travel_mm <= 800
             and 1 <= args.arrival_tolerance_mm <= 30 and 1 <= args.head_xy_tolerance_mm <= 100
             and 1 <= args.orientation_speed_deg_s <= math.degrees(1.0)):
@@ -302,9 +358,8 @@ def main() -> int:
         tf_modes = []
         tf_gaps_ms = []
         last_timestamp = None
-        deadline = time.monotonic() + args.sample_timeout_s
         last_overlay = None
-        while len(observations) < args.samples and time.monotonic() < deadline:
+        while len(observations) < args.samples:
             color = camera.get_latest_image(color_type, 1000.0)
             if int(color.timestamp_ns) == last_timestamp:
                 time.sleep(0.01)
@@ -341,19 +396,27 @@ def main() -> int:
             cv2.rectangle(last_overlay, (int(cols.min()), int(rows.min())), (int(cols.max()), int(rows.max())), (0, 255, 0), 2)
             cv2.putText(last_overlay, f"leftmost hinge {len(observations)}/{args.samples} depth={point_color[2]:.3f}m",
                         (int(cols.min()), max(22, int(rows.min())-7)), cv2.FONT_HERSHEY_SIMPLEX, .55, (0,255,0), 2)
-        if len(observations) < args.samples:
-            raise RuntimeError(f"{args.sample_timeout_s:.1f}s 内仅取得 {len(observations)}/{args.samples} 个有效左侧铰链深度样本")
         samples = np.asarray(observations)
-        hinge_base = np.median(samples, axis=0)
-        spread_mm = float(np.max(np.linalg.norm(samples - hinge_base, axis=1)) * 1000.0)
-        if spread_mm > args.max_sample_spread_mm:
-            raise RuntimeError(f"铰链定位样本离散 {spread_mm:.1f} mm，超过 {args.max_sample_spread_mm:.1f} mm")
+        hinge_base, inlier_mask, spread_m = dominant_sample_cluster(
+            samples, args.max_sample_spread_mm / 1000.0,
+        )
+        inlier_count = int(np.count_nonzero(inlier_mask))
+        rejected_count = int(len(samples) - inlier_count)
+        spread_mm = spread_m * 1000.0
+        if inlier_count < args.min_inlier_samples:
+            raise RuntimeError(
+                f"头部铰链样本没有足够一致的主簇：{inlier_count}/{len(samples)} 个样本在 "
+                f"{args.max_sample_spread_mm:.1f} mm 内，至少需要 {args.min_inlier_samples} 个"
+            )
         if last_overlay is not None:
             args.save_overlay.parent.mkdir(parents=True, exist_ok=True)
             cv2.imwrite(str(args.save_overlay), last_overlay)
         result = {"event":"head_leftmost_hinge_localized", "motion_enabled":bool(args.allow_motion),
-                  "samples":len(observations), "sample_spread_mm":round(spread_mm,2),
-                  "tf_modes":tf_modes, "max_tf_fallback_gap_ms":round(max(tf_gaps_ms),3),
+                  "samples":len(observations), "inlier_samples":inlier_count,
+                  "rejected_samples":rejected_count, "sample_spread_mm":round(spread_mm,2),
+                  "max_sample_spread_mm":args.max_sample_spread_mm,
+                  "tf_modes":[mode for mode, keep in zip(tf_modes, inlier_mask) if keep],
+                  "max_tf_fallback_gap_ms":round(max(gap for gap, keep in zip(tf_gaps_ms, inlier_mask) if keep),3),
                   "hinge_position_base_link_m":[float(v) for v in hinge_base], "above_mm":args.above_mm,
                   "tcp_end_mm":[float(v*1000) for v in tcp_end_m],
                   "grasp_preset":None if args.orientation_only else args.grasp_preset,

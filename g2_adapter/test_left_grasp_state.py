@@ -75,6 +75,28 @@ class LeftGraspStateTests(unittest.TestCase):
         self.assertEqual(step.phase, GraspPhase.FINAL_DESCENT)
         self.assertIsNone(step.camera_delta_m)
 
+    def test_fine_target_pixel_can_be_updated_after_step_pose_interpolation(self):
+        machine = LeftGraspState(self.parameters)
+        machine.set_fine_target_pixel((350.0, 260.0))
+        self.assertEqual(machine.parameters.target_u_px, 350.0)
+        self.assertEqual(machine.parameters.target_v_px, 260.0)
+        step = machine.update(observation(center=(350.0, 260.0)), now=0.0)
+        self.assertEqual(step.reason, "xy_center_confirmation")
+
+    def test_observation_can_override_target_pixel_for_height_interpolation(self):
+        machine = LeftGraspState(self.parameters)
+        step = machine.update(
+            observation(center=(350.0, 260.0)), now=0.0,
+        )
+        self.assertEqual(step.reason, "xy_correction")
+        step = machine.update(
+            Observation(
+                (350.0, 260.0), 0.20, 400.0, 400.0, 320.0, 240.0,
+                target_pixel_px=(350.0, 260.0),
+            ), now=0.1,
+        )
+        self.assertEqual(step.reason, "xy_center_confirmation")
+
     def test_force_guarded_descent_ignores_depth_as_a_motion_trigger(self):
         machine = LeftGraspState(self.parameters)
         for now in (0.1, 0.2, 0.3):

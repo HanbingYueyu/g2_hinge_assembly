@@ -84,50 +84,55 @@ class GestureTests(unittest.TestCase):
         result = state.update(frame(1.02), 1.02)
         self.assertFalse(result.activity)
 
-    def test_dual_button_chord_emits_once_after_neutral_hold(self):
+    def test_left_long_hold_then_right_press_emits_dianpi_once(self):
         state = SpaceMouseGestureState()
         state.update(frame(0.00, buttons=(True, False), pressed=(0,)), 0.00)
-        state.update(frame(0.10, buttons=(True, True), pressed=(1,)), 0.10)
-        result = state.update(frame(0.41, buttons=(True, True)), 0.41)
+        result = state.update(frame(LONG_PRESS_S + 0.01, buttons=(True, False)), LONG_PRESS_S + 0.01)
+        self.assertEqual(result.events, ())
+        result = state.update(
+            frame(LONG_PRESS_S + 0.02, buttons=(True, True), pressed=(1,)),
+            LONG_PRESS_S + 0.02,
+        )
         self.assertEqual(result.events, (TakeoverEvent.START_DIANPI,))
         self.assertEqual(result.consumed_buttons, (0, 1))
-        result = state.update(frame(0.50, buttons=(True, True)), 0.50)
+        result = state.update(frame(LONG_PRESS_S + 0.50, buttons=(True, True)), LONG_PRESS_S + 0.50)
         self.assertEqual(result.events, ())
-        state.update(frame(0.60, buttons=(False, False)), 0.60)
+        state.update(frame(LONG_PRESS_S + 0.60, buttons=(False, False)), LONG_PRESS_S + 0.60)
 
-    def test_dual_button_chord_suppresses_all_single_button_gestures(self):
+    def test_left_long_hold_then_right_dianpi_does_not_require_neutral_axes(self):
         state = SpaceMouseGestureState()
-        state.update(frame(1.00, buttons=(True, True), pressed=(0, 1)), 1.00)
-        result = state.update(frame(3.00, buttons=(True, True)), 3.00)
-        self.assertEqual(result.events, (TakeoverEvent.START_DIANPI,))
-        self.assertNotIn(TakeoverEvent.ADVANCE_RIGHT, result.events)
-        state.update(frame(3.10, buttons=(False, False)), 3.10)
-        result = state.update(frame(3.20, pressed=(1,)), 3.20)
-        self.assertEqual(result.events, ())
-
-    def test_dual_button_chord_requires_press_window_hold_and_neutral_axes(self):
-        state = SpaceMouseGestureState()
-        state.update(frame(0.00, buttons=(True, False), pressed=(0,)), 0.00)
-        state.update(frame(0.20, buttons=(True, True), pressed=(1,)), 0.20)
-        result = state.update(frame(0.60, buttons=(True, True)), 0.60)
-        self.assertEqual(result.events, ())
-        state.update(frame(0.70, buttons=(False, False)), 0.70)
-
-        state.update(
-            frame(1.00, buttons=(True, True), axes=(0.5, 0, 0, 0, 0, 0), pressed=(0, 1)),
-            1.00,
+        state.update(frame(1.00, buttons=(True, False), pressed=(0,)), 1.00)
+        state.update(frame(1.00 + LONG_PRESS_S + 0.01, buttons=(True, False)), 1.00 + LONG_PRESS_S + 0.01)
+        result = state.update(
+            frame(1.00 + LONG_PRESS_S + 0.02, axes=(0.5, 0, 0, 0, 0, 0), buttons=(True, True), pressed=(1,)),
+            1.00 + LONG_PRESS_S + 0.02,
         )
+        self.assertEqual(result.events, (TakeoverEvent.START_DIANPI,))
+        self.assertEqual(result.consumed_buttons, (0, 1))
+
+    def test_early_right_press_is_suppressed_until_both_buttons_release(self):
+        state = SpaceMouseGestureState()
+        state.update(frame(1.00, buttons=(True, False), pressed=(0,)), 1.00)
+        state.update(frame(1.05, buttons=(True, True), pressed=(1,)), 1.05)
         self.assertEqual(
-            state.update(
-                frame(1.31, buttons=(True, True), axes=(0.5, 0, 0, 0, 0, 0)),
-                1.31,
-            ).events,
+            state.update(frame(1.05 + LONG_PRESS_S + 0.1, buttons=(True, True)), 1.05 + LONG_PRESS_S + 0.1).events,
             (),
         )
-        self.assertEqual(
-            state.update(frame(1.32, buttons=(True, True)), 1.32).events,
-            (TakeoverEvent.START_DIANPI,),
-        )
+        state.update(frame(2.00, buttons=(False, False)), 2.00)
+        state.update(frame(2.10, buttons=(True, False), pressed=(0,)), 2.10)
+        state.update(frame(2.10 + LONG_PRESS_S + 0.01, buttons=(True, False)), 2.10 + LONG_PRESS_S + 0.01)
+        result = state.update(frame(2.10 + LONG_PRESS_S + 0.02, buttons=(True, True), pressed=(1,)), 2.10 + LONG_PRESS_S + 0.02)
+        self.assertEqual(result.events, (TakeoverEvent.START_DIANPI,))
+
+    def test_dianpi_chord_suppresses_all_single_button_gestures(self):
+        state = SpaceMouseGestureState()
+        state.update(frame(1.00, buttons=(True, False), pressed=(0,)), 1.00)
+        state.update(frame(1.00 + LONG_PRESS_S + 0.01, buttons=(True, False)), 1.00 + LONG_PRESS_S + 0.01)
+        result = state.update(frame(1.00 + LONG_PRESS_S + 0.02, buttons=(True, True), pressed=(1,)), 1.00 + LONG_PRESS_S + 0.02)
+        self.assertEqual(result.events, (TakeoverEvent.START_DIANPI,))
+        state.update(frame(1.50, buttons=(False, False)), 1.50)
+        result = state.update(frame(1.60, pressed=(1,)), 1.60)
+        self.assertEqual(result.events, ())
 
 
 class MotionPauseGateTests(unittest.TestCase):
@@ -217,7 +222,7 @@ class MotionPauseGateTests(unittest.TestCase):
 
 
 class WorkerTests(unittest.TestCase):
-    def test_worker_routes_dual_button_chord_to_dianpi_without_takeover(self):
+    def test_worker_routes_left_hold_right_press_to_dianpi_without_takeover(self):
         robot = BilateralRobot()
         gate = MotionPauseGate()
         controller = G2Controller(FakeGdk, robot, allow_motion=True, motion_gate=gate)
@@ -228,11 +233,12 @@ class WorkerTests(unittest.TestCase):
             device=None,
             config=TeleopConfig(side="left", axis_map=(1, 2, 3, 4, 5, 6)),
             dianpi_runner=runner,
-            clock=lambda: 0.31,
+            clock=lambda: LONG_PRESS_S + 0.02,
         )
 
-        worker.step(frame(0.00, buttons=(True, True), pressed=(0, 1)), 0.00)
-        result = worker.step(frame(0.31, buttons=(True, True)), 0.31)
+        worker.step(frame(0.00, buttons=(True, False), pressed=(0,)), 0.00)
+        worker.step(frame(LONG_PRESS_S + 0.01, buttons=(True, False)), LONG_PRESS_S + 0.01)
+        result = worker.step(frame(LONG_PRESS_S + 0.02, buttons=(True, True), pressed=(1,)), LONG_PRESS_S + 0.02)
 
         self.assertEqual(result.events, (TakeoverEvent.START_DIANPI,))
         self.assertEqual(runner.calls, 1)
@@ -251,8 +257,9 @@ class WorkerTests(unittest.TestCase):
             dianpi_runner=runner,
         )
 
-        worker.step(frame(0.00, buttons=(True, True), pressed=(0, 1)), 0.00)
-        worker.step(frame(0.31, buttons=(True, True)), 0.31)
+        worker.step(frame(0.00, buttons=(True, False), pressed=(0,)), 0.00)
+        worker.step(frame(LONG_PRESS_S + 0.01, buttons=(True, False)), LONG_PRESS_S + 0.01)
+        worker.step(frame(LONG_PRESS_S + 0.02, buttons=(True, True), pressed=(1,)), LONG_PRESS_S + 0.02)
         worker.raise_if_failed()
         self.assertEqual(runner.calls, 1)
 

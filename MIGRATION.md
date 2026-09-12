@@ -16,6 +16,8 @@ GDK 头部/双手 RGB-D
 
 预设点使用 `joint_control_request()`，由 GDK 执行规划和碰撞检查。连续视觉闭环使用
 `end_effector_pose_control()`，在 mode 1 下由 GDK 全身逆解，并以 50 Hz 的连续、限速目标发布。
+位姿流同时以 10 Hz 缓存实际末端反馈：实际末端与当前设定点的平移误差超过 5 mm 时暂停
+设定点推进并保持原目标，直到机器人追上；反馈超时则停止。到位事件只由实际反馈确认。
 该接口不规划且官方标注无碰撞检测，因此只允许已验证的局部小步；运行时仍检查状态、急停、NaN/Inf、
 目标有效性和超时。代码不会修改或关闭 GDK 碰撞配置。
 
@@ -90,7 +92,7 @@ G2 原图比例并由 YOLO 内部 letterbox；实时验证时传入
 - `g2_adapter/control.py`：唯一 GDK 运动调用边界；
 - `g2_adapter/camera.py`：GDK RGB-D 同步读取与解码；
 - `g2_adapter/safety.py`：关节、状态、速度和夹爪安全规则；
-- `g2_adapter/record_pose.py`：只读记录左手 P2/P3/P4、右手抓取前 PR1 和抓取后 PR2；
+- `g2_adapter/record_pose.py`：只读记录双臂 `workflow_home`，以及左手 P2/P3/P4、右手抓取前 PR1 和抓取后 PR2；
 - `g2_adapter/run_preset.py`：只读预检或执行一个已记录预设；
 - `g2_adapter/run_left_premove_sequence.py`：按到位确认顺序执行左 P2→P3，P3 为最终检测位；
 - `g2_adapter/run_left_post_grasp_sequence.py`：抓取确认后先在 `base_link +Z` 实测上抬 150 mm，再按到位确认执行左 P4，并保持夹爪状态；
@@ -116,6 +118,7 @@ G2 原图比例并由 YOLO 内部 letterbox；实时验证时传入
 由操作员手动将机器人移动到目标位置，然后运行只读记录：
 
 ```bash
+/home/flyfuture/traditional_auto_flow_g2_migration/scripts/run_gdk_python.sh g2_adapter/record_pose.py --name workflow_home --both-arms --save
 /home/flyfuture/traditional_auto_flow_g2_migration/scripts/run_gdk_python.sh g2_adapter/record_pose.py --name left_p2 --save
 /home/flyfuture/traditional_auto_flow_g2_migration/scripts/run_gdk_python.sh g2_adapter/record_pose.py --name left_p3 --save
 /home/flyfuture/traditional_auto_flow_g2_migration/scripts/run_gdk_python.sh g2_adapter/record_pose.py --name right_pr1 --save
@@ -183,7 +186,7 @@ GDK 左手 RGB-D 外参以 `arm_l_end_link` 为终点；视觉 FK、Jacobian、I
 最终检测位，再启动抓取状态机。若全部 P2/P3/P4 已记录，可在同一入口追加 `--full-cycle`，由单一 GDK/SAM3 进程完成整条流程。左 Omnipicker 的机械行程已实测为最大张开 `-0.785 rad`、全闭合 `0.0 rad`；当前运行时张开目标设为经操作员确认的 65%（`-0.51025 rad`），以避免碰到周围铰链。夹紧不再依赖固定绝对角度：它先测出当前铰链位置的稳定卡住角度，再从该角度额外闭合 `0.03 rad`；
 `g2_adapter/left_grasp.example.json` 的 `target_pixel_px` 必须在夹爪将要下探的位置实测，表示视觉伺服的
 抓取参考像素。视觉深度仅用于筛除无效目标，**不再用于决定垂直下探距离**；不同铰链的绝对相机深度不能作为公共高度参考。XY 连续对准后，
-`approach.final_descent_speed_mps=0.01` 与 `approach.final_descent_duration_s=25.0` 定义一个最多 250 mm 的、受相对力优先保护的接触搜索行程。每次搜索前读取 20 帧新鲜基线；加 `--final-descent-visual-servo` 时，最终下探会仅对下探前锁定的同一目标按实测像素 Jacobian 做实时 XY 复位：单次最多 1 mm，默认不设累计 XY 上限（`--final-descent-visual-max-total-m` 设为正值时才重新启用）；相对力达到接触阈值 50% 即冻结视觉修正。视觉不会改变 Z 向下探距离。相对力首次达到 2 N 即停止向下。接触时相对力不超过 2 N 则保持当前位置直接闭爪；仅超过 2 N 才最多上提 15 mm，且相对力连续 3 帧降至或等于 2 N 后才闭爪。250 mm 和 15 mm 均为操作员确认的故障兜底上限。YOLO 以最左视觉候选为优先；对齐深度只记录诊断，不再筛掉最左目标或决定垂直下探。G2 基座方向经操作员确认：`+X` 前、`+Y` 左、`+Z` 上。完整抓取在文件未完成标定时会拒绝执行。
+`approach.final_descent_speed_mps=0.01` 与 `approach.final_descent_duration_s=25.0` 定义一个最多 250 mm 的、受相对力优先保护的接触搜索行程。每次搜索前读取 20 帧新鲜基线；加 `--final-descent-visual-servo` 时，最终下探会仅对下探前锁定的同一 YOLO 目标按实测像素 Jacobian 做实时 XY 复位：估计水平误差不超过 `--final-descent-visual-tolerance-mm`（默认 5 mm）时保持，超过后每次最多 1 mm，默认不设累计 XY 上限（`--final-descent-visual-max-total-m` 设为正值时才重新启用）；相对力达到接触阈值 50% 即冻结视觉修正。视觉不会改变 Z 向下探距离。相对力首次达到 2 N 即停止向下。接触时相对力不超过 2 N 则保持当前位置直接闭爪；仅超过 2 N 才最多上提 15 mm，且相对力连续 3 帧降至或等于 2 N 后才闭爪。250 mm 和 15 mm 均为操作员确认的故障兜底上限。YOLO 以最左视觉候选为优先；对齐深度只记录诊断，不再筛掉最左目标或决定垂直下探。G2 基座方向经操作员确认：`+X` 前、`+Y` 左、`+Z` 上。完整抓取在文件未完成标定时会拒绝执行。
 完整抓取在 P3 会先以 `left_end_state` 确认左 Omnipicker 的实际角度已到配置的 65% 张开目标 `-0.51025 rad` 附近；若 6 秒内没有这一反馈，流程停止且绝不开始视觉伺服或下探。
 只读观察可由操作员运行：
 

@@ -2,6 +2,7 @@
 """Preview YOLO + STEP hole-pattern PnP using only the left colour camera."""
 import argparse
 import json
+import queue
 import threading
 import time
 from http.server import ThreadingHTTPServer
@@ -12,9 +13,11 @@ import numpy as np
 
 try:
     from .left_step_rgb import load_profile, detect_hole_centres, match_holes, OcclusionTrackerPool
+    from .left_step_height import HEIGHT_REFERENCE_SCHEMA_VERSION, aggregate_height_observations
     from .yolo_hinge import load_yolo_segmentation_model, infer_yolo_masks
 except ImportError:
     from left_step_rgb import load_profile, detect_hole_centres, match_holes, OcclusionTrackerPool
+    from left_step_height import HEIGHT_REFERENCE_SCHEMA_VERSION, aggregate_height_observations
     from yolo_hinge import load_yolo_segmentation_model, infer_yolo_masks
 
 
@@ -50,6 +53,14 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--profile", type=Path, required=True)
     parser.add_argument("--save-reference", type=Path, help="Capture 20 stationary RGB frames after manually aligning the open gripper; no motion")
+    parser.add_argument(
+        "--save-height-reference", type=Path,
+        help="Interactively capture the 100/50/0 mm STEP pixel anchors and save one interpolated reference",
+    )
+    parser.add_argument(
+        "--height-capture-frames", type=int, default=5,
+        help="Accepted frames per height anchor (default: 5; median is saved)",
+    )
     parser.add_argument("--yolo-model", default="models/left_d405_hinge_shaft_yolo/best.pt")
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--image", type=Path, help="Offline RGB image instead of GDK")
@@ -61,8 +72,12 @@ def main():
     profile = load_profile(args.profile)
     if args.image and not args.intrinsics:
         parser.error("--image requires --intrinsics")
-    if args.image and args.save_reference:
+    if args.image and (args.save_reference or args.save_height_reference):
         parser.error("reference capture requires live camera")
+    if args.save_reference and args.save_height_reference:
+        parser.error("--save-reference and --save-height-reference are mutually exclusive")
+    if args.height_capture_frames < 1:
+        parser.error("--height-capture-frames must be positive")
     model = load_yolo_segmentation_model(args.yolo_model, device=args.device)
     if args.image:
         bgr = cv2.imread(str(args.image))
@@ -88,6 +103,9 @@ def main():
         raise RuntimeError("GDK initialization failed")
     camera = server = None
     thread = None
+    height_prompt_thread = None
+    height_commands = queue.Queue()
+    height_capture_results = []
     try:
         camera_type = gdk.CameraType.kHandLeftColor
         camera = gdk.Camera([camera_type])
@@ -96,9 +114,35 @@ def main():
         thread = threading.Thread(target=server.serve_forever, daemon=True)
         thread.start()
         print(f"RGB STEP preview: http://127.0.0.1:{args.web_port}", flush=True)
+        if args.save_height_reference:
+            def prompt_for_height_anchors():
+                try:
+                    for height_mm in (100.0, 50.0, 0.0):
+                        done = threading.Event()
+                        print(
+                            f"请将夹爪中心手动移动到铰链抓取点上方 {height_mm:.0f} mm，"
+                            "保持姿态后按回车开始采集；网页会持续更新。",
+                            flush=True,
+                        )
+                        input()
+                        height_commands.put((height_mm, done))
+                        done.wait()
+                        if not height_capture_results or height_capture_results[-1]["height_mm"] != height_mm:
+                            return
+                    height_commands.put((None, None))
+                except (EOFError, KeyboardInterrupt):
+                    height_commands.put((None, None))
+
+            height_prompt_thread = threading.Thread(target=prompt_for_height_anchors, daemon=True)
+            height_prompt_thread.start()
         previous_timestamp = None
         samples = []
         trackers = OcclusionTrackerPool()
+        active_height = None
+        active_height_done = None
+        active_height_pixels = []
+        active_height_xyz = []
+        last_height_progress = None
         while True:
             frame = camera.get_latest_image(camera_type, 1000.0)
             if frame.timestamp_ns == previous_timestamp:
@@ -107,7 +151,70 @@ def main():
             previous_timestamp = frame.timestamp_ns
             intrinsic = intrinsic_to_dict(camera.get_camera_intrinsic(camera_type), width=int(frame.width), height=int(frame.height))
             bgr = cv2.cvtColor(decode_color_rgb(frame, gdk), cv2.COLOR_RGB2BGR)
-            record = analyse(bgr, model, profile, intrinsic, args.device, trackers=None if args.save_reference else trackers)
+            record = analyse(
+                bgr, model, profile, intrinsic, args.device,
+                trackers=None if (args.save_reference or args.save_height_reference) else trackers,
+            )
+            if args.save_height_reference and active_height is None:
+                try:
+                    active_height, active_height_done = height_commands.get_nowait()
+                except queue.Empty:
+                    active_height = None
+                if active_height is None:
+                    record["height_capture"] = {"state": "waiting_for_operator"}
+            if args.save_height_reference and active_height is not None:
+                accepted = [item for item in record["detections"] if item.get("accepted")]
+                if len(accepted) == 1:
+                    item = accepted[0]
+                    active_height_pixels.append(item["grasp_pixel_px"])
+                    active_height_xyz.append(item["grasp_xyz_camera_m"])
+                record["height_capture"] = {
+                    "height_mm": active_height,
+                    "samples": len(active_height_pixels),
+                    "required": args.height_capture_frames,
+                }
+                progress = (active_height, len(active_height_pixels))
+                if progress != last_height_progress:
+                    print(
+                        f"[采集 {active_height:.0f} mm] "
+                        f"有效帧 {len(active_height_pixels)}/{args.height_capture_frames}",
+                        flush=True,
+                    )
+                    last_height_progress = progress
+                if len(active_height_pixels) >= args.height_capture_frames:
+                    sample = aggregate_height_observations(
+                        active_height,
+                        pixels=active_height_pixels,
+                        grasp_xyz=active_height_xyz,
+                    )
+                    height_capture_results.append(sample)
+                    print(
+                        f"已采集 {active_height:.0f} mm：目标像素 "
+                        f"{sample['target_pixel_px']}，相机距离 {sample['camera_distance_m']:.4f} m",
+                        flush=True,
+                    )
+                    active_height_pixels = []
+                    active_height_xyz = []
+                    if active_height_done is not None:
+                        active_height_done.set()
+                    active_height = None
+                    active_height_done = None
+                    last_height_progress = None
+                    if len(height_capture_results) == 3:
+                        reference = {
+                            "schema_version": HEIGHT_REFERENCE_SCHEMA_VERSION,
+                            "height_reference_distance_basis": "step_target_camera_distance_m",
+                            "height_samples": height_capture_results,
+                            "target_pixel_px": height_capture_results[0]["target_pixel_px"],
+                            "sample_count": sum(item["sample_count"] for item in height_capture_results),
+                            "intrinsic": intrinsic,
+                            "source_sha256": profile["source_sha256"],
+                            "grasp_center_m": profile["grasp_center_m"],
+                        }
+                        args.save_height_reference.parent.mkdir(parents=True, exist_ok=True)
+                        args.save_height_reference.write_text(json.dumps(reference, indent=2) + "\n")
+                        print(f"Saved STEP height reference: {args.save_height_reference}", flush=True)
+                        break
             if args.save_reference:
                 detections = record["detections"]
                 # Never silently select another hinge when the intended one is missing.
@@ -132,7 +239,11 @@ def main():
             ok, jpeg = cv2.imencode(".jpg", bgr)
             if ok:
                 shared.update(jpeg.tobytes(), record)
-            print(json.dumps(record, ensure_ascii=False), flush=True)
+            # Height calibration keeps the web stream live but deliberately
+            # suppresses per-frame JSON so the three operator prompts remain
+            # readable in the terminal. Normal preview mode retains JSON.
+            if not args.save_height_reference:
+                print(json.dumps(record, ensure_ascii=False), flush=True)
     except KeyboardInterrupt:
         pass
     finally:

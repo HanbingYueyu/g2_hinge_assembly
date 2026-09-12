@@ -130,6 +130,10 @@ class DianpiController:
         self._serial_number: int | None = None
         self._opened = False
         self._state_lock = threading.Lock()
+        # ``read_inputs`` is used by both the P10 monitor and the cycle
+        # thread.  Protect the reusable ctypes buffers and serialize reads
+        # with output writes at the RM1010 boundary.
+        self._io_lock = threading.Lock()
         self._cycle_lock = threading.Lock()
         self._cycle_running = False
         self._stop_event = threading.Event()
@@ -155,17 +159,18 @@ class DianpiController:
         return self._serial_number
 
     def _write_pin(self, pin: int, state: int) -> None:
-        sn = self._require_open()
-        tx = (IO_WriteMultiPin_TxStruct_t * 1)()
-        rx = (IO_WriteMultiPin_RxStruct_t * 1)()
-        tx[0].Pin = pin
-        tx[0].PinState = state
-        ret = self._write_fn(sn, tx, rx, 1)
-        if int(ret) < 0 or rx[0].Ret != 0:
-            raise DianpiError(
-                f"RM1010 写入 {PIN_NAMES.get(pin, f'P{pin}')}={state} 失败: "
-                f"ret={int(ret)}, pin_ret={int(rx[0].Ret)}"
-            )
+        with self._io_lock:
+            sn = self._require_open()
+            tx = (IO_WriteMultiPin_TxStruct_t * 1)()
+            rx = (IO_WriteMultiPin_RxStruct_t * 1)()
+            tx[0].Pin = pin
+            tx[0].PinState = state
+            ret = self._write_fn(sn, tx, rx, 1)
+            if int(ret) < 0 or rx[0].Ret != 0:
+                raise DianpiError(
+                    f"RM1010 写入 {PIN_NAMES.get(pin, f'P{pin}')}={state} 失败: "
+                    f"ret={int(ret)}, pin_ret={int(rx[0].Ret)}"
+                )
 
     def _restore_cycle_outputs(self) -> None:
         for pin in (PIN_FORWARD, PIN_SOLENOID, PIN_FEEDER):
@@ -249,18 +254,19 @@ class DianpiController:
 
     def read_inputs(self) -> dict[int, int] | None:
         """读取 P3/P4/P10；底层失败返回 None。"""
-        sn = self._require_open()
-        if self._read_tx is None or self._read_rx is None:
-            raise DianpiError("RM1010 输入结构尚未初始化")
-        ret = self._read_fn(sn, self._read_tx, self._read_rx, len(INPUT_PINS))
-        if int(ret) < 0:
-            return None
-        states = {}
-        for index, pin in enumerate(INPUT_PINS):
-            if self._read_rx[index].Ret != 0:
+        with self._io_lock:
+            sn = self._require_open()
+            if self._read_tx is None or self._read_rx is None:
+                raise DianpiError("RM1010 输入结构尚未初始化")
+            ret = self._read_fn(sn, self._read_tx, self._read_rx, len(INPUT_PINS))
+            if int(ret) < 0:
                 return None
-            states[pin] = int(self._read_rx[index].PinState)
-        return states
+            states = {}
+            for index, pin in enumerate(INPUT_PINS):
+                if self._read_rx[index].Ret != 0:
+                    return None
+                states[pin] = int(self._read_rx[index].PinState)
+            return states
 
     def _report_inputs(self, states: dict[int, int]) -> None:
         if states.get(PIN_OK, 1) == 0:

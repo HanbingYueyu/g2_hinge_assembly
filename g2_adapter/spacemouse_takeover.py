@@ -26,10 +26,6 @@ except ImportError:
 DOUBLE_CLICK_WINDOW_S = 0.55
 LONG_PRESS_S = 0.40
 RIGHT_LONG_PRESS_S = 2.0
-# The dual-button chord is deliberately shorter than a right-button stage
-# advance and is recognized before any single-button gesture is evaluated.
-DIANPI_CHORD_WINDOW_S = 0.15
-DIANPI_CHORD_HOLD_S = 0.30
 # Kept as a compatibility constant for callers that imported the old policy;
 # takeover release is now explicit (double-click the active hand) and never
 # occurs solely because the SpaceMouse is idle.
@@ -64,8 +60,6 @@ class SpaceMouseGestureState:
         self._long = [False, False]
         self._pending_click: list[float | None] = [None, None]
         self._chord_blocked = False
-        self._chord_valid = False
-        self._chord_since: float | None = None
         self._chord_triggered = False
 
     def _short_release(self, button: int, now: float) -> tuple[TakeoverEvent | None, bool]:
@@ -118,20 +112,37 @@ class SpaceMouseGestureState:
 
         # The overlap itself is a conflict boundary.  Once both buttons are
         # down, never let a partially completed single-button gesture leak
-        # through, even when the second press arrived too late for a valid
-        # Dianpi chord.  The state is held until both buttons are released.
+        # through.  Dianpi is deliberately a directional gesture: the left
+        # button must already have been held long enough to be a 6D modifier,
+        # then a right-button press while it remains held starts one cycle.
+        # The state is held until both buttons are released.
         both_down = bool(frame.buttons[0]) and bool(frame.buttons[1])
+        left_down = bool(frame.buttons[0])
+        right_down = bool(frame.buttons[1])
+        left_pressed = left_down and not self._was_down[0]
+        right_pressed = right_down and not self._was_down[1]
+
+        # Update the left hold before checking the overlap.  Without this
+        # small pre-check, a report containing the right-button edge would
+        # lose the fact that the left button had already crossed the long
+        # press threshold on the preceding report.
+        if left_pressed:
+            self._down_since[0] = now
+            self._long[0] = False
+        if left_down and self._down_since[0] is not None:
+            if now - self._down_since[0] >= LONG_PRESS_S:
+                self._long[0] = True
+                self._pending_click[0] = None
+
         if both_down and not self._chord_blocked:
-            starts = [
-                self._down_since[index] if self._was_down[index] else now
-                for index in (0, 1)
-            ]
-            self._chord_since = max(starts)
-            self._chord_valid = abs(starts[0] - starts[1]) <= DIANPI_CHORD_WINDOW_S
+            left_long = self._long[0]
             self._chord_triggered = False
             self._chord_blocked = True
             self._pending_click = [None, None]
-            self._long = [False, False]
+            self._long = [left_long, False]
+            if left_long and right_pressed:
+                self._chord_triggered = True
+                events.append(TakeoverEvent.START_DIANPI)
         if self._chord_blocked:
             consumed.update((0, 1))
             if not both_down:
@@ -139,8 +150,6 @@ class SpaceMouseGestureState:
                 # buttons are fully up.  No pending click survives a chord.
                 if not frame.buttons[0] and not frame.buttons[1]:
                     self._chord_blocked = False
-                    self._chord_valid = False
-                    self._chord_since = None
                     self._chord_triggered = False
                     self._was_down = [False, False]
                     self._down_since = [None, None]
@@ -150,24 +159,7 @@ class SpaceMouseGestureState:
                     self._was_down = [bool(frame.buttons[0]), bool(frame.buttons[1])]
                 return GestureResult((), tuple(sorted(consumed)), activity)
             self._was_down = [True, True]
-            if (
-                self._chord_valid
-                and not self._chord_triggered
-                and self._chord_since is not None
-                and now - self._chord_since >= DIANPI_CHORD_HOLD_S
-                and all(
-                    math.isfinite(float(value))
-                    and abs(float(value)) <= self.deadzone
-                    for value in frame.axes
-                )
-            ):
-                self._chord_triggered = True
-                return GestureResult(
-                    (TakeoverEvent.START_DIANPI,),
-                    tuple(sorted(consumed)),
-                    activity,
-                )
-            return GestureResult((), tuple(sorted(consumed)), activity)
+            return GestureResult(tuple(events), tuple(sorted(consumed)), activity)
 
         for button in (0, 1):
             down = bool(frame.buttons[button])
@@ -362,6 +354,24 @@ class SpaceMouseTakeoverWorker:
             frame.peak_axes,
         )
 
+    @staticmethod
+    def _neutral_frame(now: float) -> InputFrame:
+        """Build a valid hold report for a button-conflict event.
+
+        A Dianpi trigger owns both buttons.  Feeding the original axes into
+        the manual session at that instant could turn a trigger into an
+        unintended robot step, so the session receives a measured-pose hold
+        while retaining its current gripper goal.
+        """
+        return InputFrame(
+            (0.0,) * 6,
+            (False, False),
+            (),
+            (now, now),
+            True,
+            (0.0,) * 6,
+        )
+
     def _new_session(self, side: str):
         from dataclasses import replace
 
@@ -418,9 +428,8 @@ class SpaceMouseTakeoverWorker:
                 # click state into TeleopSession.  A neutral tick bases the
                 # hold on current feedback while preserving the active
                 # gripper goal.
-                sanitized = self._without_consumed_buttons(frame, result.consumed_buttons)
                 with self.controller.manual_motion():
-                    self._session.tick(sanitized, now)
+                    self._session.tick(self._neutral_frame(now), now)
             return result
         if TakeoverEvent.ADVANCE_RIGHT in result.events:
             if self.allow_advance_right:

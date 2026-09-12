@@ -42,6 +42,12 @@ class MotionDisabledError(SafetyError):
 
 
 _FIXED_ORIENTATION_TOLERANCE_DEG = 0.01
+_DEFAULT_FEEDBACK_RATE_HZ = 10.0
+_DEFAULT_SOFT_FOLLOW_ERROR_M = 0.005
+_DEFAULT_FEEDBACK_STALE_TIMEOUT_S = 0.30
+_DEFAULT_ACTUAL_ARRIVAL_POSITION_TOLERANCE_M = 0.005
+_DEFAULT_ACTUAL_ARRIVAL_ORIENTATION_TOLERANCE_DEG = 2.0
+_DEFAULT_ACTUAL_ARRIVAL_STABLE_SAMPLES = 3
 
 
 def quaternion_slerp(
@@ -105,6 +111,18 @@ class CartesianPoseTarget:
         norm = math.sqrt(sum(value * value for value in self.orientation_xyzw))
         if norm < 1e-6:
             raise SafetyError("cartesian orientation quaternion has zero length")
+
+
+def _pose_errors(actual: CartesianPoseTarget, target: CartesianPoseTarget) -> tuple[float, float]:
+    """Return translational metres and rotational degrees from target to actual."""
+    position_error_m = float(
+        np.linalg.norm(
+            np.asarray(actual.position_m, dtype=np.float64)
+            - np.asarray(target.position_m, dtype=np.float64)
+        )
+    )
+    orientation_error_deg = quaternion_angle_deg(actual.orientation_xyzw, target.orientation_xyzw)
+    return position_error_m, orientation_error_deg
 
 
 class LeftCartesianImpedanceStream:
@@ -185,6 +203,8 @@ class LeftEndEffectorPositionStream:
     mode.  Per GDK's contract, commands must be published at 50 Hz and may
     not jump.  This stream therefore holds the last target continuously and
     slews only translation; the end-link orientation is fixed at startup.
+    Target progression is paced by a lower-rate actual end-link feedback
+    cache, so a slow robot can catch up without accumulating open-loop error.
     """
 
     def __init__(
@@ -196,24 +216,40 @@ class LeftEndEffectorPositionStream:
         max_translation_velocity_mps: float,
         allow_orientation_change: bool = False,
         max_angular_velocity_rad_s: float = 0.5,
+        feedback_rate_hz: float = _DEFAULT_FEEDBACK_RATE_HZ,
+        soft_follow_error_m: float = _DEFAULT_SOFT_FOLLOW_ERROR_M,
+        feedback_stale_timeout_s: float = _DEFAULT_FEEDBACK_STALE_TIMEOUT_S,
     ) -> None:
         if not 45.0 <= rate_hz <= 55.0:
             raise ValueError("end-effector position publication rate must be in [45, 55] Hz")
         if not 0.04 <= life_time_s <= 0.20:
             raise ValueError("end-effector position life_time must be in [0.04, 0.20] seconds")
-        if not 0.0 < max_translation_velocity_mps <= 0.05:
-            raise ValueError("end-effector translation velocity must be in (0, 0.05] m/s")
+        if not math.isfinite(max_translation_velocity_mps) or max_translation_velocity_mps <= 0.0:
+            raise ValueError("end-effector translation velocity must be a positive finite value")
         if not 0.01 <= max_angular_velocity_rad_s <= 1.0:
             raise ValueError("end-effector angular velocity must be in [0.01, 1.0] rad/s")
+        if not 10.0 <= feedback_rate_hz <= 20.0:
+            raise ValueError("end-effector feedback rate must be in [10, 20] Hz")
+        if not 0.0 < soft_follow_error_m <= 0.05:
+            raise ValueError("soft follow error must be in (0, 0.05] m")
+        if not 0.10 <= feedback_stale_timeout_s <= 2.0:
+            raise ValueError("feedback stale timeout must be in [0.10, 2.0] seconds")
         self._controller = controller
         self._period_s = 1.0 / float(rate_hz)
+        self._feedback_period_s = 1.0 / float(feedback_rate_hz)
         self._life_time_s = float(life_time_s)
         self._max_translation_velocity_mps = float(max_translation_velocity_mps)
         self._allow_orientation_change = bool(allow_orientation_change)
         self._max_angular_velocity_rad_s = float(max_angular_velocity_rad_s)
+        self._soft_follow_error_m = float(soft_follow_error_m)
+        self._feedback_stale_timeout_s = float(feedback_stale_timeout_s)
+        self._frame_name = "arm_l_end_link"
         self._lock = threading.Lock()
         self._commanded: CartesianPoseTarget | None = None
         self._desired: CartesianPoseTarget | None = None
+        self._actual: CartesianPoseTarget | None = None
+        self._actual_at = 0.0
+        self._feedback_sequence = 0
         self._fixed_orientation: tuple[float, float, float, float] | None = None
         self._gripper_joint_names: tuple[str, ...] = ()
         self._gripper_joint_positions: tuple[float, ...] = ()
@@ -222,19 +258,37 @@ class LeftEndEffectorPositionStream:
         self._at_target = threading.Event()
         self._target_generation = 0
         self._arrived_generation = 0
+        self._actual_arrival_stable_samples = 0
         self._thread: threading.Thread | None = None
+        self._feedback_thread: threading.Thread | None = None
 
     def start(self, initial_target: CartesianPoseTarget) -> None:
         with self._lock:
-            if self._thread is not None:
+            if (
+                self._thread is not None and self._thread.is_alive()
+            ) or (
+                self._feedback_thread is not None and self._feedback_thread.is_alive()
+            ):
                 raise RuntimeError("end-effector position stream is already started")
+            self._thread = None
+            self._feedback_thread = None
             self._commanded = initial_target
             self._desired = initial_target
+            self._actual = None
+            self._actual_at = 0.0
+            self._feedback_sequence = 0
             self._fixed_orientation = initial_target.orientation_xyzw
             self._target_generation = 0
-            self._arrived_generation = 0
-            self._at_target.set()
+            self._arrived_generation = -1
+            self._actual_arrival_stable_samples = 0
+            self._at_target.clear()
+            self._stop.clear()
+            self._error = None
+            self._feedback_thread = threading.Thread(
+                target=self._feedback_loop, name="g2-left-end-effector-feedback", daemon=True,
+            )
             self._thread = threading.Thread(target=self._run, name="g2-left-end-effector-position", daemon=True)
+            self._feedback_thread.start()
             self._thread.start()
 
     def update_target(self, target: CartesianPoseTarget) -> None:
@@ -246,9 +300,11 @@ class LeftEndEffectorPositionStream:
                 raise SafetyError("mode-1 visual servo must keep the initial end-link orientation")
             self._desired = target
             self._target_generation += 1
+            self._actual_arrival_stable_samples = 0
             self._at_target.clear()
 
     def wait_until_target(self, timeout_s: float) -> bool:
+        """Wait until actual end-link feedback reaches the current target."""
         if not math.isfinite(timeout_s) or timeout_s <= 0.0:
             raise ValueError("target wait timeout must be positive and finite")
         deadline = time.monotonic() + timeout_s
@@ -257,29 +313,83 @@ class LeftEndEffectorPositionStream:
         while True:
             self.raise_if_failed()
             with self._lock:
-                if self._arrived_generation >= requested_generation:
+                arrived = self._arrived_generation >= requested_generation
+                actual_at = self._actual_at
+                feedback_sequence = self._feedback_sequence
+            if arrived:
+                age_s = time.monotonic() - actual_at
+                if feedback_sequence > 0 and age_s <= self._feedback_stale_timeout_s:
                     return True
+                if age_s > self._feedback_stale_timeout_s:
+                    raise SafetyError("left end-effector feedback is stale while waiting for actual arrival")
             remaining = deadline - time.monotonic()
             if remaining <= 0.0:
                 return False
             self._at_target.wait(remaining)
 
     def is_target_reached(self) -> bool:
-        """Return the current target-arrival state without waiting.
+        """Return whether actual end-link feedback has reached the target.
 
         State-machine callers use this to keep perception and the web UI
         responsive while a 50-Hz position stream is moving.
         """
         self.raise_if_failed()
         with self._lock:
-            return self._arrived_generation >= self._target_generation
+            return (
+                self._feedback_sequence > 0
+                and self._arrived_generation >= self._target_generation
+                and time.monotonic() - self._actual_at <= self._feedback_stale_timeout_s
+            )
 
     def set_translation_velocity(self, velocity_mps: float) -> None:
         """Change stream rate limit without replacing the sole command writer."""
-        if not 0 < velocity_mps <= 0.05:
-            raise ValueError("translation velocity must be in (0, 0.05] m/s")
+        if not math.isfinite(velocity_mps) or velocity_mps <= 0.0:
+            raise ValueError("translation velocity must be a positive finite value")
         with self._lock:
             self._max_translation_velocity_mps = float(velocity_mps)
+
+    def wait_until_actual_target(
+        self,
+        target: CartesianPoseTarget,
+        timeout_s: float,
+        *,
+        position_tolerance_m: float = _DEFAULT_ACTUAL_ARRIVAL_POSITION_TOLERANCE_M,
+        orientation_tolerance_deg: float = _DEFAULT_ACTUAL_ARRIVAL_ORIENTATION_TOLERANCE_DEG,
+        stable_samples: int = _DEFAULT_ACTUAL_ARRIVAL_STABLE_SAMPLES,
+        poll_period_s: float = 0.02,
+    ) -> CartesianPoseTarget | None:
+        """Wait for fresh cached feedback to stay at ``target``."""
+        if not 0.0 < position_tolerance_m <= 0.05:
+            raise ValueError("actual position tolerance must be in (0, 0.05] m")
+        if not 0.0 < orientation_tolerance_deg <= 10.0:
+            raise ValueError("actual orientation tolerance must be in (0, 10] deg")
+        if not 1 <= int(stable_samples) <= 50 or not 0.01 <= poll_period_s <= 0.10:
+            raise ValueError("actual-pose stability parameters are invalid")
+        deadline = time.monotonic() + float(timeout_s)
+        last_sequence = -1
+        consecutive = 0
+        latest: CartesianPoseTarget | None = None
+        while time.monotonic() < deadline:
+            self.raise_if_failed()
+            with self._lock:
+                actual = self._actual
+                actual_at = self._actual_at
+                sequence = self._feedback_sequence
+            if actual is not None:
+                latest = actual
+                if time.monotonic() - actual_at > self._feedback_stale_timeout_s:
+                    raise SafetyError("left end-effector feedback is stale while waiting for actual arrival")
+                if sequence != last_sequence:
+                    last_sequence = sequence
+                    position_error_m, orientation_error_deg = _pose_errors(actual, target)
+                    if position_error_m <= position_tolerance_m and orientation_error_deg <= orientation_tolerance_deg:
+                        consecutive += 1
+                        if consecutive >= int(stable_samples):
+                            return actual
+                    else:
+                        consecutive = 0
+            self._stop.wait(min(float(poll_period_s), self._feedback_period_s))
+        return None
 
     def set_left_gripper_target(self, position_rad: float) -> None:
         """Synchronize the left Omnipicker with this 50-Hz pose stream.
@@ -318,7 +428,60 @@ class LeftEndEffectorPositionStream:
         thread = self._thread
         if thread is not None and thread is not threading.current_thread():
             thread.join(timeout=max(0.2, self._period_s * 4.0))
-        self._thread = None
+        feedback_thread = self._feedback_thread
+        if feedback_thread is not None and feedback_thread is not threading.current_thread():
+            feedback_thread.join(timeout=max(0.2, self._feedback_period_s * 4.0))
+        with self._lock:
+            if self._thread is None or not self._thread.is_alive():
+                self._thread = None
+            if self._feedback_thread is None or not self._feedback_thread.is_alive():
+                self._feedback_thread = None
+
+    def _set_error(self, error: Exception) -> None:
+        with self._lock:
+            if self._error is None:
+                self._error = error
+        self._stop.set()
+
+    def _feedback_loop(self) -> None:
+        deadline = time.monotonic()
+        while not self._stop.is_set():
+            try:
+                actual = self._controller.read_end_effector_pose(self._frame_name)
+            except Exception as exc:
+                self._set_error(exc)
+                return
+            now = time.monotonic()
+            with self._lock:
+                self._actual = actual
+                self._actual_at = now
+                self._feedback_sequence += 1
+                desired = self._desired
+                generation = self._target_generation
+                if desired is not None:
+                    position_error_m, orientation_error_deg = _pose_errors(actual, desired)
+                    within_tolerance = (
+                        position_error_m <= _DEFAULT_ACTUAL_ARRIVAL_POSITION_TOLERANCE_M
+                        and orientation_error_deg <= _DEFAULT_ACTUAL_ARRIVAL_ORIENTATION_TOLERANCE_DEG
+                    )
+                    if within_tolerance:
+                        self._actual_arrival_stable_samples += 1
+                    else:
+                        self._actual_arrival_stable_samples = 0
+                        if generation == self._target_generation:
+                            self._arrived_generation = min(self._arrived_generation, generation - 1)
+                            self._at_target.clear()
+                    if (
+                        self._actual_arrival_stable_samples >= _DEFAULT_ACTUAL_ARRIVAL_STABLE_SAMPLES
+                    ):
+                        self._arrived_generation = max(self._arrived_generation, generation)
+                        if generation == self._target_generation:
+                            self._at_target.set()
+            deadline += self._feedback_period_s
+            now = time.monotonic()
+            if deadline <= now:
+                deadline = now + self._feedback_period_s
+            self._stop.wait(max(0.0, deadline - now))
 
     def _run(self) -> None:
         deadline = time.monotonic()
@@ -326,20 +489,25 @@ class LeftEndEffectorPositionStream:
             with self._lock:
                 commanded = self._commanded
                 desired = self._desired
-                generation = self._target_generation
+                actual = self._actual
+                actual_at = self._actual_at
                 gripper_joint_names = self._gripper_joint_names
                 gripper_joint_positions = self._gripper_joint_positions
             if commanded is None or desired is None:
                 return
+            if actual is None:
+                self._stop.wait(min(self._period_s, self._feedback_period_s))
+                deadline = time.monotonic()
+                continue
+            if time.monotonic() - actual_at > self._feedback_stale_timeout_s:
+                self._set_error(SafetyError("left end-effector feedback is stale; holding motion stopped"))
+                return
+            actual_follow_error_m, _ = _pose_errors(actual, commanded)
             current_position = np.asarray(commanded.position_m, dtype=np.float64)
             desired_position = np.asarray(desired.position_m, dtype=np.float64)
             delta = desired_position - current_position
             distance = float(np.linalg.norm(delta))
             max_step_m = self._max_translation_velocity_mps * self._period_s
-            if distance <= max_step_m:
-                next_position = desired_position
-            else:
-                next_position = current_position + delta * (max_step_m / distance)
             current_orientation = np.asarray(commanded.orientation_xyzw, dtype=np.float64)
             desired_orientation = np.asarray(desired.orientation_xyzw, dtype=np.float64)
             orientation_dot = abs(float(np.dot(
@@ -348,17 +516,25 @@ class LeftEndEffectorPositionStream:
             )))
             orientation_angle = 2.0 * math.acos(min(1.0, max(-1.0, orientation_dot)))
             max_angle_step = self._max_angular_velocity_rad_s * self._period_s
-            if orientation_angle <= max_angle_step:
-                next_orientation = desired.orientation_xyzw
+            can_advance = (
+                actual_follow_error_m <= self._soft_follow_error_m
+            )
+            if not can_advance:
+                next_target = commanded
             else:
-                next_orientation = quaternion_slerp(
-                    commanded.orientation_xyzw,
-                    desired.orientation_xyzw,
-                    max_angle_step / orientation_angle,
-                )
-            next_target = CartesianPoseTarget(tuple(float(value) for value in next_position), next_orientation)
-            if distance <= max_step_m and orientation_angle <= max_angle_step:
-                self._at_target.set()
+                if distance <= max_step_m:
+                    next_position = desired_position
+                else:
+                    next_position = current_position + delta * (max_step_m / distance)
+                if orientation_angle <= max_angle_step:
+                    next_orientation = desired.orientation_xyzw
+                else:
+                    next_orientation = quaternion_slerp(
+                        commanded.orientation_xyzw,
+                        desired.orientation_xyzw,
+                        max_angle_step / orientation_angle,
+                    )
+                next_target = CartesianPoseTarget(tuple(float(value) for value in next_position), next_orientation)
             try:
                 self._controller._send_left_cartesian_pose(
                     next_target,
@@ -367,18 +543,15 @@ class LeftEndEffectorPositionStream:
                     end_effector_joint_positions=gripper_joint_positions,
                 )
             except Exception as exc:
-                with self._lock:
-                    self._error = exc
-                self._stop.set()
+                self._set_error(exc)
                 return
             with self._lock:
                 self._commanded = next_target
-                if next_target == desired:
-                    self._arrived_generation = max(self._arrived_generation, generation)
-                    if generation == self._target_generation:
-                        self._at_target.set()
             deadline += self._period_s
-            self._stop.wait(max(0.0, deadline - time.monotonic()))
+            now = time.monotonic()
+            if deadline <= now:
+                deadline = now + self._period_s
+            self._stop.wait(max(0.0, deadline - now))
 
 
 class RightEndEffectorPositionStream:
@@ -392,6 +565,8 @@ class RightEndEffectorPositionStream:
 
     Its use is limited to calibrated, local right-hand motions because GDK's
     pose-control interface does not plan or collision-check a trajectory.
+    Target progression is paced by a lower-rate actual end-link feedback
+    cache, so a slow robot can catch up without accumulating open-loop error.
     """
 
     def __init__(
@@ -399,24 +574,40 @@ class RightEndEffectorPositionStream:
         max_translation_velocity_mps: float,
         allow_orientation_change: bool = False,
         max_angular_velocity_rad_s: float = 0.5,
+        feedback_rate_hz: float = _DEFAULT_FEEDBACK_RATE_HZ,
+        soft_follow_error_m: float = _DEFAULT_SOFT_FOLLOW_ERROR_M,
+        feedback_stale_timeout_s: float = _DEFAULT_FEEDBACK_STALE_TIMEOUT_S,
     ) -> None:
         if not 45.0 <= rate_hz <= 55.0:
             raise ValueError("Cartesian position publication rate must be in [45, 55] Hz")
         if not 0.04 <= life_time_s <= 0.20:
             raise ValueError("Cartesian position life_time must be in [0.04, 0.20] seconds")
-        if not 0.001 <= max_translation_velocity_mps <= 0.03:
-            raise ValueError("Cartesian translation velocity must be in [0.001, 0.03] m/s")
+        if not math.isfinite(max_translation_velocity_mps) or max_translation_velocity_mps <= 0.0:
+            raise ValueError("Cartesian translation velocity must be a positive finite value")
         if not 0.01 <= max_angular_velocity_rad_s <= 1.0:
             raise ValueError("Cartesian angular velocity must be in [0.01, 1.0] rad/s")
+        if not 10.0 <= feedback_rate_hz <= 20.0:
+            raise ValueError("end-effector feedback rate must be in [10, 20] Hz")
+        if not 0.0 < soft_follow_error_m <= 0.05:
+            raise ValueError("soft follow error must be in (0, 0.05] m")
+        if not 0.10 <= feedback_stale_timeout_s <= 2.0:
+            raise ValueError("feedback stale timeout must be in [0.10, 2.0] seconds")
         self._controller = controller
         self._period_s = 1.0 / float(rate_hz)
+        self._feedback_period_s = 1.0 / float(feedback_rate_hz)
         self._life_time_s = float(life_time_s)
         self._max_translation_velocity_mps = float(max_translation_velocity_mps)
         self._allow_orientation_change = bool(allow_orientation_change)
         self._max_angular_velocity_rad_s = float(max_angular_velocity_rad_s)
+        self._soft_follow_error_m = float(soft_follow_error_m)
+        self._feedback_stale_timeout_s = float(feedback_stale_timeout_s)
+        self._frame_name = "arm_r_end_link"
         self._lock = threading.Lock()
         self._commanded: CartesianPoseTarget | None = None
         self._desired: CartesianPoseTarget | None = None
+        self._actual: CartesianPoseTarget | None = None
+        self._actual_at = 0.0
+        self._feedback_sequence = 0
         self._fixed_orientation: tuple[float, float, float, float] | None = None
         self._gripper_joint_names: tuple[str, ...] = ()
         self._gripper_joint_positions: tuple[float, ...] = ()
@@ -425,17 +616,37 @@ class RightEndEffectorPositionStream:
         self._at_target = threading.Event()
         self._target_generation = 0
         self._arrived_generation = 0
+        self._actual_arrival_stable_samples = 0
         self._thread: threading.Thread | None = None
+        self._feedback_thread: threading.Thread | None = None
 
     def start(self, initial_target: CartesianPoseTarget) -> None:
         with self._lock:
-            if self._thread is not None:
+            if (
+                self._thread is not None and self._thread.is_alive()
+            ) or (
+                self._feedback_thread is not None and self._feedback_thread.is_alive()
+            ):
                 raise RuntimeError("right end-effector position stream is already started")
+            self._thread = None
+            self._feedback_thread = None
             self._commanded = initial_target
             self._desired = initial_target
+            self._actual = None
+            self._actual_at = 0.0
+            self._feedback_sequence = 0
             self._fixed_orientation = initial_target.orientation_xyzw
-            self._at_target.set()
+            self._target_generation = 0
+            self._arrived_generation = -1
+            self._actual_arrival_stable_samples = 0
+            self._at_target.clear()
+            self._stop.clear()
+            self._error = None
+            self._feedback_thread = threading.Thread(
+                target=self._feedback_loop, name="g2-right-end-effector-feedback", daemon=True,
+            )
             self._thread = threading.Thread(target=self._run, name="g2-right-end-effector-position", daemon=True)
+            self._feedback_thread.start()
             self._thread.start()
 
     def update_target(self, target: CartesianPoseTarget) -> None:
@@ -450,6 +661,7 @@ class RightEndEffectorPositionStream:
                 raise SafetyError("right mode-1 local grasp motion must keep the calibrated end-link orientation")
             self._desired = target
             self._target_generation += 1
+            self._actual_arrival_stable_samples = 0
             self._at_target.clear()
 
     def set_right_gripper_target(self, position_rad: float) -> None:
@@ -475,24 +687,36 @@ class RightEndEffectorPositionStream:
             self._gripper_joint_positions = (clipped,)
 
     def wait_until_target(self, timeout_s: float) -> bool:
-        """Wait only for the local 50-Hz command interpolator to finish.
-
-        This deliberately does *not* mean the physical robot reached the
-        target. Motion decisions which need physical arrival must call
-        :meth:`wait_until_actual_target` while this stream remains active.
-        """
+        """Wait until actual end-link feedback reaches the current target."""
         deadline = time.monotonic() + float(timeout_s)
         with self._lock:
             requested_generation = self._target_generation
         while True:
             self.raise_if_failed()
             with self._lock:
-                if self._arrived_generation >= requested_generation:
+                arrived = self._arrived_generation >= requested_generation
+                actual_at = self._actual_at
+                feedback_sequence = self._feedback_sequence
+            if arrived:
+                age_s = time.monotonic() - actual_at
+                if feedback_sequence > 0 and age_s <= self._feedback_stale_timeout_s:
                     return True
+                if age_s > self._feedback_stale_timeout_s:
+                    raise SafetyError("right end-effector feedback is stale while waiting for actual arrival")
             remaining = deadline - time.monotonic()
             if remaining <= 0.0:
                 return False
             self._at_target.wait(remaining)
+
+    def is_target_reached(self) -> bool:
+        """Return whether actual end-link feedback has reached the target."""
+        self.raise_if_failed()
+        with self._lock:
+            return (
+                self._feedback_sequence > 0
+                and self._arrived_generation >= self._target_generation
+                and time.monotonic() - self._actual_at <= self._feedback_stale_timeout_s
+            )
 
     def wait_until_actual_target(
         self,
@@ -504,7 +728,7 @@ class RightEndEffectorPositionStream:
         stable_samples: int = 10,
         poll_period_s: float = 0.02,
     ) -> CartesianPoseTarget | None:
-        """Keep streaming until GDK feedback is continuously at ``target``."""
+        """Keep streaming until cached GDK feedback is continuously at ``target``."""
         if not 0.0 < position_tolerance_m <= 0.005:
             raise ValueError("actual position tolerance must be in (0, 0.005] m")
         if not 0.0 < orientation_tolerance_deg <= 2.0:
@@ -513,16 +737,18 @@ class RightEndEffectorPositionStream:
             raise ValueError("actual-pose stability parameters are invalid")
         with self._lock:
             requested_generation = self._target_generation
-        target_position = np.asarray(target.position_m, dtype=np.float64)
-        target_orientation = np.asarray(target.orientation_xyzw, dtype=np.float64)
-        target_orientation /= np.linalg.norm(target_orientation)
         deadline = time.monotonic() + float(timeout_s)
+        last_sequence = -1
         consecutive = 0
+        latest: CartesianPoseTarget | None = None
         while time.monotonic() < deadline:
             self.raise_if_failed()
             with self._lock:
                 if self._target_generation != requested_generation:
                     raise SafetyError("right end-effector target changed while waiting for actual arrival")
+                actual = self._actual
+                actual_at = self._actual_at
+                sequence = self._feedback_sequence
             status = self._controller.robot.get_motion_control_status()
             # ``mode`` is the instantaneous motion state (0=stop, 1=servo,
             # 2=planning).  It is legitimately 0 immediately after switching
@@ -534,22 +760,20 @@ class RightEndEffectorPositionStream:
                     f"actual={{'mode': {int(status.mode)}, 'control_mode': {int(status.control_mode)}, "
                     f"'error_code': {int(status.error_code)}, 'error_msg': '{status.error_msg}'}}"
                 )
-            actual = self._controller.read_end_effector_pose("arm_r_end_link")
-            position_error = float(np.linalg.norm(np.asarray(actual.position_m) - target_position))
-            actual_orientation = np.asarray(actual.orientation_xyzw, dtype=np.float64)
-            norm = float(np.linalg.norm(actual_orientation))
-            if norm <= 1e-12:
-                raise SafetyError("right end-effector feedback orientation is invalid")
-            actual_orientation /= norm
-            dot = min(1.0, max(-1.0, abs(float(np.dot(actual_orientation, target_orientation)))))
-            orientation_error_deg = math.degrees(2.0 * math.acos(dot))
-            if position_error <= position_tolerance_m and orientation_error_deg <= orientation_tolerance_deg:
-                consecutive += 1
-                if consecutive >= stable_samples:
-                    return actual
-            else:
-                consecutive = 0
-            self._stop.wait(poll_period_s)
+            if actual is not None:
+                latest = actual
+                if time.monotonic() - actual_at > self._feedback_stale_timeout_s:
+                    raise SafetyError("right end-effector feedback is stale while waiting for actual arrival")
+                if sequence != last_sequence:
+                    last_sequence = sequence
+                    position_error_m, orientation_error_deg = _pose_errors(actual, target)
+                    if position_error_m <= position_tolerance_m and orientation_error_deg <= orientation_tolerance_deg:
+                        consecutive += 1
+                        if consecutive >= stable_samples:
+                            return actual
+                    else:
+                        consecutive = 0
+            self._stop.wait(min(float(poll_period_s), self._feedback_period_s))
         return None
 
     def raise_if_failed(self) -> None:
@@ -565,26 +789,85 @@ class RightEndEffectorPositionStream:
         thread = self._thread
         if thread is not None and thread is not threading.current_thread():
             thread.join(timeout=max(0.2, self._period_s * 4.0))
-        self._thread = None
+        feedback_thread = self._feedback_thread
+        if feedback_thread is not None and feedback_thread is not threading.current_thread():
+            feedback_thread.join(timeout=max(0.2, self._feedback_period_s * 4.0))
+        with self._lock:
+            if self._thread is None or not self._thread.is_alive():
+                self._thread = None
+            if self._feedback_thread is None or not self._feedback_thread.is_alive():
+                self._feedback_thread = None
+
+    def _set_error(self, error: Exception) -> None:
+        with self._lock:
+            if self._error is None:
+                self._error = error
+        self._stop.set()
+
+    def _feedback_loop(self) -> None:
+        deadline = time.monotonic()
+        while not self._stop.is_set():
+            try:
+                actual = self._controller.read_end_effector_pose(self._frame_name)
+            except Exception as exc:
+                self._set_error(exc)
+                return
+            now = time.monotonic()
+            with self._lock:
+                self._actual = actual
+                self._actual_at = now
+                self._feedback_sequence += 1
+                desired = self._desired
+                generation = self._target_generation
+                if desired is not None:
+                    position_error_m, orientation_error_deg = _pose_errors(actual, desired)
+                    within_tolerance = (
+                        position_error_m <= _DEFAULT_ACTUAL_ARRIVAL_POSITION_TOLERANCE_M
+                        and orientation_error_deg <= _DEFAULT_ACTUAL_ARRIVAL_ORIENTATION_TOLERANCE_DEG
+                    )
+                    if within_tolerance:
+                        self._actual_arrival_stable_samples += 1
+                    else:
+                        self._actual_arrival_stable_samples = 0
+                        if generation == self._target_generation:
+                            self._arrived_generation = min(self._arrived_generation, generation - 1)
+                            self._at_target.clear()
+                    if (
+                        self._actual_arrival_stable_samples >= _DEFAULT_ACTUAL_ARRIVAL_STABLE_SAMPLES
+                    ):
+                        self._arrived_generation = max(self._arrived_generation, generation)
+                        if generation == self._target_generation:
+                            self._at_target.set()
+            deadline += self._feedback_period_s
+            now = time.monotonic()
+            if deadline <= now:
+                deadline = now + self._feedback_period_s
+            self._stop.wait(max(0.0, deadline - now))
 
     def _run(self) -> None:
         deadline = time.monotonic()
         while not self._stop.is_set():
             with self._lock:
-                commanded, desired, generation = self._commanded, self._desired, self._target_generation
+                commanded, desired = self._commanded, self._desired
+                actual = self._actual
+                actual_at = self._actual_at
                 gripper_joint_names = self._gripper_joint_names
                 gripper_joint_positions = self._gripper_joint_positions
             if commanded is None or desired is None:
                 return
+            if actual is None:
+                self._stop.wait(min(self._period_s, self._feedback_period_s))
+                deadline = time.monotonic()
+                continue
+            if time.monotonic() - actual_at > self._feedback_stale_timeout_s:
+                self._set_error(SafetyError("right end-effector feedback is stale; holding motion stopped"))
+                return
+            actual_follow_error_m, _ = _pose_errors(actual, commanded)
             current = np.asarray(commanded.position_m, dtype=np.float64)
             wanted = np.asarray(desired.position_m, dtype=np.float64)
             delta = wanted - current
             distance = float(np.linalg.norm(delta))
             max_step_m = self._max_translation_velocity_mps * self._period_s
-            if distance <= max_step_m:
-                next_position = wanted
-            else:
-                next_position = current + delta * (max_step_m / distance)
             current_orientation = np.asarray(commanded.orientation_xyzw, dtype=np.float64)
             desired_orientation = np.asarray(desired.orientation_xyzw, dtype=np.float64)
             orientation_dot = abs(float(np.dot(
@@ -593,19 +876,29 @@ class RightEndEffectorPositionStream:
             )))
             orientation_angle_rad = 2.0 * math.acos(min(1.0, max(-1.0, orientation_dot)))
             max_angle_step_rad = self._max_angular_velocity_rad_s * self._period_s
-            if not self._allow_orientation_change or orientation_angle_rad <= max_angle_step_rad:
-                next_orientation = desired.orientation_xyzw
+            can_advance = (
+                actual_follow_error_m <= self._soft_follow_error_m
+            )
+            if not can_advance:
+                next_target = commanded
             else:
-                next_orientation = quaternion_slerp(
-                    commanded.orientation_xyzw, desired.orientation_xyzw,
-                    max_angle_step_rad / orientation_angle_rad,
-                )
-            if distance <= max_step_m and orientation_angle_rad <= max_angle_step_rad:
-                next_target = desired
-            else:
-                next_target = CartesianPoseTarget(
-                    tuple(float(value) for value in next_position), next_orientation,
-                )
+                if distance <= max_step_m:
+                    next_position = wanted
+                else:
+                    next_position = current + delta * (max_step_m / distance)
+                if not self._allow_orientation_change or orientation_angle_rad <= max_angle_step_rad:
+                    next_orientation = desired.orientation_xyzw
+                else:
+                    next_orientation = quaternion_slerp(
+                        commanded.orientation_xyzw, desired.orientation_xyzw,
+                        max_angle_step_rad / orientation_angle_rad,
+                    )
+                if distance <= max_step_m and orientation_angle_rad <= max_angle_step_rad:
+                    next_target = desired
+                else:
+                    next_target = CartesianPoseTarget(
+                        tuple(float(value) for value in next_position), next_orientation,
+                    )
             try:
                 status = self._controller.motion_status_summary()
                 if status["mode"] not in {0, 1} or status["control_mode"] != 1 or status["error_code"] != 0:
@@ -620,18 +913,15 @@ class RightEndEffectorPositionStream:
                     end_effector_joint_positions=gripper_joint_positions,
                 )
             except Exception as exc:
-                with self._lock:
-                    self._error = exc
-                self._stop.set()
+                self._set_error(exc)
                 return
             with self._lock:
                 self._commanded = next_target
-                if next_target == desired:
-                    self._arrived_generation = max(self._arrived_generation, generation)
-                    if generation == self._target_generation:
-                        self._at_target.set()
             deadline += self._period_s
-            self._stop.wait(max(0.0, deadline - time.monotonic()))
+            now = time.monotonic()
+            if deadline <= now:
+                deadline = now + self._period_s
+            self._stop.wait(max(0.0, deadline - now))
 
 
 class G2Controller:
@@ -725,8 +1015,8 @@ class G2Controller:
         self._require_motion()
         if side not in {"left", "right"}:
             raise ValueError("side must be left or right")
-        if not math.isfinite(velocity_rad_s) or not 0.0 < velocity_rad_s <= 0.15:
-            raise SafetyError("preset velocity must be in (0, 0.15] rad/s")
+        if not math.isfinite(velocity_rad_s) or not velocity_rad_s > 0.0:
+            raise SafetyError("preset velocity must be a positive finite value")
         if not math.isfinite(life_time_s) or not 0.1 <= life_time_s <= 30.0:
             raise SafetyError("life_time_s must be in [0.1, 30]")
         current = list(self.checked_arm_state())
@@ -743,6 +1033,30 @@ class G2Controller:
         request.joint_names = list(names)
         request.joint_positions = list(target)
         request.joint_velocities = [float(velocity_rad_s)] * 7
+        with self._motion_write():
+            self.robot.joint_control_request(request)
+
+    def move_bilateral_preset(
+        self,
+        positions_rad: Sequence[float],
+        *,
+        velocity_rad_s: float = 0.08,
+        life_time_s: float = 10.0,
+        detail: str = "traditional bilateral preset",
+    ) -> None:
+        """Submit one planned request for all 14 arm joints."""
+        self._require_motion()
+        if not math.isfinite(velocity_rad_s) or not velocity_rad_s > 0.0:
+            raise SafetyError("bilateral preset velocity must be a positive finite value")
+        if not math.isfinite(life_time_s) or not 0.1 <= life_time_s <= 30.0:
+            raise SafetyError("bilateral preset life_time_s must be in [0.1, 30]")
+        target = validate_arm_target(positions_rad)
+        request = self.gdk.JointControlReq()
+        request.detail = detail
+        request.life_time = float(life_time_s)
+        request.joint_names = list(ARM_JOINT_NAMES)
+        request.joint_positions = list(target)
+        request.joint_velocities = [float(velocity_rad_s)] * len(ARM_JOINT_NAMES)
         with self._motion_write():
             self.robot.joint_control_request(request)
 

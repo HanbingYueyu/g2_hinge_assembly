@@ -3,6 +3,8 @@ import numpy as np
 
 from move_left_above_head_hinge_gdk import (
     base_from_head_at,
+    dominant_sample_cluster,
+    draw_head_coarse_overlay,
     fixed_forward_down_orientation,
     gripper_end_target,
     select_leftmost_hinge,
@@ -11,6 +13,24 @@ from control import quaternion_angle_deg
 
 
 class HeadHingeMoveTests(unittest.TestCase):
+    def test_head_overlay_marks_selected_hinge_and_sampling_progress(self):
+        image = np.zeros((80, 120, 3), dtype=np.uint8)
+        mask = np.zeros((80, 120), dtype=bool)
+        mask[25:55, 40:70] = True
+        overlay = draw_head_coarse_overlay(image, [mask], [0.95], [0], 0, 3, 15)
+        self.assertEqual(overlay.shape, image.shape)
+        self.assertGreater(int(overlay.sum()), 0)
+    def test_dominant_sample_cluster_discards_distant_samples(self):
+        stable = np.array([
+            [0.500, 0.200, 0.800], [0.510, 0.198, 0.802],
+            [0.495, 0.205, 0.799], [0.503, 0.201, 0.805],
+            [0.507, 0.203, 0.797],
+        ])
+        samples = np.vstack((stable, [[0.80, -0.10, 0.90], [0.10, 0.60, 0.40]]))
+        center, inliers, spread_m = dominant_sample_cluster(samples, 0.05)
+        self.assertEqual(int(inliers.sum()), len(stable))
+        self.assertTrue(np.allclose(center, np.median(stable, axis=0)))
+        self.assertLessEqual(spread_m, 0.05)
     def test_selects_leftmost_hinge_and_ignores_other_class(self):
         masks = []
         for x in (8, 2, 0):

@@ -1,9 +1,55 @@
 {
-  "target_pixel_px": [
-    619.0929230159932,
-    517.6328880138137
+  "schema_version": 2,
+  "height_reference_distance_basis": "step_target_camera_distance_m",
+  "height_samples": [
+    {
+      "height_mm": 100.0,
+      "camera_distance_m": 0.24774122249346764,
+      "target_pixel_px": [
+        638.2466451981045,
+        508.8813278124122
+      ],
+      "grasp_xyz_camera_m": [
+        -0.001128229690138257,
+        -0.011541816150681061,
+        0.2474696484425272
+      ],
+      "sample_count": 5
+    },
+    {
+      "height_mm": 50.0,
+      "camera_distance_m": 0.1965633579662604,
+      "target_pixel_px": [
+        635.3211514583558,
+        490.60401731568606
+      ],
+      "grasp_xyz_camera_m": [
+        -0.0020766082921631103,
+        -0.016463729660495252,
+        0.19586165270067357
+      ],
+      "sample_count": 5
+    },
+    {
+      "height_mm": 0.0,
+      "camera_distance_m": 0.1473779826894358,
+      "target_pixel_px": [
+        631.3625603232621,
+        460.0470718387471
+      ],
+      "grasp_xyz_camera_m": [
+        -0.0027280946990954694,
+        -0.02150806601843014,
+        0.14577458755581255
+      ],
+      "sample_count": 5
+    }
   ],
-  "sample_count": 20,
+  "target_pixel_px": [
+    638.2466451981045,
+    508.8813278124122
+  ],
+  "sample_count": 15,
   "intrinsic": {
     "fx": 484.35516423754075,
     "fy": 484.08331362370023,

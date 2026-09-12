@@ -1589,9 +1589,9 @@ def main() -> int:
         not 1.0 <= args.spacemouse_speed_mm_s <= 30.0
         or not 1.0 <= args.spacemouse_rotation_deg_s <= 28.6
         or not 0.0 <= args.spacemouse_deadzone <= 0.5
-        or (args.auto_speed_mm_s is not None and not 1.0 <= args.auto_speed_mm_s <= 18.0)
-        or (args.auto_rotation_deg_s is not None and not 1.0 <= args.auto_rotation_deg_s <= 28.6)
-        or (args.auto_preset_velocity_rad_s is not None and not 0.001 <= args.auto_preset_velocity_rad_s <= 0.15)
+        or (args.auto_speed_mm_s is not None and not (math.isfinite(args.auto_speed_mm_s) and args.auto_speed_mm_s > 0.0))
+        or (args.auto_rotation_deg_s is not None and not (math.isfinite(args.auto_rotation_deg_s) and args.auto_rotation_deg_s > 0.0))
+        or (args.auto_preset_velocity_rad_s is not None and not (math.isfinite(args.auto_preset_velocity_rad_s) and args.auto_preset_velocity_rad_s > 0.0))
     ):
         print("参数错误：SpaceMouse 或视觉自动速度参数无效。", file=sys.stderr)
         return 2
@@ -1770,6 +1770,7 @@ def main() -> int:
             dianpi_runner = DianpiCycleRunner(
                 event_sink=lambda event: print(json.dumps(event, ensure_ascii=False), flush=True),
             )
+            dianpi_runner.start_p10_monitor()
             takeover_worker = SpaceMouseTakeoverWorker(
                 controller,
                 motion_gate,
