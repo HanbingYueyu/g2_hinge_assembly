@@ -45,6 +45,7 @@ try:
         load_pr1_pose, load_pr2_pose, move_right_pr1,
     )
     from .spacemouse_takeover import MotionPauseGate, SpaceMouseTakeoverWorker
+    from .dianpi_runner import DianpiCycleRunner
     from .spacemouse_teleop import TeleopConfig
 except ImportError:
     from apriltag_workpiece import (
@@ -60,6 +61,7 @@ except ImportError:
         load_pr1_pose, load_pr2_pose, move_right_pr1,
     )
     from spacemouse_takeover import MotionPauseGate, SpaceMouseTakeoverWorker
+    from dianpi_runner import DianpiCycleRunner
     from spacemouse_teleop import TeleopConfig
 
 
@@ -1748,6 +1750,7 @@ def main() -> int:
     server = None
     motion_gate: MotionPauseGate | None = None
     takeover_worker: SpaceMouseTakeoverWorker | None = None
+    dianpi_runner: DianpiCycleRunner | None = None
     try:
         detector = detector_for_41h12()
         color_type = agibot_gdk.CameraType.kHandRightColor
@@ -1764,6 +1767,9 @@ def main() -> int:
         )
         controller.checked_arm_state()
         if args.spacemouse_device:
+            dianpi_runner = DianpiCycleRunner(
+                event_sink=lambda event: print(json.dumps(event, ensure_ascii=False), flush=True),
+            )
             takeover_worker = SpaceMouseTakeoverWorker(
                 controller,
                 motion_gate,
@@ -1775,6 +1781,7 @@ def main() -> int:
                     deadzone=args.spacemouse_deadzone,
                 ),
                 allow_advance_right=False,
+                dianpi_runner=dianpi_runner,
             )
             takeover_worker.start()
         intrinsic = None
@@ -2318,6 +2325,8 @@ def main() -> int:
     finally:
         if takeover_worker is not None:
             takeover_worker.stop()
+        if dianpi_runner is not None:
+            dianpi_runner.close()
         if terminal_status_active:
             print(flush=True)
         if server is not None:

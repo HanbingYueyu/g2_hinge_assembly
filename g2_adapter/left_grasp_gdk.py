@@ -53,6 +53,7 @@ try:
         load_presets as load_post_grasp_presets,
     )
     from .spacemouse_takeover import AdvanceRightRequested, MotionPauseGate, SpaceMouseTakeoverWorker
+    from .dianpi_runner import DianpiCycleRunner
     from .spacemouse_teleop import TeleopConfig
 except ImportError:
     from left_step_xy import xy_error, bounded_xy
@@ -79,6 +80,7 @@ except ImportError:
         load_presets as load_post_grasp_presets,
     )
     from spacemouse_takeover import AdvanceRightRequested, MotionPauseGate, SpaceMouseTakeoverWorker
+    from dianpi_runner import DianpiCycleRunner
     from spacemouse_teleop import TeleopConfig
 
 
@@ -1822,6 +1824,7 @@ def main() -> int:
     web_shared: SharedView | None = None
     motion_gate: MotionPauseGate | None = None
     takeover_worker: SpaceMouseTakeoverWorker | None = None
+    dianpi_runner: DianpiCycleRunner | None = None
     try:
         if args.web_port:
             web_shared = SharedView()
@@ -1845,6 +1848,9 @@ def main() -> int:
         )
         controller.checked_arm_state()
         if args.spacemouse_device:
+            dianpi_runner = DianpiCycleRunner(
+                event_sink=lambda event: print(json.dumps(event, ensure_ascii=False), flush=True),
+            )
             takeover_worker = SpaceMouseTakeoverWorker(
                 controller,
                 motion_gate,
@@ -1856,6 +1862,7 @@ def main() -> int:
                     deadzone=args.spacemouse_deadzone,
                 ),
                 allow_advance_right=True,
+                dianpi_runner=dianpi_runner,
             )
             takeover_worker.start()
         camera_type = agibot_gdk.CameraType.kHandLeftColor
@@ -3725,6 +3732,8 @@ def main() -> int:
     finally:
         if takeover_worker is not None:
             takeover_worker.stop()
+        if dianpi_runner is not None:
+            dianpi_runner.close()
         stop_force_descent_sam_preview(force_preview_stop, force_preview_thread)
         if perception is not None:
             perception.stop()
