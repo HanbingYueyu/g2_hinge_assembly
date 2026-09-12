@@ -303,6 +303,7 @@ class SpaceMouseTakeoverWorker:
         clock=time.monotonic,
         sleep=time.sleep,
         hid_factory=None,
+        dianpi_runner=None,
     ) -> None:
         self.controller = controller
         self.gate = gate
@@ -312,6 +313,7 @@ class SpaceMouseTakeoverWorker:
         self.clock = clock
         self.sleep = sleep
         self.hid_factory = hid_factory
+        self.dianpi_runner = dianpi_runner
         self.gestures = SpaceMouseGestureState(deadzone=config.deadzone)
         self.active_side: str | None = None
         self._session = None
@@ -321,6 +323,8 @@ class SpaceMouseTakeoverWorker:
         self._last_disconnect: str | None = None
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
+        self._last_dianpi_result = None
+        self._dianpi_error: BaseException | None = None
 
     @property
     def advance_requested(self) -> bool:
@@ -333,6 +337,14 @@ class SpaceMouseTakeoverWorker:
     @property
     def last_disconnect(self) -> str | None:
         return self._last_disconnect
+
+    @property
+    def last_dianpi_result(self):
+        return self._last_dianpi_result
+
+    @property
+    def dianpi_error(self) -> BaseException | None:
+        return self._dianpi_error
 
     def raise_if_failed(self) -> None:
         if self._failed is not None:
@@ -391,6 +403,25 @@ class SpaceMouseTakeoverWorker:
 
     def step(self, frame: InputFrame, now: float) -> GestureResult:
         result = self.gestures.update(frame, now)
+        if TakeoverEvent.START_DIANPI in result.events:
+            if self.dianpi_runner is not None:
+                try:
+                    self._last_dianpi_result = self.dianpi_runner.trigger()
+                    self._dianpi_error = None
+                except BaseException as exc:
+                    # The supplied runner is expected to swallow hardware
+                    # failures; keep this boundary defensive so a logging or
+                    # test runner can never abort G2 motion.
+                    self._dianpi_error = exc
+            if self._session is not None:
+                # The chord owns both buttons and must not feed stale axes or
+                # click state into TeleopSession.  A neutral tick bases the
+                # hold on current feedback while preserving the active
+                # gripper goal.
+                sanitized = self._without_consumed_buttons(frame, result.consumed_buttons)
+                with self.controller.manual_motion():
+                    self._session.tick(sanitized, now)
+            return result
         if TakeoverEvent.ADVANCE_RIGHT in result.events:
             if self.allow_advance_right:
                 if self._session is not None:

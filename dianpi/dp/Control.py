@@ -132,6 +132,7 @@ class DianpiController:
         self._state_lock = threading.Lock()
         self._cycle_lock = threading.Lock()
         self._cycle_running = False
+        self._stop_event = threading.Event()
         self._read_tx = None
         self._read_rx = None
 
@@ -270,6 +271,8 @@ class DianpiController:
     def _wait_and_report(self, duration_s: float) -> None:
         deadline = self._monotonic_fn() + duration_s
         while True:
+            if self._stop_event.is_set():
+                raise DianpiError("电批周期已停止")
             remaining = deadline - self._monotonic_fn()
             if remaining <= 0:
                 return
@@ -286,6 +289,7 @@ class DianpiController:
             raise DianpiBusyError("电批周期正在运行")
         with self._state_lock:
             self._cycle_running = True
+        self._stop_event.clear()
         completed = False
         try:
             self._write_pin(PIN_FEEDER, 0)
@@ -314,6 +318,12 @@ class DianpiController:
             with self._state_lock:
                 self._cycle_running = False
             self._cycle_lock.release()
+
+    def stop_cycle(self) -> None:
+        """请求当前周期尽快停止，并由周期清理输出引脚。"""
+        with self._state_lock:
+            if self._cycle_running:
+                self._stop_event.set()
 
     def close(self) -> None:
         """恢复安全电平并关闭设备；可重复调用。"""

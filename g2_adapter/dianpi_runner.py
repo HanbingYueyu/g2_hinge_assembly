@@ -129,8 +129,21 @@ class DianpiCycleRunner:
                 return
             self._closed = True
             thread = self._thread
+            controller = self._controller
+        if thread is not None and thread.is_alive() and controller is not None:
+            stop_cycle = getattr(controller, "stop_cycle", None)
+            if stop_cycle is not None:
+                try:
+                    stop_cycle()
+                except BaseException as exc:
+                    with self._lock:
+                        self._last_error = exc
+                    self._emit({"event": "dianpi_error", "error": str(exc)})
         if thread is not None and thread is not threading.current_thread():
             thread.join(timeout=max(0.0, float(timeout_s)))
+        if thread is not None and thread.is_alive():
+            self._emit({"event": "dianpi_error", "error": "周期线程未能在关闭期限内停止"})
+            return
         with self._lock:
             controller = self._controller
             self._controller = None

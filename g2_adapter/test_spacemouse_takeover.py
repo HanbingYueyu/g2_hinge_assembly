@@ -17,12 +17,23 @@ from spacemouse_takeover import (
 )
 from control import G2Controller
 from spacemouse_teleop import TeleopConfig, TransientGDKReadTimeout
+from dianpi_runner import DianpiTriggerResult
 from test_control import FakeGdk
 from test_spacemouse_teleop import BilateralRobot
 
 
 def frame(now, *, axes=(0.0,) * 6, buttons=(False, False), pressed=()):
     return InputFrame(axes, buttons, pressed, (now, now), True)
+
+
+class FakeDianpiRunner:
+    def __init__(self, result=DianpiTriggerResult.STARTED):
+        self.result = result
+        self.calls = 0
+
+    def trigger(self):
+        self.calls += 1
+        return self.result
 
 
 class GestureTests(unittest.TestCase):
@@ -206,6 +217,45 @@ class MotionPauseGateTests(unittest.TestCase):
 
 
 class WorkerTests(unittest.TestCase):
+    def test_worker_routes_dual_button_chord_to_dianpi_without_takeover(self):
+        robot = BilateralRobot()
+        gate = MotionPauseGate()
+        controller = G2Controller(FakeGdk, robot, allow_motion=True, motion_gate=gate)
+        runner = FakeDianpiRunner()
+        worker = SpaceMouseTakeoverWorker(
+            controller,
+            gate,
+            device=None,
+            config=TeleopConfig(side="left", axis_map=(1, 2, 3, 4, 5, 6)),
+            dianpi_runner=runner,
+            clock=lambda: 0.31,
+        )
+
+        worker.step(frame(0.00, buttons=(True, True), pressed=(0, 1)), 0.00)
+        result = worker.step(frame(0.31, buttons=(True, True)), 0.31)
+
+        self.assertEqual(result.events, (TakeoverEvent.START_DIANPI,))
+        self.assertEqual(runner.calls, 1)
+        self.assertIsNone(worker.active_side)
+
+    def test_busy_dianpi_trigger_does_not_fail_worker(self):
+        robot = BilateralRobot()
+        gate = MotionPauseGate()
+        controller = G2Controller(FakeGdk, robot, allow_motion=True, motion_gate=gate)
+        runner = FakeDianpiRunner(DianpiTriggerResult.BUSY)
+        worker = SpaceMouseTakeoverWorker(
+            controller,
+            gate,
+            device=None,
+            config=TeleopConfig(side="left", axis_map=(1, 2, 3, 4, 5, 6)),
+            dianpi_runner=runner,
+        )
+
+        worker.step(frame(0.00, buttons=(True, True), pressed=(0, 1)), 0.00)
+        worker.step(frame(0.31, buttons=(True, True)), 0.31)
+        worker.raise_if_failed()
+        self.assertEqual(runner.calls, 1)
+
     def test_transient_gdk_read_timeout_cancels_takeover_and_resumes_auto(self):
         robot = BilateralRobot()
         gate = MotionPauseGate()

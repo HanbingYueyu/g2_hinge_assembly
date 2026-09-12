@@ -135,7 +135,7 @@ def test_second_cycle_is_rejected_while_first_cycle_is_running():
     controller = make_controller(io)
     controller.open()
 
-    cycle_thread = threading.Thread(target=controller.run_cycle)
+    cycle_thread = threading.Thread(target=controller.run_cycle, daemon=True)
     cycle_thread.start()
     assert io.read_started.wait(1.0)
     with pytest.raises(DianpiBusyError):
@@ -143,6 +143,35 @@ def test_second_cycle_is_rejected_while_first_cycle_is_running():
     io.read_block.set()
     cycle_thread.join(1.0)
     assert not cycle_thread.is_alive()
+
+
+def test_stop_cycle_interrupts_wait_and_restores_cycle_outputs():
+    io = FakeIO()
+    io.block_reads = True
+    controller = make_controller(io)
+    controller.open()
+    errors = []
+
+    def run_cycle():
+        try:
+            controller.run_cycle()
+        except Exception as exc:  # noqa: BLE001 - assert stop is reported
+            errors.append(exc)
+
+    cycle_thread = threading.Thread(target=run_cycle, daemon=True)
+    cycle_thread.start()
+    assert io.read_started.wait(1.0)
+
+    controller.stop_cycle()
+    io.read_block.set()
+    cycle_thread.join(1.0)
+
+    assert not cycle_thread.is_alive()
+    assert len(errors) == 1
+    assert not controller.cycle_running
+    assert [(pin, state) for _timestamp, pin, state in io.writes[-3:]] == [
+        (0, 1), (8, 1), (9, 1)
+    ]
 
 
 def test_close_restores_safe_levels_and_is_idempotent():

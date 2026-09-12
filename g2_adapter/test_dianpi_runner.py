@@ -14,6 +14,7 @@ class FakeController:
         self.open_calls = 0
         self.cycle_calls = 0
         self.close_calls = 0
+        self.stop_calls = 0
         self.cycle_started = threading.Event()
         self.cycle_finished = threading.Event()
         self.release = threading.Event()
@@ -34,6 +35,10 @@ class FakeController:
 
     def close(self):
         self.close_calls += 1
+
+    def stop_cycle(self):
+        self.stop_calls += 1
+        self.release.set()
 
 
 def wait_until(predicate, timeout=1.0):
@@ -96,4 +101,16 @@ def test_hardware_error_is_reported_without_raising_to_worker():
     wait_until(lambda: any(event["event"] == "dianpi_error" for event in events))
     assert any(event["event"] == "dianpi_error" for event in events)
     runner.close()
+    assert controller.close_calls == 1
+
+
+def test_close_stops_active_cycle_before_closing_controller():
+    controller = FakeController(block=True)
+    runner, _controller, _factory_calls = make_runner(controller=controller)
+    assert runner.trigger() is DianpiTriggerResult.STARTED
+    assert controller.cycle_started.wait(1.0)
+
+    runner.close(timeout_s=1.0)
+
+    assert controller.stop_calls == 1
     assert controller.close_calls == 1
