@@ -4,8 +4,12 @@ from __future__ import annotations
 
 from enum import Enum
 import importlib
+import sys
 import threading
+from pathlib import Path
 from typing import Callable
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
 
 class DianpiTriggerResult(str, Enum):
@@ -17,7 +21,16 @@ class DianpiTriggerResult(str, Enum):
 def _default_controller_factory():
     # Keep the RM1010 shared-library import inside the runner.  The integrated
     # workflow opens it from the P10 monitor or the first SpaceMouse trigger.
-    module = importlib.import_module("dianpi.dp.Control")
+    try:
+        module = importlib.import_module("dianpi.dp.Control")
+    except ModuleNotFoundError:
+        # Started as ``python g2_adapter/<script>.py`` the project root is not
+        # on sys.path, so the sibling ``dianpi`` package is invisible.  Add it
+        # once and retry.
+        root = str(PROJECT_ROOT)
+        if root not in sys.path:
+            sys.path.append(root)
+        module = importlib.import_module("dianpi.dp.Control")
     return module.DianpiController()
 
 
@@ -177,6 +190,17 @@ class DianpiCycleRunner:
                     return
                 with self._lock:
                     self._last_error = exc
+                if isinstance(exc, (ImportError, ModuleNotFoundError)):
+                    # A missing dianpi package cannot be fixed by retrying.
+                    # Report once and leave the RM1010 monitor off instead of
+                    # logging an error every poll period.
+                    self._emit({
+                        "event": "dianpi_unavailable",
+                        "source": "p10_monitor",
+                        "error": str(exc),
+                        "hint": "请确认工程根目录在 PYTHONPATH 中，或用 scripts/run_gdk_sam3_python.sh 启动",
+                    })
+                    return
                 self._emit({"event": "dianpi_error", "source": "p10_monitor", "error": str(exc)})
                 # A missed read must not suppress a real low edge on the
                 # next successful read.

@@ -38,12 +38,14 @@ except ImportError:
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DEPTH_SCALE_M = 0.001
-_PREFERRED_G2_HINGE_SHAFT_YOLO = PROJECT_ROOT / "models" / "left_d405_hinge_shaft_yolo" / "best.pt"
-_ROLLBACK_G2_HINGE_YOLO = PROJECT_ROOT / "models" / "left_d405_hinge_yolo" / "best.pt"
+# The grasp reference marks the hinge only, so the one-class weight is
+# preferred; the two-class hinge/shaft weight remains the fallback.
+_PREFERRED_LEFT_HINGE_YOLO = PROJECT_ROOT / "models" / "left_d405_hinge_yolo" / "best.pt"
+_ROLLBACK_LEFT_HINGE_SHAFT_YOLO = PROJECT_ROOT / "models" / "left_d405_hinge_shaft_yolo" / "best.pt"
 DEFAULT_G2_NATIVE_YOLO = (
-    _PREFERRED_G2_HINGE_SHAFT_YOLO
-    if _PREFERRED_G2_HINGE_SHAFT_YOLO.is_file()
-    else _ROLLBACK_G2_HINGE_YOLO
+    _PREFERRED_LEFT_HINGE_YOLO
+    if _PREFERRED_LEFT_HINGE_YOLO.is_file()
+    else _ROLLBACK_LEFT_HINGE_SHAFT_YOLO
 )
 
 

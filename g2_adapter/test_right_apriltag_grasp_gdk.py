@@ -80,6 +80,51 @@ class ManualFinishTests(unittest.TestCase):
                     return_screwdriver(controller, saved, config, lambda event: None)
                 release.assert_not_called()
 
+    def test_return_can_defer_the_gripper_release_to_the_final_stage(self):
+        saved = CartesianPoseTarget((0.4, -0.3, 0.8), (0, 0, 0, 1))
+        controller = Mock()
+        controller.read_end_effector_pose.return_value = saved
+        stream = controller.start_right_end_effector_position_stream.return_value
+        stream.wait_until_actual_target.side_effect = lambda target, *_a, **_k: target
+        config = {
+            "autonomous_approach": {"speed_mps": 0.018, "angular_speed_deg_s": 18},
+            "local_motion": {"final_actual_position_tolerance_m": 0.0005, "final_actual_orientation_tolerance_deg": 0.5},
+            "gripper": {"open_rad": -0.785},
+        }
+        events = []
+        with patch("right_apriltag_grasp_gdk.move_right_gripper_with_feedback") as release:
+            return_screwdriver(controller, saved, config, events.append, release=False)
+        release.assert_not_called()
+        self.assertEqual(events[-1]["event"], "right_return_complete_gripper_held")
+        self.assertEqual([event["event"] for event in events].count("right_return_arrived"), 2)
+
+    def test_parse_args_accepts_an_explicit_argv_and_the_staged_stop_flag(self):
+        from right_apriltag_grasp_gdk import parse_args
+        args = parse_args(["--execute", "--allow-motion", "--stop-after-transport",
+                           "--premove-pose", "RR1", "--post-grasp-pose", "RR2"])
+        self.assertTrue(args.stop_after_transport)
+        self.assertEqual(args.premove_pose, "RR1")
+        self.assertEqual(args.post_grasp_pose, "RR2")
+        default = parse_args([])
+        self.assertFalse(default.stop_after_transport)
+
+    def test_standalone_main_delegates_to_the_injectable_stage(self):
+        import right_apriltag_grasp_gdk as module
+        with patch.object(module, "run_right_grasp_stage", return_value=7) as stage:
+            self.assertEqual(module.main(["--max-frames", "1"]), 7)
+        self.assertIsNone(stage.call_args.kwargs["services"])
+        self.assertEqual(stage.call_args.kwargs["argv"], ["--max-frames", "1"])
+
+    def test_every_args_reference_in_the_module_is_a_defined_cli_flag(self):
+        import inspect
+        import pathlib
+        import re
+        import right_apriltag_grasp_gdk as module
+        source = pathlib.Path(module.__file__).read_text(encoding="utf-8")
+        used = set(re.findall(r"\bargs\.([A-Za-z_][A-Za-z0-9_]*)", source))
+        defined = set(vars(module.parse_args([])))
+        self.assertEqual(sorted(used - defined), [])
+
     def test_wait_keeps_worker_alive_until_manual_finish(self):
         worker = SimpleNamespace(allow_advance_right=False, advance_requested=False)
         checks = []

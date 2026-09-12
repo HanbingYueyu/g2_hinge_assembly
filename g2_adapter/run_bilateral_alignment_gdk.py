@@ -88,6 +88,9 @@ except ImportError:
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_MODEL = PROJECT_ROOT / "models" / "hole_target_det_v2" / "best.pt"
+# Keep the two-class hinge/shaft weight here: this tool's direct mode needs the
+# shaft (class 1) as the held-part target.  The grasp flow uses the one-class
+# hinge weight instead.
 DEFAULT_LEFT_TARGET_MODEL = PROJECT_ROOT / "models" / "left_d405_hinge_shaft_yolo" / "best.pt"
 LEFT_END_LINK = "arm_l_end_link"
 LEFT_HINGE_CLASS_ID = 0

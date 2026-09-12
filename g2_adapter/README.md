@@ -304,6 +304,8 @@ python3 g2_adapter/derive_left_xy_mapping.py \
 4. 以 50 Hz、固定法兰姿态进行最多 250 mm 的力优先接触搜索。追加 `--final-descent-visual-servo` 后，会仅对下探前锁定的同一 YOLO 实例做实时 XY 复位：估计水平误差不超过 `--final-descent-visual-tolerance-mm`（默认 5 mm）时保持，超过后每次最多 1 mm，默认不设累计 XY 上限（可用 `--final-descent-visual-max-total-m` 设正值重新启用上限）；相对力达到接触阈值的 50% 即冻结视觉修正。视觉绝不改变 Z 向下探距离。相对力首次达到 2 N 都会停止向下；目标真正连续丢失仍会停止并进入安全恢复。接触力 ≤2 N 时保持当前位置直接闭爪；仅接触力 >2 N 才最多上提 15 mm，并在相对力连续 3 帧 ≤2 N 后闭爪。未触发接触或未能卸力均拒绝闭爪；
 5. Omnipicker 先向 `0 rad` 收拢以测得本次铰链的卡住角度；角度稳定 0.5 秒（变化 ≤0.005 rad）后，仅从该角度再闭合 0.03 rad。若反馈到达 `0 rad`，先保持闭合，不把机械端点直接判为“空夹”，因为薄铰链仍可能已被夹住；随后先以 `base_link +Z` 上抬 20 mm，并连续比较同一 YOLO 实例的像素中心和掩膜面积。目标在抬升期间连续丢失达到配置的 3 秒才张爪、回到视觉对准并重新抓取；验证通过后，`--full-cycle` 会持续锁定并监控该同一实例完成 150 mm 上抬，且必须取得一帧新的健康观测才会请求 P4。P4 请求前掉件会张爪并重新抓取；P4 预设运动期间不消费视觉结果，只保持夹爪闭合并轮询实际关节到位，避免快速运动造成几何误报；P4 到位后按现有流程结束，当前阶段不会在 P4 运动中自动重抓。
 
+6. 150 mm 受监控上抬同时做**空夹判定**：闭爪反馈只说明夹爪合上了，不说明铰链在爪子里，而"被跟踪的掩膜"在空夹时依然存在。左腕相机随夹爪移动，因此真正夹住时同一实例的掩膜面积基本不变，空夹或正在滑出时面积会持续变化。实现上跳过起抬后的 `--post-grasp-lift-area-grace-s`（默认 2 s），只保留 `--post-grasp-lift-area-window-s`（默认 3 s）滑动窗口内的面积样本，用 `(max-min)/median` 得到 `spread_fraction`；样本数达到 `--post-grasp-lift-area-min-samples`（默认 4）、`spread_fraction > --post-grasp-lift-area-spread`（默认 0.5），并且连续 `--post-grasp-lift-area-confirmations`（默认 2）次窗口判定都超阈值（单帧抖动不算，必须"持续"变化）时才判空夹，行为与"掉件"完全一致：立即停住、保持夹爪闭合状态复位到实测位姿、张开左爪并回到视觉对准重新抓取。相关事件：`post_grasp_lift_area_unstable`（判定时刻，含全部面积证据）、`post_grasp_lift_monitor_regrasp_started`（`area_unstable: true`）、`pre_p4_monitored_lift_arrived`（正常结束时给出 `area_monitor_max_spread_fraction`，用于调阈值）。该判定只使用时间窗口内的相对变化，因此上抬过程中面积随距离缓慢单调变化不会误判；感知停顿时窗口样本过期即退出判定，不会因为"看不到"而误判空夹。
+
 完整抓取先以 GDK `left_end_state` 确认左 Omnipicker 已张开至配置的 `-0.51025 rad`（机械最大张开量的 65%）附近，才允许开始视觉伺服；单次 GDK 接口调用成功不再被视为张开成功。若 6 秒内未收到符合容差的反馈，流程在 P3 停止，不会下探或闭爪。
 
 受看护的 `--stop-after xy` 与 `--stop-after descend` 不会改变夹爪状态；只有完整且已标定的抓取流程才会先张开夹爪。
@@ -472,3 +474,15 @@ scripts/run_gdk_sam3_python.sh g2_adapter/probe_right_end_pose_mode1.py \
 ```
 
 只有探针通过、填写 grasp TCP 和实测 pregrasp 映射，并由操作员把 `calibrated` 设为 `true` 后，才可使用 `--execute --allow-motion`。不带 `--autonomous-approach` 时仅运行已经位于 3 mm/0.5° 范围内的 pregrasp 到最多 50 mm 的末段；带该参数时才启用上面的受限粗到精自主预接近。GDK mode-1 无路径和碰撞规划，不得把它当作大范围自动避障。
+
+## 分阶段双臂流程（单进程）
+
+`run_bilateral_flow_gdk.py` 把左右手整条流程收进**一个进程**：一次 `gdk_init`，一个 `G2Controller`、一个 `MotionPauseGate`、一个 SpaceMouse worker、三路相机，并在启动时预加载头部 YOLO（2 类 hinge+hole）、左手 D405 YOLO 与右手 AprilTag 检测器常驻；**不加载 SAM3**（日志会打印 `"sam3": "not_loaded"`）。
+
+- 阶段计划与两道 SpaceMouse 门定义在 `bilateral_stages.py`（`--list-stages` 可打印，`--dry-run` 只读校验 5 个预设与 `workflow_home`）。
+- 单进程运行时与门控在 `bilateral_runtime.py`；跨阶段注入契约在 `bilateral_services.py`；三相机网页在 `bilateral_web.py`。
+- 两个既有 demo 仍是独立可用的 CLI：`main()` 为薄壳，实体在 `run_left_cycle(services=...)` / `run_right_grasp_stage(services=...)`，由主程序注入已建好的 GDK/控制器/worker/相机/模型。
+- 新增参数：左手 `--skip-workflow-home`、`--move-above-hole`、`--hole-*`；右手 `--stop-after-transport`、`--premove-pose`、`--post-grasp-pose`；`record_pose.py` 新增 `--side` 与 `LR1/LL1/LL2/RR1/RR2`。
+- 网页 `http://<ip>:<web-port>` 一页显示三路相机：第一行头部 RGB，第二行左手 D405 与右手 AprilTag 并排；三路常显（阶段叠加图优先，其余时间显示该相机原画面），无隐藏开关。SpaceMouse 全程可接管，右键长按 2 秒为"下一阶段"。
+
+完整命令与录制步骤见仓库根目录 `常用命令.md` 的「分阶段双臂流程（单进程，推荐）」。

@@ -3,10 +3,14 @@ import numpy as np
 
 from move_left_above_head_hinge_gdk import (
     base_from_head_at,
+    build_head_targets,
+    cluster_head_target,
     dominant_sample_cluster,
     draw_head_coarse_overlay,
     fixed_forward_down_orientation,
     gripper_end_target,
+    sample_head_target_points,
+    select_highest_confidence_class,
     select_leftmost_hinge,
 )
 from control import quaternion_angle_deg
@@ -38,6 +42,92 @@ class HeadHingeMoveTests(unittest.TestCase):
             mask[3:6, x:x+2] = True
             masks.append(mask)
         self.assertEqual(select_leftmost_hinge(masks, [0.8]*3, [0, 0, 1]), 1)
+
+    def test_selects_highest_confidence_hole_of_its_own_class(self):
+        hinge = np.zeros((10, 12), dtype=bool)
+        hinge[3:6, 1:3] = True
+        weak_hole = np.zeros((10, 12), dtype=bool)
+        weak_hole[3:6, 4:6] = True
+        strong_hole = np.zeros((10, 12), dtype=bool)
+        strong_hole[3:6, 8:10] = True
+        empty = np.zeros((10, 12), dtype=bool)
+        masks = [hinge, weak_hole, strong_hole, empty]
+        scores = [0.99, 0.40, 0.71, 0.95]
+        classes = [0, 1, 1, 1]
+        self.assertEqual(select_highest_confidence_class(masks, scores, classes, 1), 2)
+        self.assertEqual(select_highest_confidence_class(masks, scores, classes, 0), 0)
+        self.assertIsNone(select_highest_confidence_class([empty], [0.9], [1], 1))
+
+    def test_sample_head_target_points_collects_hinge_and_hole_from_one_stream(self):
+        hinge = np.zeros((10, 12), dtype=bool)
+        hinge[2:5, 0:2] = True
+        hole = np.zeros((10, 12), dtype=bool)
+        hole[2:5, 7:9] = True
+        points = {"hinge": np.array([0.0, 0.0, 0.0]), "hole": np.array([0.1, 0.1, 0.0])}
+        frames = {"n": 0}
+
+        def next_observation():
+            frames["n"] += 1
+            if frames["n"] % 2:
+                return [hinge], [0.9], [0], lambda mask: points["hinge"]
+            return [hole], [0.8], [1], lambda mask: points["hole"]
+
+        observations, seen = sample_head_target_points(
+            next_observation=next_observation, samples=3, timeout_s=5.0,
+        )
+        self.assertEqual(len(observations["hinge"]), 3)
+        self.assertEqual(len(observations["hole"]), 3)
+        self.assertGreaterEqual(seen, 6)
+
+    def test_sample_head_target_points_gives_up_when_a_class_is_missing(self):
+        hinge = np.zeros((10, 12), dtype=bool)
+        hinge[2:5, 0:2] = True
+        ticks = {"now": 0.0}
+
+        def clock():
+            ticks["now"] += 0.5
+            return ticks["now"]
+
+        observations, _ = sample_head_target_points(
+            next_observation=lambda: ([hinge], [0.9], [0], lambda mask: np.zeros(3)),
+            samples=5, timeout_s=2.0, clock=clock,
+        )
+        # deadline = 0.5 + 2.0; the loop appends while the clock is below it.
+        self.assertEqual(len(observations["hinge"]), 3)
+        self.assertEqual(observations["hole"], [])
+
+    def test_cluster_head_target_reports_dominant_cluster(self):
+        stable = [np.array([0.5, 0.2, 0.8]) for _ in range(9)]
+        outlier = [np.array([5.0, 5.0, 5.0])]
+        report = cluster_head_target(
+            "hole", stable + outlier, max_sample_spread_mm=50.0, min_inlier_samples=8,
+        )
+        self.assertEqual(report["inlier_samples"], 9)
+        self.assertEqual(report["rejected_samples"], 1)
+        self.assertAlmostEqual(report["position_base_link_m"][0], 0.5, places=6)
+        with self.assertRaises(RuntimeError):
+            cluster_head_target("hole", [], max_sample_spread_mm=50.0, min_inlier_samples=1)
+        with self.assertRaises(RuntimeError):
+            cluster_head_target("hole", [np.array([0.0, 0.0, 0.0])], max_sample_spread_mm=50.0, min_inlier_samples=8)
+
+    def test_build_head_targets_reports_a_missing_class_instead_of_raising(self):
+        hinge = [np.array([0.5, 0.2, 0.8]) for _ in range(9)]
+        targets, rejected = build_head_targets(
+            {"hinge": hinge, "hole": []}, max_sample_spread_mm=50.0, min_inlier_samples=8,
+        )
+        self.assertEqual(set(targets), {"hinge"})
+        self.assertNotIn("hole", targets)
+        self.assertEqual(rejected["hole"]["samples"], 0)
+        self.assertIn("hole", rejected["hole"]["reason"])
+
+    def test_build_head_targets_reports_a_scattered_class(self):
+        scattered = [np.array([float(index), 0.0, 0.0]) for index in range(9)]
+        targets, rejected = build_head_targets(
+            {"hole": scattered}, max_sample_spread_mm=10.0, min_inlier_samples=8,
+        )
+        self.assertEqual(targets, {})
+        self.assertIn("hole", rejected)
+        self.assertIn("主簇", rejected["hole"]["reason"])
 
     def test_target_accounts_for_tcp_and_above_height(self):
         target = gripper_end_target(np.array([0.5, 0.2, 0.7]), (0, 0, 0, 1), np.array([0, 0, 0.145]), 0.2)

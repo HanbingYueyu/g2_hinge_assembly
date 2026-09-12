@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import sys
 import threading
+import unittest
 import time
 
+import dianpi_runner
 from dianpi_runner import DianpiCycleRunner, DianpiTriggerResult
 
 
@@ -152,3 +155,47 @@ def test_p10_monitor_and_spacemouse_trigger_share_one_controller():
     assert controller.open_calls == 1
     assert controller.cycle_calls == 1
     runner.close()
+
+
+class DianpiImportFallbackTests(unittest.TestCase):
+    """A plain-script launch must still find the sibling ``dianpi`` package."""
+
+    def test_factory_adds_the_project_root_and_retries_once(self):
+        calls = {"count": 0}
+
+        class FakeModule:
+            @staticmethod
+            def DianpiController():
+                return "controller"
+
+        def fake_import(name):
+            calls["count"] += 1
+            if calls["count"] == 1:
+                raise ModuleNotFoundError(name)
+            return FakeModule
+
+        original_import = dianpi_runner.importlib.import_module
+        original_path = list(sys.path)
+        dianpi_runner.importlib.import_module = fake_import
+        try:
+            self.assertEqual(dianpi_runner._default_controller_factory(), "controller")
+        finally:
+            dianpi_runner.importlib.import_module = original_import
+            sys.path[:] = original_path
+        self.assertEqual(calls["count"], 2)
+        self.assertIn(str(dianpi_runner.PROJECT_ROOT), sys.path)
+
+    def test_p10_monitor_reports_once_and_stops_when_dianpi_is_missing(self):
+        events: list[dict] = []
+
+        def factory():
+            raise ModuleNotFoundError("No module named 'dianpi'")
+
+        runner = DianpiCycleRunner(controller_factory=factory, event_sink=events.append)
+        runner.start_p10_monitor(poll_period_s=0.001)
+        wait_until(lambda: any(event.get("event") == "dianpi_unavailable" for event in events))
+        time.sleep(0.05)
+        runner.close()
+        names = [event["event"] for event in events]
+        self.assertEqual(names.count("dianpi_unavailable"), 1)
+        self.assertNotIn("dianpi_error", names)

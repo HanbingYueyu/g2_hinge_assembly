@@ -1,0 +1,764 @@
+#!/usr/bin/env python3
+"""Single-process staged bilateral workflow for the G2 electric-screwdriver cell.
+
+One process owns exactly one GDK session, one ``G2Controller``, one
+``MotionPauseGate``, one SpaceMouse worker, three cameras and three preloaded
+models (head hinge+hole YOLO, left D405 YOLO, right AprilTag detector).  SAM3 is
+never imported or loaded here.
+
+The stage order and the two SpaceMouse "next stage" gates live in
+``bilateral_stages.DEFAULT_PLAN``; ``--list-stages`` prints them and ``--dry-run``
+validates every recorded preset without touching the robot.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import math
+import sys
+import time
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from pathlib import Path
+
+try:
+    from .bilateral_runtime import BilateralRuntime, PreloadedModels
+    from .bilateral_services import StageServices
+    from .bilateral_stages import DEFAULT_PLAN, Stage, StageSequencer, stage_names
+    from .bilateral_web import BilateralWeb, RawPaneFeed
+    from .safety import SafetyError
+except ImportError:
+    from bilateral_runtime import BilateralRuntime, PreloadedModels
+    from bilateral_services import StageServices
+    from bilateral_stages import DEFAULT_PLAN, Stage, StageSequencer, stage_names
+    from bilateral_web import BilateralWeb, RawPaneFeed
+    from safety import SafetyError
+
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+
+
+@dataclass
+class StageSettings:
+    """Values the orchestrator forwards to the borrowed stage CLI parsers."""
+
+    args: argparse.Namespace
+
+    # ------------------------------------------------------------- left stage
+    def left_argv(self) -> list[str]:
+        args = self.args
+        argv = [
+            "--config", str(Path(args.left_config).expanduser()),
+            "--detector", "yolo",
+            "--yolo-model", str(Path(args.left_yolo_model).expanduser()),
+            "--head-coarse-approach",
+            "--head-yolo-model", str(Path(args.head_yolo_model).expanduser()),
+            "--head-yolo-confidence", str(args.head_yolo_confidence),
+            "--head-forward-yaw-deg", str(args.approach_yaw_deg),
+            "--head-gripper-pitch-deg", str(args.approach_pitch_deg),
+            "--head-gripper-roll-deg", str(args.approach_roll_deg),
+            "--head-above-mm", str(args.approach_above_mm),
+            "--head-samples", str(args.head_samples),
+            "--head-min-inlier-samples", str(args.head_min_inlier_samples),
+            "--head-max-sample-spread-mm", str(args.head_max_sample_spread_mm),
+            # Keep the tuned left-grasp behaviour of the original bilateral
+            # command: live XY visual servo during the final descent, the
+            # central YOLO acceptance window, and the post-grasp target-loss
+            # timeout.  Without the servo the descent only follows the
+            # interpolated screen target and can push the part.
+            "--final-descent-visual-servo",
+            "--final-descent-visual-tolerance-mm", str(args.final_descent_visual_tolerance_mm),
+            "--yolo-center-fraction", str(args.yolo_center_fraction),
+            "--post-grasp-target-lost-timeout-s", str(args.post_grasp_target_lost_timeout_s),
+            "--move-above-hole",
+            "--hole-above-mm", str(args.hole_above_mm),
+            "--hole-forward-yaw-deg", str(args.hole_yaw_deg),
+            "--hole-gripper-pitch-deg", str(args.hole_pitch_deg),
+            "--hole-gripper-roll-deg", str(args.hole_roll_deg),
+            "--hole-speed-mm-s", str(args.auto_speed_mm_s),
+            "--hole-sample-timeout-s", str(args.hole_sample_timeout_s),
+            "--home-pose-name", args.home_pose_name,
+            "--poses", str(Path(args.poses).expanduser()),
+            "--full-cycle",
+            "--skip-workflow-home",
+            "--web-port", "0",
+            "--xy-speed-mm-s", str(args.auto_speed_mm_s),
+            "--speed-mm-s", str(args.auto_speed_mm_s),
+            "--auto-preset-velocity-rad-s", str(args.auto_preset_velocity_rad_s),
+            "--preset-arrival-tolerance-rad", str(args.preset_arrival_tolerance_rad),
+            "--preset-timeout-s", str(args.preset_timeout_s),
+            "--allow-motion",
+        ]
+        if args.left_height_reference is not None:
+            argv.extend(("--height-reference", str(Path(args.left_height_reference).expanduser())))
+        return argv
+
+    # ------------------------------------------------------------ right stage
+    def right_argv(self) -> list[str]:
+        args = self.args
+        return [
+            "--config", str(Path(args.right_config).expanduser()),
+            "--tag-geometry-profile", str(Path(args.tag_geometry_profile).expanduser()),
+            "--poses", str(Path(args.poses).expanduser()),
+            "--web-port", "0",
+            "--execute", "--autonomous-approach", "--allow-motion",
+            "--premove-pr1", "--post-grasp-pr2",
+            "--premove-pose", args.right_premove_pose,
+            "--post-grasp-pose", args.right_post_grasp_pose,
+            "--stop-after-transport",
+            "--auto-speed-mm-s", str(args.auto_speed_mm_s),
+            "--auto-preset-velocity-rad-s", str(args.auto_preset_velocity_rad_s),
+        ]
+
+
+class FlowContext:
+    """Everything a stage function needs, without a second GDK session."""
+
+    def __init__(self, *, gdk, services: StageServices, runtime: BilateralRuntime,
+                 settings: StageSettings, feeds: dict | None = None) -> None:
+        self.gdk = gdk
+        self.services = services
+        self.runtime = runtime
+        self.settings = settings
+        # pane name -> RawPaneFeed, so a stage can own its camera's pane.
+        self.feeds = dict(feeds or {})
+
+    @property
+    def args(self) -> argparse.Namespace:
+        return self.settings.args
+
+
+def parse_args(argv=None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--device", default=None, help="SpaceMouse Compact 的 /dev/hidrawN 路径或 udev 固定别名")
+    parser.add_argument("--poses", type=Path, default=PROJECT_ROOT / "g2_adapter" / "recorded_poses.json")
+    parser.add_argument("--home-pose-name", default="workflow_home")
+    parser.add_argument("--left-config", type=Path, default=PROJECT_ROOT / "g2_adapter" / "left_grasp.example.json")
+    parser.add_argument("--left-height-reference", type=Path, default=PROJECT_ROOT / "g2_adapter" / "left_step_reference.json")
+    parser.add_argument("--right-config", type=Path, default=PROJECT_ROOT / "g2_adapter" / "right_apriltag_grasp.example.json")
+    parser.add_argument(
+        "--tag-geometry-profile", type=Path,
+        default=PROJECT_ROOT / "g2_adapter" / "tag_geometry_electric_screwdriver.json",
+    )
+    parser.add_argument("--head-yolo-model", type=Path, default=PROJECT_ROOT / "models" / "head_hinge_yolo" / "best.pt")
+    parser.add_argument(
+        "--left-yolo-model", type=Path,
+        default=PROJECT_ROOT / "models" / "left_d405_hinge_yolo" / "best.pt",
+        help="左手 D405 抓取检测权重；抓取只消费 hinge 类，默认单类权重。",
+    )
+    parser.add_argument("--head-yolo-confidence", type=float, default=0.50)
+    parser.add_argument("--yolo-device", default="cuda:0")
+    parser.add_argument("--head-samples", type=int, default=15)
+    parser.add_argument("--head-min-inlier-samples", type=int, default=8)
+    parser.add_argument("--head-max-sample-spread-mm", type=float, default=50.0)
+    parser.add_argument("--head-localize-timeout-s", type=float, default=60.0)
+    parser.add_argument("--yolo-center-fraction", type=float, default=0.70,
+                        help="左手 D405 YOLO 全图推理时中央有效目标区域宽高比例，默认 0.70。")
+    parser.add_argument("--final-descent-visual-tolerance-mm", type=float, default=5.0,
+                        help="下探视觉伺服的估计水平误差死区，默认 5 mm。")
+    parser.add_argument("--post-grasp-target-lost-timeout-s", type=float, default=3.0,
+                        help="抓取后同一目标连续不可见多久才重新抓取，默认 3 秒。")
+    parser.add_argument("--approach-yaw-deg", type=float, default=0.0, help="到铰链上方时的偏航角，默认 0（正对前方）。")
+    parser.add_argument("--approach-pitch-deg", type=float, default=42.0, help="到铰链上方时的下俯角，默认 42。")
+    parser.add_argument("--approach-roll-deg", type=float, default=180.0, help="到铰链上方时的滚转角，默认 180。")
+    parser.add_argument("--approach-above-mm", type=float, default=100.0, help="铰链上方距离，默认 100 mm。")
+    parser.add_argument("--hole-above-mm", type=float, default=100.0, help="hole 上方距离，默认 100 mm。")
+    parser.add_argument("--hole-yaw-deg", type=float, default=20.0, help="到 hole 上方时的偏航角，默认 20（待实机确认）。")
+    parser.add_argument("--hole-pitch-deg", type=float, default=42.0)
+    parser.add_argument("--hole-roll-deg", type=float, default=180.0)
+    parser.add_argument("--hole-sample-timeout-s", type=float, default=20.0)
+    parser.add_argument("--web-host", default="127.0.0.1")
+    parser.add_argument("--web-port", type=int, default=8767, help="三相机合并页面端口；0 表示关闭。")
+    parser.add_argument("--raw-preview-fps", type=float, default=5.0,
+                        help="某一路没有阶段叠加图时，原画面兜底推送帧率；0 表示关闭兜底。")
+    parser.add_argument("--raw-preview-hold-s", type=float, default=1.0,
+                        help="阶段叠加图停推多久后恢复原画面，默认 1 秒。")
+    parser.add_argument("--right-premove-pose", default="RR1")
+    parser.add_argument("--right-post-grasp-pose", default="RR2")
+    parser.add_argument("--auto-speed-mm-s", type=float, default=10.0)
+    parser.add_argument("--auto-preset-velocity-rad-s", type=float, default=0.08)
+    parser.add_argument("--preset-arrival-tolerance-rad", type=float, default=0.03)
+    parser.add_argument("--preset-timeout-s", type=float, default=25.0)
+    parser.add_argument("--spacemouse-speed-mm-s", type=float, default=30.0)
+    parser.add_argument("--spacemouse-rotation-deg-s", type=float, default=20.0)
+    parser.add_argument("--spacemouse-deadzone", type=float, default=0.12)
+    parser.add_argument("--from-stage", choices=stage_names(), default=None, help="从指定阶段开始（调试用）。")
+    parser.add_argument("--list-stages", action="store_true", help="只打印阶段计划后退出。")
+    parser.add_argument("--dry-run", action="store_true", help="只读：校验姿态文件与阶段计划，不初始化 GDK。")
+    parser.add_argument("--log", type=Path, default=None)
+    parser.add_argument("--allow-motion", action="store_true", help="唯一运动确认参数；不指定时拒绝启动动作。")
+    return parser.parse_args(argv)
+
+
+def print_stage_plan() -> None:
+    for index, spec in enumerate(DEFAULT_PLAN, start=1):
+        gate = "  [SpaceMouse 门]" if spec.waits_for_advance else ""
+        pane = "" if spec.camera_pane is None else f"  cam={spec.camera_pane}"
+        print(f"{index:2d}. {spec.stage.value:14s} step {spec.user_step:4s}{gate}{pane}\n    {spec.title}")
+
+
+def run_dry_run(args: argparse.Namespace) -> int:
+    runtime = BilateralRuntime(args=args, controller=None)
+    report = runtime.validate_plan_assets()
+    home_ok, home_error = True, None
+    try:
+        try:
+            from .workflow_home import load_workflow_home
+        except ImportError:
+            from workflow_home import load_workflow_home
+        load_workflow_home(Path(args.poses), args.home_pose_name)
+    except Exception as exc:  # noqa: BLE001 - reported to the operator
+        home_ok, home_error = False, str(exc)
+    print_stage_plan()
+    print(json.dumps({
+        "event": "bilateral_flow_dry_run",
+        "poses": str(Path(args.poses).expanduser()),
+        "presets": report["presets"],
+        "missing_presets": report["missing"],
+        "home_pose": args.home_pose_name,
+        "home_ok": home_ok,
+        "home_error": home_error,
+    }, ensure_ascii=False, indent=2))
+    return 0 if not report["missing"] and home_ok else 1
+
+
+def validate_args(args: argparse.Namespace) -> int | None:
+    if args.device is None or not str(args.device).startswith("/dev/"):
+        print("--device 必须是 /dev/hidrawN 路径或 udev 固定别名。", file=sys.stderr)
+        return 2
+    checks = (
+        math.isfinite(args.head_samples) and 1 <= args.head_samples <= 30,
+        1 <= args.head_min_inlier_samples <= args.head_samples,
+        math.isfinite(args.head_max_sample_spread_mm) and 0 < args.head_max_sample_spread_mm <= 200,
+        math.isfinite(args.auto_speed_mm_s) and 0 < args.auto_speed_mm_s <= 50,
+        math.isfinite(args.auto_preset_velocity_rad_s) and 0 < args.auto_preset_velocity_rad_s <= 0.5,
+        math.isfinite(args.hole_above_mm) and 0 < args.hole_above_mm <= 500,
+        math.isfinite(args.approach_above_mm) and 0 < args.approach_above_mm <= 500,
+        1.0 <= args.spacemouse_speed_mm_s <= 30.0,
+        1.0 <= args.spacemouse_rotation_deg_s <= 28.6,
+        0.0 <= args.spacemouse_deadzone <= 0.5,
+        0.5 <= args.head_yolo_confidence <= 1.0,
+        0.0 < args.yolo_center_fraction <= 1.0,
+        math.isfinite(args.final_descent_visual_tolerance_mm) and args.final_descent_visual_tolerance_mm > 0.0,
+        0.1 <= args.post_grasp_target_lost_timeout_s <= 30.0,
+        math.isfinite(args.web_port) and 0 <= args.web_port <= 65535,
+    )
+    if not all(checks):
+        print("阶段参数超出安全范围。", file=sys.stderr)
+        return 2
+    return None
+
+
+# --------------------------------------------------------------------- stages
+def stage_home(ctx: FlowContext) -> dict:
+    opened = ctx.runtime.open_all_grippers()
+    home = ctx.runtime.move_both_to_home(
+        velocity_rad_s=ctx.args.auto_preset_velocity_rad_s,
+        arrival_tolerance_rad=ctx.args.preset_arrival_tolerance_rad,
+        timeout_s=ctx.args.preset_timeout_s,
+    )
+    return {"grippers": opened["event"], "home": home["event"]}
+
+
+def stage_head_localize(ctx: FlowContext) -> dict:
+    try:
+        from .move_left_above_head_hinge_gdk import localize_head_targets
+    except ImportError:
+        from move_left_above_head_hinge_gdk import localize_head_targets
+    gdk = ctx.gdk
+    tf = ctx.services.tf
+    localization, overlay = localize_head_targets(
+        camera=ctx.services.head_camera, tf=tf, model=ctx.services.head_yolo, gdk=gdk,
+        color_type=gdk.CameraType.kHeadColor, depth_type=gdk.CameraType.kHeadDepth,
+        depth_to_color=_transform_dict(tf, gdk.SensorExtrinsicType.kHeadDepthToHeadColor),
+        head_from_color=_transform_dict(tf, gdk.SensorExtrinsicType.kHeadRGBDToHeadLink3),
+        samples=ctx.args.head_samples,
+        min_inlier_samples=ctx.args.head_min_inlier_samples,
+        max_sample_spread_mm=ctx.args.head_max_sample_spread_mm,
+        confidence=ctx.args.head_yolo_confidence,
+        imgsz=640, device=ctx.args.yolo_device,
+        timeout_s=ctx.args.head_localize_timeout_s,
+        on_frame=_head_live_publisher(ctx),
+    )
+    _publish_head_overlay(ctx, overlay, localization)
+    targets = require_head_targets(localization)
+    ctx.services.put("head_targets", targets)
+    hole_target = targets.get("hole")
+    warning = hole_missing_warning(localization)
+    if warning is not None:
+        ctx.runtime.emit_event(warning)
+        print("警告：头部没有识别到 hole；将正常抓取并上抬，然后停在上抬位置等待下一阶段指令。", flush=True)
+    return {
+        "hinge_position_base_link_m": targets["hinge"]["position_base_link_m"],
+        "hole_position_base_link_m": None if hole_target is None else hole_target["position_base_link_m"],
+        "hole_samples": 0 if hole_target is None else hole_target["samples"],
+        "hole_missing": hole_target is None,
+        "frames": localization["frames"],
+    }
+
+
+def require_head_targets(localization: dict) -> dict:
+    """Return the head targets; only the hinge is mandatory.
+
+    A missing hole is a downgrade, not a stop: the left stage logs a warning,
+    grasps and lifts as usual, then holds and waits for the operator's next
+    stage command instead of moving above the hole.
+    """
+    targets = localization.get("targets") or {}
+    rejected = localization.get("rejected_targets") or {}
+    if "hinge" not in targets:
+        raise SafetyError(
+            "头部没有定位到最左 hinge；停止后续自动流程。原因："
+            + str(rejected.get("hinge", {}).get("reason", "无有效三维样本"))
+        )
+    return targets
+
+
+def hole_missing_warning(localization: dict) -> dict | None:
+    """Warning record for a head localization that found no hole, else None."""
+    if (localization.get("targets") or {}).get("hole") is not None:
+        return None
+    reason = (localization.get("rejected_targets") or {}).get("hole", {}).get(
+        "reason", "无有效三维样本",
+    )
+    return {
+        "event": "head_hole_missing",
+        "level": "warning",
+        "reason": reason,
+        "action": "继续抓取；上抬到位后停在原地等待 SpaceMouse 下一阶段指令，不做 hole 移动",
+    }
+
+
+def _make_jpeg_reader(gdk, camera, color_type, *, timeout_ms: float = 300.0):
+    """Return a callable that grabs the newest frame of one camera as JPEG.
+
+    The timeout is deliberately short: three pane feeds run side by side, so a
+    single stalled camera must not hold a whole second of its own thread.
+    """
+    import cv2
+    try:
+        from .camera import decode_color_rgb
+    except ImportError:
+        from camera import decode_color_rgb
+
+    def read():
+        frame = camera.get_latest_image(color_type, float(timeout_ms))
+        bgr = cv2.cvtColor(decode_color_rgb(frame, gdk), cv2.COLOR_RGB2BGR)
+        ok, buffer = cv2.imencode(".jpg", bgr, [cv2.IMWRITE_JPEG_QUALITY, 80])
+        return buffer.tobytes() if ok else None
+
+    return read
+
+
+def warmup_camera(gdk, camera, color_type, label: str, *, attempts: int = 3,
+                  timeout_ms: float = 1000.0) -> dict:
+    """Read one frame before the panes start so the first page load is not blank.
+
+    Returns a report instead of raising: a camera that is late is a diagnostic,
+    not a reason to abort the workflow.
+    """
+    try:
+        from .camera import decode_color_rgb
+    except ImportError:
+        from camera import decode_color_rgb
+
+    last_error: BaseException | None = None
+    for attempt in range(1, max(1, int(attempts)) + 1):
+        try:
+            frame = camera.get_latest_image(color_type, float(timeout_ms))
+            image = decode_color_rgb(frame, gdk)
+            return {
+                "camera": label, "ok": True, "attempts": attempt,
+                "shape": list(getattr(image, "shape", ())),
+            }
+        except BaseException as exc:  # noqa: BLE001 - reported, never raised
+            last_error = exc
+    return {
+        "camera": label, "ok": False, "attempts": int(attempts),
+        "error": str(last_error)[:200],
+    }
+
+
+def _head_live_publisher(ctx: "FlowContext"):
+    """Publish the head hinge/hole overlay for every localization frame."""
+    try:
+        from .move_left_above_head_hinge_gdk import draw_head_targets_overlay
+    except ImportError:
+        from move_left_above_head_hinge_gdk import draw_head_targets_overlay
+
+    def publish(bgr, masks, scores, classes) -> None:
+        web = getattr(ctx.services, "web", None)
+        if web is None:
+            return
+        import cv2
+
+        overlay = draw_head_targets_overlay(bgr, masks, scores, classes)
+        ok, buffer = cv2.imencode(".jpg", overlay, [cv2.IMWRITE_JPEG_QUALITY, 82])
+        if ok:
+            web.pane("head").update(buffer.tobytes(), {
+                "state": "head_coarse_localizing",
+                "source": "head_yolo",
+                "note": "正在采样最左 hinge 与最高置信度 hole",
+            })
+
+    return publish
+
+
+def _transform_dict(tf, sensor_type) -> dict:
+    try:
+        from .camera import transform_to_dict
+    except ImportError:
+        from camera import transform_to_dict
+    return transform_to_dict(tf.get_tf_from_sensor(sensor_type))
+
+
+def _publish_head_overlay(ctx: FlowContext, overlay, localization: dict) -> None:
+    """Push the head hinge/hole overlay into the shared page, if one is running."""
+    web = getattr(ctx.services, "web", None)
+    if web is None or overlay is None:
+        return
+    import cv2
+    ok, encoded = cv2.imencode(".jpg", overlay, [cv2.IMWRITE_JPEG_QUALITY, 82])
+    if not ok:
+        return
+    web.pane("head").update(encoded.tobytes(), {
+        "state": "head_hinge_hole_localized",
+        "source": "head_yolo",
+        "frames": localization.get("frames"),
+        "targets": localization.get("targets"),
+        "safety": "只读头部定位；未发送运动。",
+    })
+
+
+def stage_left_grasp(ctx: FlowContext) -> dict:
+    try:
+        from .left_grasp_gdk import run_left_cycle
+    except ImportError:
+        from left_grasp_gdk import run_left_cycle
+    # A missing hole is handled inside the left stage: warn, grasp, lift, then
+    # hold and wait for the next stage command instead of moving to the hole.
+    targets = ctx.services.get("head_targets") or {}
+    code = run_left_cycle(services=ctx.services, argv=ctx.settings.left_argv())
+    if code != 0:
+        raise SafetyError(f"左手抓取阶段返回 {code}")
+    return {"returncode": code, "hole_detected": "hole" in targets}
+
+
+def stage_left_to_ll(ctx: FlowContext) -> dict:
+    records = ctx.runtime.move_left_presets(
+        ("LL1", "LL2"),
+        velocity_rad_s=ctx.args.auto_preset_velocity_rad_s,
+        arrival_tolerance_rad=ctx.args.preset_arrival_tolerance_rad,
+        timeout_s=ctx.args.preset_timeout_s,
+    )
+    return {"presets": [record["preset"] for record in records]}
+
+
+def stage_right_to_lr1(ctx: FlowContext) -> dict:
+    record = ctx.runtime.move_right_preset(
+        "LR1",
+        velocity_rad_s=ctx.args.auto_preset_velocity_rad_s,
+        arrival_tolerance_rad=ctx.args.preset_arrival_tolerance_rad,
+        timeout_s=ctx.args.preset_timeout_s,
+    )
+    return {"preset": record["preset"]}
+
+
+def stage_right_grasp(ctx: FlowContext) -> dict:
+    try:
+        from .right_apriltag_grasp_gdk import run_right_grasp_stage
+    except ImportError:
+        from right_apriltag_grasp_gdk import run_right_grasp_stage
+    code = run_right_grasp_stage(services=ctx.services, argv=ctx.settings.right_argv())
+    if code != 0:
+        raise SafetyError(f"右手抓取阶段返回 {code}")
+    if ctx.services.get("right_saved_grasp_pose") is None:
+        raise SafetyError("右手抓取阶段没有保存抓取位姿；无法在门2后回位")
+    return {"returncode": code}
+
+
+def stage_right_return(ctx: FlowContext) -> dict:
+    try:
+        from .right_apriltag_grasp_gdk import return_screwdriver
+        from .right_apriltag_grasp_gdk import require_mapping
+    except ImportError:
+        from right_apriltag_grasp_gdk import return_screwdriver, require_mapping
+    saved = ctx.services.get("right_saved_grasp_pose")
+    if saved is None:
+        raise SafetyError("没有可用的右手抓取位姿；拒绝回位")
+    config = ctx.services.get("right_config")
+    if config is None:
+        config = require_mapping(
+            json.loads(Path(ctx.args.right_config).expanduser().read_text(encoding="utf-8")), "config",
+        )
+    events: list[dict] = []
+    return_screwdriver(
+        ctx.services.controller, saved, config, events.append, release=False,
+    )
+    return {"events": [event.get("event") for event in events], "released": False}
+
+
+def stage_finish(ctx: FlowContext) -> dict:
+    opened = ctx.runtime.open_all_grippers()
+    home = ctx.runtime.move_both_to_home(
+        velocity_rad_s=ctx.args.auto_preset_velocity_rad_s,
+        arrival_tolerance_rad=ctx.args.preset_arrival_tolerance_rad,
+        timeout_s=ctx.args.preset_timeout_s,
+    )
+    return {"grippers": opened["event"], "home": home["event"]}
+
+
+STAGE_HANDLERS = {
+    Stage.HOME: stage_home,
+    Stage.HEAD_LOCALIZE: stage_head_localize,
+    Stage.LEFT_GRASP: stage_left_grasp,
+    Stage.RIGHT_TO_LR1: stage_right_to_lr1,
+    Stage.LEFT_TO_LL: stage_left_to_ll,
+    Stage.RIGHT_GRASP: stage_right_grasp,
+    Stage.RIGHT_RETURN: stage_right_return,
+    Stage.FINISH: stage_finish,
+}
+
+
+def run_flow(args: argparse.Namespace) -> int:
+    try:
+        import agibot_gdk
+    except ImportError:
+        print("agibot_gdk 不可用；请通过 scripts/run_gdk_sam3_python.sh 运行。", file=sys.stderr)
+        return 2
+
+    from spacemouse_teleop import TeleopConfig
+    from spacemouse_takeover import MotionPauseGate, SpaceMouseTakeoverWorker
+    from dianpi_runner import DianpiCycleRunner
+
+    try:
+        from .control import G2Controller
+        from .yolo_hinge import load_yolo_segmentation_model
+        from .right_apriltag_grasp_gdk import detector_for_41h12
+    except ImportError:
+        from control import G2Controller
+        from yolo_hinge import load_yolo_segmentation_model
+        from right_apriltag_grasp_gdk import detector_for_41h12
+
+    if agibot_gdk.gdk_init() != agibot_gdk.GDKRes.kSuccess:
+        print("GDK 初始化失败", file=sys.stderr)
+        return 2
+    settings = StageSettings(args=args)
+    log_path = (
+        Path(args.log).expanduser() if args.log is not None
+        else PROJECT_ROOT / "logs" / f"bilateral_flow_{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}.jsonl"
+    )
+    cameras: list = []
+    worker = None
+    dianpi = None
+    web: BilateralWeb | None = None
+    runtime: BilateralRuntime | None = None
+    models: PreloadedModels | None = None
+    services: StageServices | None = None
+    ctx: FlowContext | None = None
+    feeds: dict = {}
+    try:
+        robot = agibot_gdk.Robot()
+        time.sleep(1.0)
+        gate = MotionPauseGate()
+        controller = G2Controller(agibot_gdk, robot, allow_motion=True, motion_gate=gate)
+        controller.checked_arm_state()
+        def flow_event_sink(event: dict) -> None:
+            print(json.dumps(event, ensure_ascii=False), flush=True)
+
+        dianpi = DianpiCycleRunner(event_sink=flow_event_sink)
+        dianpi.start_p10_monitor()
+        worker = SpaceMouseTakeoverWorker(
+            controller, gate,
+            device=args.device,
+            config=TeleopConfig(
+                side="left",
+                speed_m_s=args.spacemouse_speed_mm_s / 1000.0,
+                angular_speed_rad_s=math.radians(args.spacemouse_rotation_deg_s),
+                deadzone=args.spacemouse_deadzone,
+            ),
+            allow_advance_right=False,
+            dianpi_runner=dianpi,
+            event_sink=flow_event_sink,
+        )
+        worker.start()
+
+        head_camera = agibot_gdk.Camera([agibot_gdk.CameraType.kHeadColor, agibot_gdk.CameraType.kHeadDepth])
+        left_camera = agibot_gdk.Camera([agibot_gdk.CameraType.kHandLeftColor, agibot_gdk.CameraType.kHandLeftDepth])
+        right_camera = agibot_gdk.Camera([agibot_gdk.CameraType.kHandRightColor])
+        cameras = [head_camera, left_camera, right_camera]
+        tf = agibot_gdk.TF()
+
+        print(json.dumps({"event": "bilateral_models_preload_start"}, ensure_ascii=False), flush=True)
+        models = PreloadedModels(
+            head_yolo=load_yolo_segmentation_model(Path(args.head_yolo_model), device=args.yolo_device),
+            left_yolo=load_yolo_segmentation_model(Path(args.left_yolo_model), device=args.yolo_device),
+            apriltag_detector=detector_for_41h12(),
+        )
+        print(json.dumps({"event": "bilateral_models_preloaded", "sam3": "not_loaded"}, ensure_ascii=False), flush=True)
+
+        if args.web_port:
+            web = BilateralWeb(host=args.web_host, port=args.web_port)
+            url = web.start()
+            print(f"三相机合并页面：{url}（HEAD / LEFT / RIGHT，可勾选隐藏）", flush=True)
+        if web is not None and args.raw_preview_fps > 0:
+            # Warm each stream once before the feeds start: GDK needs a moment
+            # after Camera() before the first colour frame is available, and a
+            # pane that never gets its first frame stays blank on the page.
+            camera_sources = (
+                ("head", head_camera, agibot_gdk.CameraType.kHeadColor),
+                ("left", left_camera, agibot_gdk.CameraType.kHandLeftColor),
+                ("right", right_camera, agibot_gdk.CameraType.kHandRightColor),
+            )
+            for label, pane_camera, color_type in camera_sources:
+                report = warmup_camera(agibot_gdk, pane_camera, color_type, label)
+                print(json.dumps({"event": "camera_warmup", **report}, ensure_ascii=False), flush=True)
+                if not report["ok"]:
+                    print(
+                        f"警告：{label} 相机预热失败，页面该格会显示错误信息并持续重试：{report['error']}",
+                        flush=True,
+                    )
+            # Every pane stays live: the stages push annotated frames while they
+            # own a camera, and the raw feed covers the rest of the run.
+            for pane_name, pane_camera, color_type in camera_sources:
+                feed = RawPaneFeed(
+                    pane_name,
+                    _make_jpeg_reader(agibot_gdk, pane_camera, color_type),
+                    web,
+                    hold_s=args.raw_preview_hold_s,
+                    fps=args.raw_preview_fps,
+                )
+                feeds[pane_name] = feed
+                feed.start()
+            print(
+                f"原画面兜底：三路相机常显，{args.raw_preview_fps:g} fps；"
+                f"阶段叠加图停推 {args.raw_preview_hold_s:g} 秒后自动切回原画面。",
+                flush=True,
+            )
+
+        services = StageServices(
+            gdk=agibot_gdk, robot=robot, controller=controller, gate=gate, worker=worker,
+            dianpi_runner=dianpi, tf=tf,
+            head_yolo=models.head_yolo, left_yolo=models.left_yolo, right_detector=models.apriltag_detector,
+            head_camera=head_camera, left_camera=left_camera, right_camera=right_camera,
+            web=web,
+        )
+        services.extra["right_color_type"] = agibot_gdk.CameraType.kHandRightColor
+        runtime = BilateralRuntime(
+            args=args, controller=controller, gate=gate, worker=worker,
+            models=models, journal_path=log_path,
+        )
+        ctx = FlowContext(
+            gdk=agibot_gdk, services=services, runtime=runtime, settings=settings, feeds=feeds,
+        )
+        return _drive(ctx, args)
+    finally:
+        # Deterministic teardown: stop every producer thread first, then drop
+        # the vision assets, and only then release the GDK session.  Closing
+        # cameras or releasing GDK while a worker is still ticking has been
+        # observed to abort inside the native binding.
+        for feed in feeds.values():
+            try:
+                feed.stop()
+            except Exception:
+                pass
+        if worker is not None:
+            try:
+                worker.stop()
+            except Exception:
+                pass
+        if dianpi is not None:
+            try:
+                # The P10 monitor can be inside a slow native import/open when
+                # the run ends; give it longer than the 1 s default before
+                # reporting that it did not stop.
+                dianpi.close(timeout_s=3.0)
+            except Exception:
+                pass
+        if web is not None:
+            try:
+                web.stop()
+            except Exception:
+                pass
+        for camera in cameras:
+            try:
+                camera.close_camera()
+            except Exception:
+                pass
+        models = services = runtime = ctx = None
+        try:
+            import torch
+
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        except Exception:
+            pass
+        time.sleep(0.2)
+        try:
+            agibot_gdk.gdk_release()
+        except Exception:
+            pass
+
+
+def _drive(ctx: FlowContext, args: argparse.Namespace) -> int:
+    sequencer = StageSequencer(start_at=args.from_stage)
+    while not sequencer.is_done:
+        spec = sequencer.current
+        ctx.runtime.emit(
+            "stage_start", stage=spec.stage.value, user_step=spec.user_step, title=spec.title,
+        )
+        # A stage that uses a camera owns that pane and pushes its own overlay;
+        # pause the raw fallback for it so the two never read the same camera.
+        feed = ctx.feeds.get(spec.camera_pane) if spec.camera_pane else None
+        if feed is not None:
+            feed.pause()
+        try:
+            if spec.waits_for_advance:
+                ctx.runtime.wait_for_advance(spec)
+                payload = {"gate": spec.stage.value}
+                if spec.stage is Stage.GATE_LEFT:
+                    # The first long press also releases the left jaw.  With a
+                    # hole the hold step is skipped, so gate 1 is where the
+                    # operator asks the hand to let go of the part.
+                    released = ctx.runtime.open_left_gripper()
+                    payload["left_gripper_position_rad"] = released["actual_position_rad"].get("left")
+                    payload["left_gripper_attempts"] = released["command_attempts"].get("left")
+                    print("门1 长按后已张开左爪。", flush=True)
+            else:
+                payload = STAGE_HANDLERS[spec.stage](ctx)
+        except Exception as exc:  # noqa: BLE001 - reported and stops the sequence
+            sequencer.fail_current(str(exc))
+            ctx.runtime.emit("stage_failed", stage=spec.stage.value, error=str(exc))
+            print(f"阶段 {spec.stage.value} 失败：{exc}", file=sys.stderr)
+            return 1
+        finally:
+            if feed is not None:
+                feed.resume()
+        sequencer.complete_current(payload)
+        stage_fields = dict(payload or {})
+        stage_fields["stage"] = spec.stage.value
+        ctx.runtime.emit("stage_complete", **stage_fields)
+    ctx.runtime.emit("bilateral_flow_complete", **sequencer.summary())
+    print("左右手分阶段流程全部完成。", flush=True)
+    return 0
+
+
+def main(argv=None) -> int:
+    args = parse_args(argv)
+    if args.list_stages:
+        print_stage_plan()
+        return 0
+    if args.dry_run:
+        return run_dry_run(args)
+    if not args.allow_motion:
+        print("分阶段流程必须显式指定 --allow-motion；否则不会启动动作。", file=sys.stderr)
+        return 2
+    invalid = validate_args(args)
+    if invalid is not None:
+        return invalid
+    return run_flow(args)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

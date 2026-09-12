@@ -89,6 +89,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--head-xy-tolerance-mm", type=float, default=50.0, help="夹持中心相对头部目标的最大水平误差")
     parser.add_argument("--save-overlay", type=Path, default=PROJECT_ROOT / "outputs/head_leftmost_hinge_localization.jpg")
     parser.add_argument("--log", type=Path, default=None)
+    parser.add_argument(
+        "--localize-hinge-and-hole", action="store_true",
+        help="只读：同时定位最左 hinge(class 0) 与置信度最高的 hole(class 1)，不创建 Robot、不发运动。",
+    )
+    parser.add_argument(
+        "--localize-timeout-s", type=float, default=60.0,
+        help="只读双目标定位的采样超时；某一类始终缺失时到点即返回已有结果。",
+    )
     parser.add_argument("--allow-motion", action="store_true")
     return parser.parse_args()
 
@@ -200,6 +208,235 @@ def select_leftmost_hinge(masks, scores, classes):
         if rows.size:
             candidates.append((float(cols.mean()), index, float(score)))
     return None if not candidates else min(candidates)[1]
+
+
+def select_highest_confidence_class(masks, scores, classes, class_id: int) -> int | None:
+    """Select the highest-scoring non-empty mask of one class."""
+    best_index = None
+    best_score = float("-inf")
+    for index, (mask, score, cls) in enumerate(zip(masks, scores, classes)):
+        if int(cls) != int(class_id):
+            continue
+        rows, cols = np.where(mask)
+        if not rows.size:
+            continue
+        value = float(score)
+        if best_index is None or value > best_score:
+            best_index, best_score = index, value
+    return best_index
+
+
+# Head classes consumed by the staged bilateral flow: the leftmost hinge and,
+# independently of it, the highest-confidence hole.
+HEAD_TARGET_SELECTORS = {
+    "hinge": lambda masks, scores, classes: select_leftmost_hinge(masks, scores, classes),
+    "hole": lambda masks, scores, classes: select_highest_confidence_class(masks, scores, classes, 1),
+}
+
+
+def sample_head_target_points(
+    *,
+    next_observation,
+    selectors=None,
+    samples: int,
+    timeout_s: float = 60.0,
+    clock=time.monotonic,
+    sleep=time.sleep,
+) -> tuple[dict[str, list[np.ndarray]], int]:
+    """Collect base_link points per class selector from one read-only frame stream.
+
+    ``next_observation()`` returns ``(masks, scores, classes, to_base)`` for one
+    new frame, or ``None`` when that frame cannot be used.  ``to_base(mask)``
+    returns the base_link point for the mask, or ``None`` when its depth is
+    unusable.  Sampling stops once every selector has ``samples`` points or
+    ``timeout_s`` expires, so a missing class never stalls the caller.
+    """
+    active = dict(HEAD_TARGET_SELECTORS if selectors is None else selectors)
+    if not active:
+        raise ValueError("selectors 不能为空")
+    if int(samples) < 1:
+        raise ValueError("samples 必须 >= 1")
+    if not (math.isfinite(float(timeout_s)) and float(timeout_s) > 0.0):
+        raise ValueError("timeout_s 必须为正的有限值")
+    observations: dict[str, list[np.ndarray]] = {name: [] for name in active}
+    frames = 0
+    deadline = clock() + float(timeout_s)
+    while any(len(points) < int(samples) for points in observations.values()):
+        if clock() >= deadline:
+            break
+        observation = next_observation()
+        if observation is None:
+            sleep(0.01)
+            continue
+        masks, scores, classes, to_base = observation
+        frames += 1
+        for name, selector in active.items():
+            if len(observations[name]) >= int(samples):
+                continue
+            index = selector(masks, scores, classes)
+            if index is None:
+                continue
+            point = to_base(masks[index])
+            if point is None:
+                continue
+            observations[name].append(np.asarray(point, dtype=float))
+    return observations, frames
+
+
+def cluster_head_target(
+    name: str,
+    points: list[np.ndarray],
+    *,
+    max_sample_spread_mm: float,
+    min_inlier_samples: int,
+) -> dict:
+    """Cluster one selector's samples and report its dominant base_link target."""
+    if not points:
+        raise RuntimeError(f"头部 {name} 没有可用三维样本")
+    samples = np.asarray(points, dtype=float)
+    center, inlier_mask, spread_m = dominant_sample_cluster(samples, max_sample_spread_mm / 1000.0)
+    inlier_count = int(np.count_nonzero(inlier_mask))
+    if inlier_count < int(min_inlier_samples):
+        raise RuntimeError(
+            f"头部 {name} 样本没有足够一致的主簇：{inlier_count}/{len(samples)} 个样本在 "
+            f"{max_sample_spread_mm:.1f} mm 内，至少需要 {min_inlier_samples} 个"
+        )
+    return {
+        "name": name,
+        "position_base_link_m": [float(value) for value in center],
+        "samples": int(len(samples)),
+        "inlier_samples": inlier_count,
+        "rejected_samples": int(len(samples) - inlier_count),
+        "sample_spread_mm": round(spread_m * 1000.0, 2),
+    }
+
+
+def build_head_targets(
+    observations: dict[str, list[np.ndarray]],
+    *,
+    max_sample_spread_mm: float,
+    min_inlier_samples: int,
+) -> tuple[dict[str, dict], dict[str, dict]]:
+    """Cluster every sampled class, tolerating a class that was never seen.
+
+    Returns ``(targets, rejected)``: ``targets`` holds the classes with a
+    consistent main cluster, ``rejected`` holds the classes that were absent or
+    too scattered, with the sample count and reason.  The staged flow needs a
+    hole, but it must be able to report *why* the hole is missing instead of
+    failing with a bare cluster error.
+    """
+    targets: dict[str, dict] = {}
+    rejected: dict[str, dict] = {}
+    for name, points in observations.items():
+        samples = len(points)
+        try:
+            targets[name] = cluster_head_target(
+                name, points,
+                max_sample_spread_mm=max_sample_spread_mm,
+                min_inlier_samples=min_inlier_samples,
+            )
+        except RuntimeError as exc:
+            rejected[name] = {"samples": samples, "reason": str(exc)}
+    return targets, rejected
+
+
+def draw_head_targets_overlay(bgr: np.ndarray, masks, scores, classes) -> np.ndarray:
+    """Draw both staged-flow targets: green leftmost hinge, orange best hole."""
+    overlay = np.asarray(bgr).copy()
+    for name, colour in (("hinge", (0, 255, 0)), ("hole", (0, 180, 255))):
+        index = HEAD_TARGET_SELECTORS[name](masks, scores, classes)
+        if index is None:
+            continue
+        binary = np.asarray(masks[index], dtype=bool)
+        if binary.shape != overlay.shape[:2] or not np.any(binary):
+            continue
+        colour_array = np.asarray(colour, dtype=np.uint8)
+        overlay[binary] = (0.65 * overlay[binary] + 0.35 * colour_array).astype(np.uint8)
+        rows, cols = np.where(binary)
+        cv2.rectangle(overlay, (int(cols.min()), int(rows.min())), (int(cols.max()), int(rows.max())),
+                      tuple(int(value) for value in colour), 2)
+        cv2.putText(overlay, f"{name} {float(scores[index]):.2f}",
+                    (int(cols.min()), max(22, int(rows.min()) - 7)),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, tuple(int(value) for value in colour), 2)
+    return overlay
+
+
+def localize_head_targets(
+    *,
+    camera, tf, model, gdk, color_type, depth_type, depth_to_color, head_from_color,
+    samples: int, min_inlier_samples: int, max_sample_spread_mm: float,
+    confidence: float, imgsz: int, device: str, timeout_s: float = 60.0,
+    on_frame=None,
+) -> tuple[dict, np.ndarray | None]:
+    """Read-only head localization of the leftmost hinge and the best hole.
+
+    Uses the same depth -> color -> head_link3 -> base_link chain as the single
+    hinge coarse approach; it never creates a Robot or sends motion.
+    """
+    state: dict = {"color_intrinsic": None, "depth_intrinsic": None, "last_timestamp": None, "last_frame": None}
+
+    def next_observation():
+        color = camera.get_latest_image(color_type, 1000.0)
+        timestamp_ns = int(color.timestamp_ns)
+        if timestamp_ns == state["last_timestamp"]:
+            return None
+        state["last_timestamp"] = timestamp_ns
+        base_from_head, _, _ = base_from_head_at(tf, timestamp_ns)
+        depth = camera.get_nearest_image(depth_type, timestamp_ns, 1000.0)
+        bgr = cv2.cvtColor(decode_color_rgb(color, gdk), cv2.COLOR_RGB2BGR)
+        depth_u16 = decode_depth_u16(depth, gdk)
+        if state["color_intrinsic"] is None:
+            state["color_intrinsic"] = intrinsic_to_dict(
+                camera.get_camera_intrinsic(color_type), width=int(color.width), height=int(color.height),
+            )
+            state["depth_intrinsic"] = intrinsic_to_dict(
+                camera.get_camera_intrinsic(depth_type), width=int(depth.width), height=int(depth.height),
+            )
+        aligned = align_depth_to_color(
+            depth_u16, depth_intrinsic=state["depth_intrinsic"], color_intrinsic=state["color_intrinsic"],
+            depth_to_color=depth_to_color, depth_scale_m=DEPTH_SCALE_M,
+        )
+        masks, scores, classes = infer_yolo_masks(
+            model, bgr, confidence=confidence, imgsz=imgsz, device=device,
+        )
+        color_intrinsic = state["color_intrinsic"]
+
+        def to_base(mask):
+            _, points = depth_points(mask, aligned, DEPTH_SCALE_M, color_intrinsic)
+            if len(points) < 20:
+                return None
+            point_color = np.median(points, axis=0)
+            return apply_transform(base_from_head, apply_transform(head_from_color, point_color))
+
+        state["last_frame"] = (bgr, masks, scores, classes)
+        if on_frame is not None:
+            # Let the caller publish a live overlay for this stage; a raw
+            # preview feed backs off while annotated frames keep arriving.
+            try:
+                on_frame(bgr, masks, scores, classes)
+            except Exception:
+                pass
+        return masks, scores, classes, to_base
+
+    observations, frames = sample_head_target_points(
+        next_observation=next_observation, samples=samples, timeout_s=timeout_s,
+    )
+    targets, rejected = build_head_targets(
+        observations,
+        max_sample_spread_mm=max_sample_spread_mm,
+        min_inlier_samples=min_inlier_samples,
+    )
+    localization = {
+        "frames": frames,
+        "targets": targets,
+        # Classes with no usable cluster (absent, or too scattered) and why.
+        "rejected_targets": rejected,
+    }
+    overlay = None
+    if state["last_frame"] is not None:
+        bgr, masks, scores, classes = state["last_frame"]
+        overlay = draw_head_targets_overlay(bgr, masks, scores, classes)
+    return localization, overlay
 
 
 def draw_head_coarse_overlay(
@@ -327,8 +564,12 @@ def main() -> int:
             and 0 < args.max_sample_spread_mm <= 200 and 0 < args.above_mm <= 500
             and 0 < args.speed_mm_s <= 50 and 0 < args.max_travel_mm <= 800
             and 1 <= args.arrival_tolerance_mm <= 30 and 1 <= args.head_xy_tolerance_mm <= 100
-            and 1 <= args.orientation_speed_deg_s <= math.degrees(1.0)):
+            and 1 <= args.orientation_speed_deg_s <= math.degrees(1.0)
+            and 0 < args.localize_timeout_s <= 600):
         print("置信度、采样数、高度、速度、最大行程、到位容差或姿态速度参数无效", file=sys.stderr)
+        return 2
+    if args.localize_hinge_and_hole and args.allow_motion:
+        print("--localize-hinge-and-hole 是只读模式，不能与 --allow-motion 同时使用。", file=sys.stderr)
         return 2
     try:
         fixed_orientation = fixed_forward_down_orientation(
@@ -353,6 +594,30 @@ def main() -> int:
         tf = gdk.TF()
         depth_to_color = transform_to_dict(tf.get_tf_from_sensor(gdk.SensorExtrinsicType.kHeadDepthToHeadColor))
         head_from_color = transform_to_dict(tf.get_tf_from_sensor(gdk.SensorExtrinsicType.kHeadRGBDToHeadLink3))
+        if args.localize_hinge_and_hole:
+            localization, overlay = localize_head_targets(
+                camera=camera, tf=tf, model=model, gdk=gdk,
+                color_type=color_type, depth_type=depth_type,
+                depth_to_color=depth_to_color, head_from_color=head_from_color,
+                samples=args.samples, min_inlier_samples=args.min_inlier_samples,
+                max_sample_spread_mm=args.max_sample_spread_mm,
+                confidence=args.confidence, imgsz=args.imgsz, device=args.device,
+                timeout_s=args.localize_timeout_s,
+            )
+            if overlay is not None:
+                args.save_overlay.parent.mkdir(parents=True, exist_ok=True)
+                cv2.imwrite(str(args.save_overlay), overlay)
+            result = {
+                "event": "head_hinge_hole_localized",
+                "motion_enabled": False,
+                "confidence": args.confidence,
+                "overlay": str(args.save_overlay.resolve()),
+                **localization,
+            }
+            print(json.dumps(result, ensure_ascii=False, indent=2), flush=True)
+            append_log(log_path, result)
+            print("只读定位完成：未创建 Robot、未发送运动或夹爪命令。")
+            return 0
         color_intrinsic = depth_intrinsic = None
         observations = []
         tf_modes = []

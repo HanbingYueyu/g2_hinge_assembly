@@ -48,8 +48,36 @@ POSE_NAMES = (
     "right_post_grasp",
     "right_pr1",
     "right_pr2",
+    # Staged bilateral flow presets, named "<stage><arm><index>" and recorded
+    # for one arm only.
+    "LR1",
+    "LL1",
+    "LL2",
+    "RR1",
+    "RR2",
 )
+
+# Presets whose arm cannot be inferred from a left_/right_ prefix.  The staged
+# flow records one arm per pose, so the resolved side is also what
+# ``--side`` must agree with.
+POSE_SIDES = {
+    "LR1": "right",
+    "RR1": "right",
+    "RR2": "right",
+    "LL1": "left",
+    "LL2": "left",
+}
+
 DEFAULT_OUTPUT = Path(__file__).resolve().parent / "recorded_poses.json"
+
+
+def pose_side(name: str) -> str:
+    """Resolve the arm a preset name belongs to."""
+    if name == WORKFLOW_HOME_POSE_NAME:
+        return "both"
+    if name in POSE_SIDES:
+        return POSE_SIDES[name]
+    return "left" if name.startswith("left_") else "right"
 
 
 def parse_args() -> argparse.Namespace:
@@ -57,6 +85,12 @@ def parse_args() -> argparse.Namespace:
         description="只读当前 G2 姿态；不会调用任何运动或夹爪控制 API。"
     )
     parser.add_argument("--name", required=True, choices=(*POSE_NAMES, WORKFLOW_HOME_POSE_NAME))
+    parser.add_argument(
+        "--side",
+        choices=("left", "right"),
+        default=None,
+        help="单臂姿态所属手臂；默认按姿态名推断，显式指定时必须与名字一致。",
+    )
     parser.add_argument(
         "--both-arms",
         action="store_true",
@@ -127,6 +161,13 @@ def main() -> int:
             file=sys.stderr,
         )
         return 2
+    expected_side = pose_side(args.name)
+    if args.side is not None and args.side != expected_side:
+        print(
+            f"--side {args.side} 与姿态名 {args.name} 对应的手臂 {expected_side} 不一致。",
+            file=sys.stderr,
+        )
+        return 2
     try:
         import agibot_gdk
     except ImportError as exc:
@@ -151,7 +192,7 @@ def main() -> int:
                 all_joints[name] = value
         end_state = dict(robot.get_end_state())
         is_home = args.name == WORKFLOW_HOME_POSE_NAME
-        side = "both" if is_home else ("left" if args.name.startswith("left_") else "right")
+        side = expected_side
         selected_names = LEFT_ARM_JOINT_NAMES if side == "left" else RIGHT_ARM_JOINT_NAMES
         offset = 0 if side == "left" else 7
         end_link_pose = None if is_home else _end_link_pose(motion, side)

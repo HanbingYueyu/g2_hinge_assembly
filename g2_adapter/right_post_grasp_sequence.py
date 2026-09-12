@@ -65,9 +65,11 @@ def _validate_right_pr1_target(values: list[float]) -> list[float]:
 
 
 def load_right_pose(path: Path = DEFAULT_OUTPUT, pose_name: str = PR1_POSE_NAME) -> list[float]:
-    """Load and validate one named seven-joint right-arm preset."""
-    if pose_name not in {PR1_POSE_NAME, PR2_POSE_NAME}:
-        raise ValueError(f"unsupported right preset: {pose_name}")
+    """Load and validate one named seven-joint right-arm preset.
+
+    Any pose whose recorded ``side`` is ``right`` is accepted, so the staged
+    bilateral flow can use RR1/RR2 without touching this module.
+    """
     document = json.loads(path.expanduser().read_text(encoding="utf-8"))
     poses = document.get("poses")
     item = poses.get(pose_name) if isinstance(poses, dict) else None
@@ -244,15 +246,16 @@ def move_right_pr2(
     controller: G2Controller,
     target: list[float],
     *,
+    preset_name: str = PR2_POSE_NAME,
     velocity_rad_s: float = PRESET_VELOCITY_RAD_S,
     arrival_tolerance_rad: float = PRESET_ARRIVAL_TOLERANCE_RAD,
     timeout_s: float = PRESET_TIMEOUT_S,
 ) -> dict:
-    """Move the right arm to the post-grasp PR2 preset."""
+    """Move the right arm to the post-grasp transport preset."""
     result = move_right_preset(
         controller,
         target,
-        preset_name=PR2_POSE_NAME,
+        preset_name=preset_name,
         velocity_rad_s=velocity_rad_s,
         arrival_tolerance_rad=arrival_tolerance_rad,
         timeout_s=timeout_s,
@@ -265,10 +268,11 @@ def execute_post_grasp_transport(
     controller: G2Controller,
     pr2_target: list[float],
     *,
+    pr2_pose_name: str = PR2_POSE_NAME,
     lift_speed_mps: float | None = None,
     preset_velocity_rad_s: float = PRESET_VELOCITY_RAD_S,
 ) -> tuple[dict, dict, dict]:
-    """Save the grasp pose, lift, then move to PR2 in that strict order."""
+    """Save the grasp pose, lift, then move to the transport preset in order."""
     saved = pose_snapshot(controller)
     saved.update({
         "event": "right_post_grasp_pose_saved",
@@ -276,10 +280,10 @@ def execute_post_grasp_transport(
     })
     lift_args = {} if lift_speed_mps is None else {"speed_mps": lift_speed_mps}
     lift = lift_after_grasp(controller, pose_from_snapshot(saved), **lift_args)
-    pr2_args = (
-        {}
-        if preset_velocity_rad_s == PRESET_VELOCITY_RAD_S
-        else {"velocity_rad_s": preset_velocity_rad_s}
-    )
+    pr2_args: dict = {}
+    if pr2_pose_name != PR2_POSE_NAME:
+        pr2_args["preset_name"] = pr2_pose_name
+    if preset_velocity_rad_s != PRESET_VELOCITY_RAD_S:
+        pr2_args["velocity_rad_s"] = preset_velocity_rad_s
     pr2 = move_right_pr2(controller, pr2_target, **pr2_args)
     return saved, lift, pr2

@@ -56,7 +56,7 @@ def parse_args(argv=None) -> argparse.Namespace:
     parser.add_argument("--right-config", type=Path, default=PROJECT_ROOT / "g2_adapter" / "right_apriltag_grasp.example.json")
     parser.add_argument("--poses", type=Path, default=PROJECT_ROOT / "g2_adapter" / "recorded_poses.json")
     parser.add_argument("--checkpoint", type=Path, default=PROJECT_ROOT / "checkpoints" / "sam3.1_multiplex.pt")
-    parser.add_argument("--yolo-model", type=Path, default=PROJECT_ROOT / "models" / "left_d405_hinge_shaft_yolo" / "best.pt")
+    parser.add_argument("--yolo-model", type=Path, default=PROJECT_ROOT / "models" / "left_d405_hinge_yolo" / "best.pt")
     parser.add_argument("--head-yolo-model", type=Path, default=PROJECT_ROOT / "models" / "head_hinge_yolo" / "best.pt")
     parser.add_argument("--head-yolo-confidence", type=float, default=0.50,
                         help="头部 YOLO 接受检测的最低置信度，范围 0.50～1.00。")

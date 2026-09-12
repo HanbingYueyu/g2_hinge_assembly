@@ -42,7 +42,7 @@ try:
     from .control import CartesianPoseTarget, G2Controller, quaternion_slerp
     from .right_post_grasp_sequence import (
         PRESET_VELOCITY_RAD_S, PR1_POSE_NAME, PR2_POSE_NAME, execute_post_grasp_transport,
-        load_pr1_pose, load_pr2_pose, move_right_pr1,
+        load_right_pose, move_right_preset,
     )
     from .spacemouse_takeover import MotionPauseGate, SpaceMouseTakeoverWorker
     from .dianpi_runner import DianpiCycleRunner
@@ -58,7 +58,7 @@ except ImportError:
     from control import CartesianPoseTarget, G2Controller, quaternion_slerp
     from right_post_grasp_sequence import (
         PRESET_VELOCITY_RAD_S, PR1_POSE_NAME, PR2_POSE_NAME, execute_post_grasp_transport,
-        load_pr1_pose, load_pr2_pose, move_right_pr1,
+        load_right_pose, move_right_preset,
     )
     from spacemouse_takeover import MotionPauseGate, SpaceMouseTakeoverWorker
     from dianpi_runner import DianpiCycleRunner
@@ -153,7 +153,7 @@ def handler_class(shared: SharedView):
     return Handler
 
 
-def parse_args() -> argparse.Namespace:
+def parse_args(argv=None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="G2 右手 AprilTag 41h12 工件定位与局部抓取（仅 GDK）")
     parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG)
     parser.add_argument("--face-distance-mm", type=float, default=None, help="仅持续正对伺服，距标定抓取点 10–300 mm，不操作夹爪")
@@ -194,7 +194,15 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--poses", type=Path, default=PROJECT_ROOT / "g2_adapter" / "recorded_poses.json",
-        help="包含 right_pr1 和 right_pr2 的记录姿态文件",
+        help="包含右手预移动和抓取后运输姿态的记录文件",
+    )
+    parser.add_argument(
+        "--premove-pose", default=PR1_POSE_NAME,
+        help=f"抓取前预移动使用的右手预设名；默认 {PR1_POSE_NAME}，分阶段流程可传 RR1。",
+    )
+    parser.add_argument(
+        "--post-grasp-pose", default=PR2_POSE_NAME,
+        help=f"抓取后运输使用的右手预设名；默认 {PR2_POSE_NAME}，分阶段流程可传 RR2。",
     )
     parser.add_argument("--spacemouse-device", help="启用 SpaceMouse 临时接管；指定 /dev/hidrawN。")
     parser.add_argument("--spacemouse-speed-mm-s", type=float, default=10.0, help="SpaceMouse 平移速度上限，单位 mm/s。")
@@ -208,7 +216,11 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="视觉自动关节预设速度，单位 rad/s。",
     )
-    return parser.parse_args()
+    parser.add_argument(
+        "--stop-after-transport", action="store_true",
+        help="抓取并运输到 --post-grasp-pose 后直接退出：不等 SpaceMouse、不放回电批，供分阶段流程使用。",
+    )
+    return parser.parse_args(argv)
 
 
 def require_mapping(document: object, name: str) -> dict:
@@ -1509,8 +1521,12 @@ def execute_local_grasp(
         stream.stop()
 
 
-def return_screwdriver(controller, saved_pose, config, emit) -> None:
-    """Return via base +Z clearance; release only after both measured arrivals."""
+def return_screwdriver(controller, saved_pose, config, emit, *, release: bool = True) -> None:
+    """Return via base +Z clearance; optionally keep the gripper closed.
+
+    The staged flow passes ``release=False`` so the electric screwdriver is
+    released by the final "open every gripper" stage instead.
+    """
     above = CartesianPoseTarget(
         (saved_pose.position_m[0], saved_pose.position_m[1], saved_pose.position_m[2] + 0.10),
         saved_pose.orientation_xyzw,
@@ -1542,6 +1558,9 @@ def return_screwdriver(controller, saved_pose, config, emit) -> None:
             emit({"event": "right_return_arrived", "stage": stage, "position_m": list(actual.position_m)})
     finally:
         stream.stop()
+    if not release:
+        emit({"event": "right_return_complete_gripper_held"})
+        return
     gripper = require_mapping(config.get("gripper"), "gripper")
     opened = move_right_gripper_with_feedback(controller, float(gripper.get("open_rad", -0.785)))
     emit({"event": "right_return_released", **opened})
@@ -1561,8 +1580,19 @@ def wait_for_manual_finish(worker, *, preview=None, sleep=time.sleep) -> None:
             sleep(0.01)
 
 
-def main() -> int:
-    args = parse_args()
+def main(argv=None) -> int:
+    """Standalone CLI: this process owns its own GDK session and SpaceMouse worker."""
+    return run_right_grasp_stage(services=None, argv=argv)
+
+
+def run_right_grasp_stage(*, services=None, argv=None) -> int:
+    """Run the right-hand AprilTag pick, optionally inside an existing process.
+
+    ``services`` carries the orchestrator's GDK session, controller, gate,
+    SpaceMouse worker and preloaded detector/camera.  With ``services=None`` the
+    stage creates and owns all of them, which keeps the original CLI intact.
+    """
+    args = parse_args(argv)
     if args.face_distance_mm is not None:
         if not math.isfinite(args.face_distance_mm) or not 10 <= args.face_distance_mm <= 300 or args.post_grasp_pr2 or (args.execute and not args.autonomous_approach):
             print("正对模式距离需为 10–300 mm，执行需自主接近且不能运输至 PR2", file=sys.stderr)
@@ -1611,8 +1641,8 @@ def main() -> int:
             if args.auto_preset_velocity_rad_s is None
             else args.auto_preset_velocity_rad_s
         )
-        pr1_target = load_pr1_pose(args.poses) if args.premove_pr1 else None
-        pr2_target = load_pr2_pose(args.poses) if args.post_grasp_pr2 else None
+        pr1_target = load_right_pose(args.poses, args.premove_pose) if args.premove_pr1 else None
+        pr2_target = load_right_pose(args.poses, args.post_grasp_pose) if args.post_grasp_pr2 else None
         tag_geometry = load_tag_geometry(config, args.tag_geometry_profile)
         tool_mapping = config.get("right_end_from_grasp_tcp")
         right_end_from_tcp = None if tool_mapping is None else as_transform(tool_mapping, "right_end_from_grasp_tcp")
@@ -1740,33 +1770,61 @@ def main() -> int:
     save_target_path = None if args.save_target is None else args.save_target.expanduser()
     try:
         import agibot_gdk
-        if agibot_gdk.gdk_init() != agibot_gdk.GDKRes.kSuccess:
-            raise RuntimeError("GDK 初始化失败")
-        initialized = True
     except Exception as exc:
         print(f"GDK 不可用：{exc}", file=sys.stderr)
         return 2
+    # Only a standalone run owns (and therefore releases) the GDK session.
+    initialized = services is None
+    if initialized:
+        try:
+            if agibot_gdk.gdk_init() != agibot_gdk.GDKRes.kSuccess:
+                raise RuntimeError("GDK 初始化失败")
+        except Exception as exc:
+            print(f"GDK 不可用：{exc}", file=sys.stderr)
+            return 2
     camera = None
     server = None
     motion_gate: MotionPauseGate | None = None
     takeover_worker: SpaceMouseTakeoverWorker | None = None
     dianpi_runner: DianpiCycleRunner | None = None
+    # Guarded in ``finally``; injected objects belong to the orchestrator.
+    owns_camera = True
+    owns_worker = True
+    injected = services is not None
     try:
-        detector = detector_for_41h12()
-        color_type = agibot_gdk.CameraType.kHandRightColor
-        camera = agibot_gdk.Camera([color_type])
-        tf = agibot_gdk.TF()
-        robot = agibot_gdk.Robot()
-        if args.spacemouse_device:
-            motion_gate = MotionPauseGate()
-        controller = G2Controller(
-            agibot_gdk,
-            robot,
-            allow_motion=args.allow_motion,
-            motion_gate=motion_gate,
+        owns_camera = not injected or services.right_camera is None
+        owns_worker = not injected or services.worker is None
+        detector = (
+            services.right_detector if injected and services.right_detector is not None
+            else detector_for_41h12()
         )
-        controller.checked_arm_state()
-        if args.spacemouse_device:
+        color_type = (
+            services.extra.get("right_color_type") if injected and services.extra.get("right_color_type") is not None
+            else agibot_gdk.CameraType.kHandRightColor
+        )
+        camera = (
+            services.right_camera if injected and services.right_camera is not None
+            else agibot_gdk.Camera([color_type])
+        )
+        tf = services.tf if injected and services.tf is not None else agibot_gdk.TF()
+        robot = services.robot if injected else agibot_gdk.Robot()
+        if injected and services.controller is not None:
+            controller = services.controller
+            motion_gate = services.gate
+        else:
+            if args.spacemouse_device:
+                motion_gate = MotionPauseGate()
+            controller = G2Controller(
+                agibot_gdk,
+                robot,
+                allow_motion=args.allow_motion,
+                motion_gate=motion_gate,
+            )
+            controller.checked_arm_state()
+        if injected and services.worker is not None:
+            takeover_worker = services.worker
+            dianpi_runner = services.dianpi_runner
+        elif args.spacemouse_device:
             dianpi_runner = DianpiCycleRunner(
                 event_sink=lambda event: print(json.dumps(event, ensure_ascii=False), flush=True),
             )
@@ -1783,6 +1841,7 @@ def main() -> int:
                 ),
                 allow_advance_right=False,
                 dianpi_runner=dianpi_runner,
+                event_sink=lambda event: print(json.dumps(event, ensure_ascii=False), flush=True),
             )
             takeover_worker.start()
         intrinsic = None
@@ -1803,11 +1862,16 @@ def main() -> int:
             )
         latest = None
         observation_anchor = None
-        shared = SharedView() if args.web_port else None
-        if shared is not None:
-            server = ThreadingHTTPServer((args.web_host, args.web_port), handler_class(shared))
-            threading.Thread(target=server.serve_forever, daemon=True).start()
-            print(f"实时只读页面：http://{args.web_host}:{args.web_port}", flush=True)
+        if injected and services.web is not None:
+            # Publish into the orchestrator's shared three-camera page instead
+            # of starting a second HTTP server on this stage's own port.
+            shared = services.web.pane("right")
+        else:
+            shared = SharedView() if args.web_port else None
+            if shared is not None:
+                server = ThreadingHTTPServer((args.web_host, args.web_port), handler_class(shared))
+                threading.Thread(target=server.serve_forever, daemon=True).start()
+                print(f"实时只读页面：http://{args.web_host}:{args.web_port}", flush=True)
         log_path.parent.mkdir(parents=True, exist_ok=True)
         with log_path.open("a", encoding="utf-8") as log:
             log.write(json.dumps({
@@ -1828,21 +1892,23 @@ def main() -> int:
 
             if args.premove_pr1:
                 if pr1_target is None:
-                    raise RuntimeError(f"未加载右手 {PR1_POSE_NAME} 目标；停止启动抓取流程")
+                    raise RuntimeError(f"未加载右手 {args.premove_pose} 目标；停止启动抓取流程")
                 if shared is not None:
                     shared.update_status({
                         "state": "premove_pr1",
                         "motion": "planned_joint_premove",
-                        "preset": PR1_POSE_NAME,
+                        "preset": args.premove_pose,
                     })
-                premove_record = move_right_pr1(
+                premove_record = move_right_preset(
                     controller,
                     pr1_target,
+                    preset_name=args.premove_pose,
                     velocity_rad_s=preset_velocity_rad_s,
                 )
                 premove_record = {
                     **premove_record,
                     "event": "right_pr1_premove_arrived",
+                    "preset": args.premove_pose,
                     "phase": "before_visual_grasp",
                     "utc": datetime.now(timezone.utc).isoformat(),
                 }
@@ -1860,7 +1926,7 @@ def main() -> int:
                     shared.update_status({
                         "state": "waiting_fresh_visual_lock",
                         "motion": "hold_current_pose",
-                        "preset": PR1_POSE_NAME,
+                        "preset": args.premove_pose,
                     })
 
             def acquire_raw_lock(*, moving: bool = False):
@@ -2254,6 +2320,11 @@ def main() -> int:
                         )
                         close_record = {"event": "right_gripper_closed", **close_record}
                         saved_grasp_pose = controller.read_end_effector_pose("arm_r_end_link")
+                        if injected:
+                            # The staged flow returns to this pose in a later
+                            # stage, so keep it on the shared services object.
+                            services.put("right_saved_grasp_pose", saved_grasp_pose)
+                            services.put("right_config", config)
                         def emit_return_event(event):
                             event = {"utc": datetime.now(timezone.utc).isoformat(), **event}
                             print(json.dumps(event, ensure_ascii=False), flush=True)
@@ -2270,10 +2341,11 @@ def main() -> int:
                         log.flush()
                         if args.post_grasp_pr2:
                             if pr2_target is None:
-                                raise RuntimeError(f"未加载右手 {PR2_POSE_NAME} 目标；停止前往 PR2")
+                                raise RuntimeError(f"未加载右手 {args.post_grasp_pose} 目标；停止前往运输点")
                             post_grasp_events = execute_post_grasp_transport(
                                 controller,
                                 pr2_target,
+                                pr2_pose_name=args.post_grasp_pose,
                                 lift_speed_mps=(
                                     None
                                     if args.auto_speed_mm_s is None
@@ -2301,6 +2373,9 @@ def main() -> int:
                             )
                             + "；请在现场核验夹爪状态。"
                         )
+                        if args.stop_after_transport:
+                            print("分阶段流程：运输结束即停；不等待 SpaceMouse、不放回电批。", flush=True)
+                            return 0
                         if takeover_worker is not None:
                             wait_for_manual_finish(takeover_worker, preview=publish_takeover_preview)
                             takeover_worker.stop_for_final_motion()
@@ -2324,16 +2399,16 @@ def main() -> int:
         print(f"右手 AprilTag 流程失败：{exc}", file=sys.stderr)
         return 1
     finally:
-        if takeover_worker is not None:
+        if owns_worker and takeover_worker is not None:
             takeover_worker.stop()
-        if dianpi_runner is not None:
+        if owns_worker and dianpi_runner is not None:
             dianpi_runner.close()
         if terminal_status_active:
             print(flush=True)
         if server is not None:
             server.shutdown()
             server.server_close()
-        if camera is not None:
+        if owns_camera and camera is not None:
             try:
                 camera.close_camera()
             except Exception:

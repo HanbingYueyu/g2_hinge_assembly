@@ -18,6 +18,9 @@ set -u
 # env.sh adds the official CPython 3.10 module directory to PYTHONPATH. Keep
 # its dynamic-library environment, but never expose that incompatible .so to
 # CPython 3.12; the venv holds the freshly compiled extension instead.
+# Project-root packages such as dianpi/ are resolved by the tools themselves
+# (appended to sys.path), so the repo's sam3/ checkout cannot shadow the
+# installed sam3 package.
 unset PYTHONPATH
 
 cd "${project_root}"

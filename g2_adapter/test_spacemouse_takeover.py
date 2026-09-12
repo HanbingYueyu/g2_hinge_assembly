@@ -16,6 +16,7 @@ from spacemouse_takeover import (
     TakeoverEvent,
 )
 from control import G2Controller
+from safety import SafetyError
 from spacemouse_teleop import TeleopConfig, TransientGDKReadTimeout
 from dianpi_runner import DianpiTriggerResult
 from test_control import FakeGdk
@@ -134,6 +135,53 @@ class GestureTests(unittest.TestCase):
         result = state.update(frame(1.60, pressed=(1,)), 1.60)
         self.assertEqual(result.events, ())
 
+    def test_held_left_allows_repeated_right_taps_to_run_repeated_cycles(self):
+        state = SpaceMouseGestureState()
+        state.update(frame(1.00, buttons=(True, False), pressed=(0,)), 1.00)
+        state.update(frame(1.00 + LONG_PRESS_S + 0.01, buttons=(True, False)), 1.00 + LONG_PRESS_S + 0.01)
+        first = state.update(frame(1.50, buttons=(True, True), pressed=(1,)), 1.50)
+        self.assertEqual(first.events, (TakeoverEvent.START_DIANPI,))
+        # Tap the right button again without releasing the left modifier: the
+        # second release must re-arm the chord instead of locking the operator
+        # out until both buttons are fully up.
+        released = state.update(frame(1.60, buttons=(True, False)), 1.60)
+        self.assertEqual(released.events, ())
+        second = state.update(frame(1.70, buttons=(True, True), pressed=(1,)), 1.70)
+        self.assertEqual(second.events, (TakeoverEvent.START_DIANPI,))
+        third = state.update(frame(1.80, buttons=(True, True), pressed=(1,)), 1.80)
+        self.assertEqual(third.events, ())
+
+    def test_rearmed_chord_never_leaks_a_takeover_on_release(self):
+        state = SpaceMouseGestureState()
+        state.update(frame(1.00, buttons=(True, False), pressed=(0,)), 1.00)
+        state.update(frame(1.00 + LONG_PRESS_S + 0.01, buttons=(True, False)), 1.00 + LONG_PRESS_S + 0.01)
+        state.update(frame(1.50, buttons=(True, True), pressed=(1,)), 1.50)
+        state.update(frame(1.60, buttons=(True, False)), 1.60)
+        # Releasing the still-held left modifier after a re-armed chord is a
+        # chord release, not a click or a takeover.
+        self.assertEqual(state.update(frame(1.70), 1.70).events, ())
+        self.assertEqual(state.update(frame(1.80, buttons=(False, True), pressed=(1,)), 1.80).events, ())
+        self.assertEqual(state.update(frame(1.90), 1.90).events, ())
+
+    def test_early_right_press_is_not_rearmed_into_a_chord_right_away(self):
+        state = SpaceMouseGestureState()
+        state.update(frame(1.00, buttons=(True, False), pressed=(0,)), 1.00)
+        # Both buttons are pressed before the left modifier is long enough.
+        state.update(frame(1.05, buttons=(True, True), pressed=(1,)), 1.05)
+        state.update(frame(1.06, buttons=(True, False)), 1.06)
+        # A right press that still predates the left long press stays silent.
+        self.assertEqual(
+            state.update(frame(1.10, buttons=(True, True), pressed=(1,)), 1.10).events,
+            (),
+        )
+        # Once the left hold has genuinely crossed the threshold, the next
+        # right press is a real chord again.
+        self.assertEqual(state.update(frame(1.45, buttons=(True, False)), 1.45).events, ())
+        self.assertEqual(
+            state.update(frame(1.46, buttons=(True, True), pressed=(1,)), 1.46).events,
+            (TakeoverEvent.START_DIANPI,),
+        )
+
 
 class MotionPauseGateTests(unittest.TestCase):
     def test_pause_waits_for_an_inflight_automatic_write_before_manual_access(self):
@@ -220,6 +268,27 @@ class MotionPauseGateTests(unittest.TestCase):
         self.assertIsInstance(errors[0], AdvanceRightRequested)
         self.assertTrue(gate.is_paused())
 
+    def test_consume_advance_clears_the_request_and_reopens_automatic_motion(self):
+        gate = MotionPauseGate()
+        gate.request_advance()
+        self.assertTrue(gate.is_paused())
+        with self.assertRaises(AdvanceRightRequested):
+            gate.wait_for_auto()
+        gate.consume_advance()
+        self.assertFalse(gate.is_paused())
+        # The next automatic writer proceeds instead of raising again, so one
+        # gate can serve several "next stage" boundaries.
+        gate.wait_for_auto()
+
+    def test_consume_advance_keeps_an_aborted_gate_closed(self):
+        gate = MotionPauseGate()
+        error = SafetyError("worker failed")
+        gate.abort(error)
+        gate.consume_advance()
+        self.assertTrue(gate.is_paused())
+        with self.assertRaises(SafetyError):
+            gate.wait_for_auto()
+
 
 class WorkerTests(unittest.TestCase):
     def test_worker_routes_left_hold_right_press_to_dianpi_without_takeover(self):
@@ -262,6 +331,74 @@ class WorkerTests(unittest.TestCase):
         worker.step(frame(LONG_PRESS_S + 0.02, buttons=(True, True), pressed=(1,)), LONG_PRESS_S + 0.02)
         worker.raise_if_failed()
         self.assertEqual(runner.calls, 1)
+
+    def test_worker_reports_every_dianpi_trigger_result(self):
+        robot = BilateralRobot()
+        gate = MotionPauseGate()
+        controller = G2Controller(FakeGdk, robot, allow_motion=True, motion_gate=gate)
+        events = []
+
+        class CountingRunner:
+            def __init__(self):
+                self.calls = 0
+
+            def trigger(self):
+                self.calls += 1
+                return DianpiTriggerResult.STARTED if self.calls == 1 else DianpiTriggerResult.BUSY
+
+        runner = CountingRunner()
+        worker = SpaceMouseTakeoverWorker(
+            controller,
+            gate,
+            device=None,
+            config=TeleopConfig(side="left", axis_map=(1, 2, 3, 4, 5, 6)),
+            dianpi_runner=runner,
+            event_sink=events.append,
+        )
+
+        worker.step(frame(0.00, buttons=(True, False), pressed=(0,)), 0.00)
+        worker.step(frame(LONG_PRESS_S + 0.01, buttons=(True, False)), LONG_PRESS_S + 0.01)
+        worker.step(frame(LONG_PRESS_S + 0.02, buttons=(True, True), pressed=(1,)), LONG_PRESS_S + 0.02)
+        # Tap the right button a second time without releasing the left one.
+        worker.step(frame(LONG_PRESS_S + 0.10, buttons=(True, False)), LONG_PRESS_S + 0.10)
+        worker.step(frame(LONG_PRESS_S + 0.20, buttons=(True, True), pressed=(1,)), LONG_PRESS_S + 0.20)
+
+        self.assertEqual(runner.calls, 2)
+        self.assertEqual(
+            [event["action"] for event in events],
+            ["cycle_started", "ignored_previous_cycle_still_running"],
+        )
+        self.assertTrue(all(event["event"] == "dianpi_trigger_result" for event in events))
+        # The operator-facing sink must stay optional for standalone users.
+        silent = SpaceMouseTakeoverWorker(
+            controller, gate, device=None,
+            config=TeleopConfig(side="left", axis_map=(1, 2, 3, 4, 5, 6)),
+            dianpi_runner=FakeDianpiRunner(),
+        )
+        silent.step(frame(0.00, buttons=(True, False), pressed=(0,)), 0.00)
+        silent.step(frame(LONG_PRESS_S + 0.01, buttons=(True, False)), LONG_PRESS_S + 0.01)
+        silent.step(frame(LONG_PRESS_S + 0.02, buttons=(True, True), pressed=(1,)), LONG_PRESS_S + 0.02)
+        self.assertIsNone(silent.event_sink)
+
+    def test_dianpi_trigger_sink_failure_cannot_break_the_worker(self):
+        robot = BilateralRobot()
+        gate = MotionPauseGate()
+        controller = G2Controller(FakeGdk, robot, allow_motion=True, motion_gate=gate)
+
+        def broken_sink(_event):
+            raise RuntimeError("log pipe closed")
+
+        worker = SpaceMouseTakeoverWorker(
+            controller, gate, device=None,
+            config=TeleopConfig(side="left", axis_map=(1, 2, 3, 4, 5, 6)),
+            dianpi_runner=FakeDianpiRunner(),
+            event_sink=broken_sink,
+        )
+        worker.step(frame(0.00, buttons=(True, False), pressed=(0,)), 0.00)
+        worker.step(frame(LONG_PRESS_S + 0.01, buttons=(True, False)), LONG_PRESS_S + 0.01)
+        result = worker.step(frame(LONG_PRESS_S + 0.02, buttons=(True, True), pressed=(1,)), LONG_PRESS_S + 0.02)
+        self.assertEqual(result.events, (TakeoverEvent.START_DIANPI,))
+        worker.raise_if_failed()
 
     def test_transient_gdk_read_timeout_cancels_takeover_and_resumes_auto(self):
         robot = BilateralRobot()
@@ -452,6 +589,30 @@ class WorkerTests(unittest.TestCase):
         self.assertEqual(result.events, (TakeoverEvent.ADVANCE_RIGHT,))
         self.assertTrue(worker.advance_requested)
         self.assertTrue(gate.is_paused())
+
+    def test_worker_consume_advance_clears_the_flag_and_reopens_the_gate(self):
+        robot = BilateralRobot()
+        gate = MotionPauseGate()
+        controller = G2Controller(FakeGdk, robot, allow_motion=True, motion_gate=gate)
+        worker = SpaceMouseTakeoverWorker(
+            controller,
+            gate,
+            device=None,
+            config=TeleopConfig(side="left", axis_map=(1, 2, 3, 4, 5, 6)),
+            allow_advance_right=True,
+            clock=lambda: 1.02,
+        )
+        worker.step(frame(1.0), 1.0)
+        worker.step(frame(1.02, buttons=(False, True), pressed=(1,)), 1.02)
+        worker.step(
+            frame(1.02 + RIGHT_LONG_PRESS_S + 0.01, buttons=(False, True)),
+            1.02 + RIGHT_LONG_PRESS_S + 0.01,
+        )
+        self.assertTrue(worker.advance_requested)
+        worker.consume_advance()
+        self.assertFalse(worker.advance_requested)
+        self.assertFalse(gate.is_paused())
+        gate.wait_for_auto()
 
 
 if __name__ == "__main__":

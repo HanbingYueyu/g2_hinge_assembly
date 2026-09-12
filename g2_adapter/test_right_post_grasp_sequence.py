@@ -13,6 +13,7 @@ from right_post_grasp_sequence import (
     lift_target_from_pose,
     load_pr1_pose,
     load_pr2_pose,
+    load_right_pose,
     move_right_pr1,
     move_right_pr2,
     pose_snapshot,
@@ -51,6 +52,31 @@ class RightPostGraspSequenceTests(unittest.TestCase):
             path = Path(directory) / "poses.json"
             path.write_text(json.dumps(document), encoding="utf-8")
             self.assertEqual(load_pr2_pose(path), [0.2] * 7)
+
+    def test_staged_flow_right_presets_are_loaded_by_name(self):
+        document = {
+            "schema_version": 1,
+            "poses": {
+                "RR1": {"side": "right", "joint_positions_rad": [0.3] * 7},
+                "RR2": {"side": "right", "joint_positions_rad": [0.4] * 7},
+            },
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "poses.json"
+            path.write_text(json.dumps(document), encoding="utf-8")
+            self.assertEqual(load_right_pose(path, "RR1"), [0.3] * 7)
+            self.assertEqual(load_right_pose(path, "RR2"), [0.4] * 7)
+
+    def test_staged_flow_rejects_a_left_arm_pose_recorded_under_a_right_name(self):
+        document = {
+            "schema_version": 1,
+            "poses": {"RR1": {"side": "left", "joint_positions_rad": [0.3] * 7}},
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "poses.json"
+            path.write_text(json.dumps(document), encoding="utf-8")
+            with self.assertRaises(RuntimeError):
+                load_right_pose(path, "RR1")
 
     def test_pr1_pose_range_is_checked_before_transport(self):
         document = {

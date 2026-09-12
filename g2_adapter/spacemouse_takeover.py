@@ -145,21 +145,31 @@ class SpaceMouseGestureState:
                 events.append(TakeoverEvent.START_DIANPI)
         if self._chord_blocked:
             consumed.update((0, 1))
-            if not both_down:
-                # Suppress the release edge too, then re-arm only after both
-                # buttons are fully up.  No pending click survives a chord.
-                if not frame.buttons[0] and not frame.buttons[1]:
-                    self._chord_blocked = False
-                    self._chord_triggered = False
-                    self._was_down = [False, False]
-                    self._down_since = [None, None]
-                    self._long = [False, False]
-                    self._pending_click = [None, None]
-                else:
-                    self._was_down = [bool(frame.buttons[0]), bool(frame.buttons[1])]
-                return GestureResult((), tuple(sorted(consumed)), activity)
-            self._was_down = [True, True]
-            return GestureResult(tuple(events), tuple(sorted(consumed)), activity)
+            if right_down:
+                self._was_down = [True, True]
+                return GestureResult(tuple(events), tuple(sorted(consumed)), activity)
+            # The right-button press edge is what triggers one Dianpi cycle, so
+            # the chord re-arms as soon as that edge is released.  An operator
+            # can then keep the left modifier held and tap the right button
+            # again for the next cycle instead of being locked out until both
+            # buttons are fully up.  Releases are still swallowed here so no
+            # click or takeover can leak out of the overlap.
+            self._chord_blocked = False
+            self._chord_triggered = False
+            if not left_down:
+                self._was_down = [False, False]
+                self._down_since = [None, None]
+                self._long = [False, False]
+                self._pending_click = [None, None]
+            else:
+                # Left is still held: keep its measured press state (the
+                # pre-chord long-press tracker keeps updating it every tick),
+                # so the next right press is another chord only once the left
+                # button has genuinely been held long enough.  Drop any pending
+                # single click it may have accumulated.
+                self._was_down = [True, False]
+                self._pending_click[0] = None
+            return GestureResult((), tuple(sorted(consumed)), activity)
 
         for button in (0, 1):
             down = bool(frame.buttons[button])
@@ -240,6 +250,19 @@ class MotionPauseGate:
         with self._writer_lock:
             return
 
+    def consume_advance(self) -> None:
+        """Clear one consumed advance request and re-open automatic motion.
+
+        The staged bilateral flow uses the same gate for several "next stage"
+        gates, so each gate must consume exactly one request instead of the
+        sticky single-shot behaviour of the original two-stage runner.
+        """
+        with self._condition:
+            self._advance_requested = False
+            if self._aborted is None:
+                self._paused = False
+            self._condition.notify_all()
+
     def abort(self, error: BaseException) -> None:
         with self._condition:
             self._aborted = error
@@ -296,6 +319,7 @@ class SpaceMouseTakeoverWorker:
         sleep=time.sleep,
         hid_factory=None,
         dianpi_runner=None,
+        event_sink=None,
     ) -> None:
         self.controller = controller
         self.gate = gate
@@ -306,6 +330,7 @@ class SpaceMouseTakeoverWorker:
         self.sleep = sleep
         self.hid_factory = hid_factory
         self.dianpi_runner = dianpi_runner
+        self.event_sink = event_sink
         self.gestures = SpaceMouseGestureState(deadzone=config.deadzone)
         self.active_side: str | None = None
         self._session = None
@@ -321,6 +346,11 @@ class SpaceMouseTakeoverWorker:
     @property
     def advance_requested(self) -> bool:
         return self._advance_requested
+
+    def consume_advance(self) -> None:
+        """Consume one pending advance request and let automatic motion resume."""
+        self._advance_requested = False
+        self.gate.consume_advance()
 
     @property
     def connected(self) -> bool:
@@ -411,18 +441,53 @@ class SpaceMouseTakeoverWorker:
         if resume:
             self.gate.resume()
 
+    def _emit_dianpi(self, event: dict) -> None:
+        sink = self.event_sink
+        if sink is None:
+            return
+        try:
+            sink(event)
+        except Exception:
+            # Operator feedback must never affect G2 or SpaceMouse control.
+            pass
+
     def step(self, frame: InputFrame, now: float) -> GestureResult:
         result = self.gestures.update(frame, now)
         if TakeoverEvent.START_DIANPI in result.events:
-            if self.dianpi_runner is not None:
+            if self.dianpi_runner is None:
+                self._emit_dianpi({
+                    "event": "dianpi_trigger_result",
+                    "result": "ignored",
+                    "action": "no_dianpi_runner",
+                })
+            else:
                 try:
-                    self._last_dianpi_result = self.dianpi_runner.trigger()
+                    outcome = self.dianpi_runner.trigger()
+                    self._last_dianpi_result = outcome
                     self._dianpi_error = None
+                    value = getattr(outcome, "value", None) or str(outcome)
+                    self._emit_dianpi({
+                        "event": "dianpi_trigger_result",
+                        "result": value,
+                        "action": (
+                            "cycle_started"
+                            if value == "started"
+                            else "ignored_previous_cycle_still_running"
+                            if value == "busy"
+                            else "hardware_error"
+                        ),
+                    })
                 except BaseException as exc:
                     # The supplied runner is expected to swallow hardware
                     # failures; keep this boundary defensive so a logging or
                     # test runner can never abort G2 motion.
                     self._dianpi_error = exc
+                    self._emit_dianpi({
+                        "event": "dianpi_trigger_result",
+                        "result": "raised",
+                        "action": "hardware_error",
+                        "error": str(exc),
+                    })
             if self._session is not None:
                 # The chord owns both buttons and must not feed stale axes or
                 # click state into TeleopSession.  A neutral tick bases the

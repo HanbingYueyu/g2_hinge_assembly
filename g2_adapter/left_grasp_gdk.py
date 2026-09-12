@@ -46,7 +46,8 @@ try:
     from .localize_left_d405_sam3 import depth_points, draw_overlay, eligible_candidates, parse_roi, stats_for_mask
     from .move_left_above_head_hinge_gdk import (
         base_from_head_at, dominant_sample_cluster, fixed_forward_down_orientation,
-        draw_head_coarse_overlay, gripper_end_target, select_leftmost_hinge, wait_actual_left_target,
+        draw_head_coarse_overlay, draw_head_targets_overlay, gripper_end_target,
+        select_highest_confidence_class, select_leftmost_hinge, wait_actual_left_target,
     )
     from .safety import SafetyError
     from .sam_crop import center_crop_bounds, center_crop_image, draw_crop_box, expand_crop_masks
@@ -83,7 +84,8 @@ except ImportError:
     from localize_left_d405_sam3 import depth_points, draw_overlay, eligible_candidates, parse_roi, stats_for_mask
     from move_left_above_head_hinge_gdk import (
         base_from_head_at, dominant_sample_cluster, fixed_forward_down_orientation,
-        draw_head_coarse_overlay, gripper_end_target, select_leftmost_hinge, wait_actual_left_target,
+        draw_head_coarse_overlay, draw_head_targets_overlay, gripper_end_target,
+        select_highest_confidence_class, select_leftmost_hinge, wait_actual_left_target,
     )
     from safety import SafetyError
     from sam_crop import center_crop_bounds, center_crop_image, draw_crop_box, expand_crop_masks
@@ -112,14 +114,16 @@ LEFT_VISUAL_TIP_LINK = "arm_l_end_link"
 # Camera/model inference sets the cadence. Do not add an artificial delay
 # between display-only frames.
 FORCE_DESCENT_SAM_PREVIEW_PERIOD_S = 0.01
-_PREFERRED_G2_HINGE_SHAFT_YOLO = PROJECT_ROOT / "models" / "left_d405_hinge_shaft_yolo" / "best.pt"
-_ROLLBACK_G2_HINGE_YOLO = PROJECT_ROOT / "models" / "left_d405_hinge_yolo" / "best.pt"
-# Prefer the newly trained two-class model when it is present, while retaining
-# the known one-class weight as a safe checkout/rollback fallback.
+# The left grasp only consumes the hinge class (class 0), so the one-class
+# hinge weight is preferred here.  The two-class hinge/shaft weight stays on
+# disk for run_bilateral_alignment_gdk.py (its post-grasp hole alignment needs
+# class 1 "shaft") and as a rollback for this flow.
+_PREFERRED_LEFT_HINGE_YOLO = PROJECT_ROOT / "models" / "left_d405_hinge_yolo" / "best.pt"
+_ROLLBACK_LEFT_HINGE_SHAFT_YOLO = PROJECT_ROOT / "models" / "left_d405_hinge_shaft_yolo" / "best.pt"
 DEFAULT_G2_NATIVE_YOLO = (
-    _PREFERRED_G2_HINGE_SHAFT_YOLO
-    if _PREFERRED_G2_HINGE_SHAFT_YOLO.is_file()
-    else _ROLLBACK_G2_HINGE_YOLO
+    _PREFERRED_LEFT_HINGE_YOLO
+    if _PREFERRED_LEFT_HINGE_YOLO.is_file()
+    else _ROLLBACK_LEFT_HINGE_SHAFT_YOLO
 )
 DEFAULT_G2_URDF = PROJECT_ROOT / "robot_description" / "G2_t2v2_crsB_omnipicker.urdf"
 EXIT_ADVANCE_RIGHT = 20
@@ -405,6 +409,105 @@ def held_part_monitor_failure(
     return None
 
 
+def held_part_gate_step(
+    monitor: dict,
+    observation: dict | None,
+    *,
+    now: float,
+    max_stale_s: float,
+    center_drift_px: float,
+    area_change_fraction: float,
+    check_geometry: bool = False,
+) -> str:
+    """Advance one post-grasp "is the part still held?" gate step.
+
+    Mirrors the P3/P4 gate: a fresh same-target frame clears
+    ``awaiting_fresh_observation``; only a timeout-confirmed loss is
+    actionable; stale perception holds position instead of moving blind.
+
+    Returns ``"proceed"`` (part confirmed still held), ``"lost"`` (confirmed
+    loss), ``"stale"`` (perception went stale on this step) or ``"wait"``.
+    ``monitor`` is updated in place.
+    """
+    if observation is not None:
+        monitor["failure"] = held_part_monitor_failure(
+            observation,
+            reference_center_px=monitor["reference_center_px"],
+            reference_area_px=monitor["reference_area_px"],
+            max_center_drift_px=center_drift_px,
+            max_area_change_fraction=area_change_fraction,
+            check_geometry=check_geometry,
+        )
+        monitor["awaiting_fresh_observation"] = False
+        monitor["paused"] = False
+        monitor["stale_since"] = None
+        monitor["last_observation_at"] = now
+    if monitor.get("failure") is not None:
+        return "lost"
+    if not monitor.get("awaiting_fresh_observation"):
+        return "proceed"
+    if observation is None and not monitor.get("paused") and now - monitor["last_observation_at"] > max_stale_s:
+        monitor["paused"] = True
+        monitor["stale_since"] = now
+        return "stale"
+    return "wait"
+
+
+HELD_PART_AREA_UNSTABLE_REASON = "held_target_mask_area_unstable_during_lift"
+
+
+def held_part_area_instability(
+    samples: Sequence[tuple[float, float]],
+    *,
+    now: float,
+    window_s: float,
+    max_spread: float,
+    min_samples: int,
+) -> dict | None:
+    """Judge a closed-gripper lift from the trailing mask-area history.
+
+    A confirmed close is not proof that the hinge is actually inside the jaws:
+    an empty grasp still shows a tracked mask.  The distinguishing signal
+    during transport is motion of the part *relative to the gripper*.
+
+    The left wrist camera moves with the gripper, so a part that is really
+    held keeps a nearly constant apparent mask area, while a part that was
+    never gripped (or is sliding out) keeps changing size frame after frame.
+    Areas normally drift right after the close, so only the trailing
+    ``window_s`` of the lift is judged and the caller feeds this helper only
+    after its grace period.
+
+    Returns ``None`` until the trailing window holds at least ``min_samples``
+    finite, positive areas.  Otherwise returns the measured spread together
+    with ``unstable`` telling whether it exceeds ``max_spread``.
+    """
+    window = [
+        (float(timestamp), float(area))
+        for timestamp, area in samples
+        if now - float(timestamp) <= window_s
+        and math.isfinite(float(area))
+        and float(area) > 0.0
+    ]
+    if len(window) < max(1, int(min_samples)):
+        return None
+    areas = [area for _, area in window]
+    median_area = float(np.median(areas))
+    spread_fraction = (max(areas) - min(areas)) / median_area
+    return {
+        "reason": HELD_PART_AREA_UNSTABLE_REASON,
+        "unstable": spread_fraction > max_spread,
+        "spread_fraction": spread_fraction,
+        "max_area_px": max(areas),
+        "min_area_px": min(areas),
+        "median_area_px": median_area,
+        "latest_area_px": areas[-1],
+        "samples": len(window),
+        "window_s": window_s,
+        "max_spread": max_spread,
+        "min_samples": int(min_samples),
+    }
+
+
 @dataclass
 class NonBlockingLeftPresetSequence:
     """Send one recorded joint target at a time and poll it from the main loop.
@@ -505,7 +608,7 @@ def stalled_gripper_position(
     return positions[-1]
 
 
-def parse_args() -> argparse.Namespace:
+def parse_args(argv=None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="G2 左手最终检测位 D405/YOLO 闭环抓取")
     parser.add_argument("--config", type=Path, default=PROJECT_ROOT / "g2_adapter" / "left_grasp.example.json")
     parser.add_argument("--urdf", type=Path, default=DEFAULT_G2_URDF, help="兼容旧命令；当前视觉对准不使用 URDF 夹爪中心。")
@@ -668,6 +771,36 @@ def parse_args() -> argparse.Namespace:
         help="抓取后的运输监控最长允许多久没有新的同一目标观测，默认 2 秒；超时只暂停并保持闭爪，明确丢失才重夹。",
     )
     parser.add_argument(
+        "--post-grasp-lift-area-grace-s",
+        type=float,
+        default=2.0,
+        help="闭爪上抬后跳过多久的面积变化（闭爪/起抬瞬间面积本来就会变），默认 2 秒。",
+    )
+    parser.add_argument(
+        "--post-grasp-lift-area-window-s",
+        type=float,
+        default=3.0,
+        help="空夹判定的滑动窗口长度，默认 3 秒；只看窗口内掩膜面积的相对波动。",
+    )
+    parser.add_argument(
+        "--post-grasp-lift-area-spread",
+        type=float,
+        default=0.5,
+        help="窗口内掩膜面积相对中位数的最大波动比例；超过即认为没夹住（空夹/滑落），默认 0.5（50%%）。",
+    )
+    parser.add_argument(
+        "--post-grasp-lift-area-min-samples",
+        type=int,
+        default=4,
+        help="窗口内至少需要多少个面积样本才开始判定空夹，默认 4。",
+    )
+    parser.add_argument(
+        "--post-grasp-lift-area-confirmations",
+        type=int,
+        default=2,
+        help="连续多少次窗口判定都超阈值才真正判空夹，默认 2；用于过滤单帧抖动。",
+    )
+    parser.add_argument(
         "--post-grasp-target-lost-timeout-s",
         type=float,
         default=3.0,
@@ -681,6 +814,11 @@ def parse_args() -> argparse.Namespace:
         "--full-cycle",
         action="store_true",
         help="执行启动接近、YOLO 抓取、+Z 上抬 150 mm、P3→P4；可用 --head-coarse-approach 替换 P1→P2。",
+    )
+    parser.add_argument(
+        "--skip-workflow-home",
+        action="store_true",
+        help="分阶段流程使用：调用方已完成双臂归位，本阶段不再重复执行 workflow_home。",
     )
     parser.add_argument(
         "--head-coarse-approach",
@@ -713,6 +851,24 @@ def parse_args() -> argparse.Namespace:
                         help="头部粗定位时末端 +Z 向下俯角，正值向下。")
     parser.add_argument("--head-gripper-roll-deg", type=float, default=180.0,
                         help="头部粗定位时绕末端 +Z 的滚转角，默认 180 度。")
+    parser.add_argument("--hole-sample-timeout-s", type=float, default=20.0,
+                        help="头部同时采样 class 1 hole 的最长等待；超时后仍可只用 hinge 继续。")
+    parser.add_argument("--move-above-hole", action="store_true",
+                        help="分阶段流程：抓取并 +Z 上抬 150 mm 后，以 --hole-* 姿态移动到 hole 上方后结束本阶段。")
+    parser.add_argument("--hole-above-mm", type=float, default=100.0,
+                        help="左手夹爪中心位于 hole 上方的距离，默认 100 mm。")
+    parser.add_argument("--hole-forward-yaw-deg", type=float, default=20.0,
+                        help="到 hole 上方时末端 +Z 相对 base_link +X 的水平偏航角，默认 20 度。")
+    parser.add_argument("--hole-gripper-pitch-deg", type=float, default=42.0,
+                        help="到 hole 上方时末端 +Z 向下俯角，默认 42 度。")
+    parser.add_argument("--hole-gripper-roll-deg", type=float, default=180.0,
+                        help="到 hole 上方时绕末端 +Z 的滚转角，默认 180 度。")
+    parser.add_argument("--hole-speed-mm-s", type=float, default=10.0,
+                        help="到 hole 上方的自动平移速度上限，默认 10 mm/s。")
+    parser.add_argument("--hole-rotation-deg-s", type=float, default=20.0,
+                        help="到 hole 上方时的末端角速度上限，默认 20 deg/s。")
+    parser.add_argument("--max-travel-mm", type=float, default=450.0,
+                        help="到 hole 上方这一步允许的最大直线行程，默认 450 mm；超过即拒绝发送。")
     parser.add_argument(
         "--wait-for-next",
         action="store_true",
@@ -741,7 +897,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--spacemouse-rotation-deg-s", type=float, default=10.0, help="SpaceMouse 旋转速度上限，单位 deg/s。")
     parser.add_argument("--spacemouse-deadzone", type=float, default=0.12, help="SpaceMouse 轴死区。")
     parser.add_argument("--allow-motion", action="store_true", help="唯一运动确认参数；未指定时严格只读。")
-    return parser.parse_args()
+    return parser.parse_args(argv)
 
 
 def load_config(path: Path, *, require_calibrated: bool) -> tuple[dict, GraspParameters | None, float | None, float | None, float | None, np.ndarray | None, ForceContactParameters | None, AdaptiveGripperCloseParameters | None]:
@@ -1897,8 +2053,14 @@ def stop_force_descent_sam_preview(stop: threading.Event | None, worker: threadi
 
 
 def run_head_coarse_approach_in_process(*, gdk, controller: G2Controller, tf, args, head_model_path: Path, log,
-                                        shared: SharedView | None = None) -> tuple[threading.Event | None, threading.Thread | None, dict]:
-    """Locate the leftmost head-camera hinge and move above it in this GDK session."""
+                                        shared: SharedView | None = None, head_camera=None,
+                                        head_model=None) -> tuple[threading.Event | None, threading.Thread | None, dict]:
+    """Locate the leftmost head-camera hinge and move above it in this GDK session.
+
+    ``head_camera`` and ``head_model`` may be supplied by a single-process
+    orchestrator that preloaded them; in that case this stage neither creates
+    nor closes them.
+    """
     try:
         tcp_end_m = np.asarray([float(value) for value in args.step_tcp_end_mm.split(",")], dtype=float) / 1000.0
         if tcp_end_m.shape != (3,) or not np.isfinite(tcp_end_m).all():
@@ -1911,25 +2073,36 @@ def run_head_coarse_approach_in_process(*, gdk, controller: G2Controller, tf, ar
         gripper_pitch_deg=args.head_gripper_pitch_deg,
         gripper_roll_deg=args.head_gripper_roll_deg,
     )
-    head_camera = gdk.Camera([gdk.CameraType.kHeadColor, gdk.CameraType.kHeadDepth])
-    head_model = None
+    owns_head_camera = head_camera is None
+    owns_head_model = head_model is None
+    head_camera = head_camera if head_camera is not None else gdk.Camera(
+        [gdk.CameraType.kHeadColor, gdk.CameraType.kHeadDepth]
+    )
     head_preview_stop: threading.Event | None = None
     head_preview_thread: threading.Thread | None = None
     head_coarse_context: dict | None = None
     preview_transferred = False
     try:
-        head_model = load_yolo_segmentation_model(head_model_path, device=args.yolo_device)
+        if head_model is None:
+            head_model = load_yolo_segmentation_model(head_model_path, device=args.yolo_device)
         depth_to_color = transform_to_dict(tf.get_tf_from_sensor(gdk.SensorExtrinsicType.kHeadDepthToHeadColor))
         head_from_color = transform_to_dict(tf.get_tf_from_sensor(gdk.SensorExtrinsicType.kHeadRGBDToHeadLink3))
         color_intrinsic = depth_intrinsic = None
         observations: list[np.ndarray] = []
+        hole_observations: list[np.ndarray] = []
         tf_modes: list[str] = []
         tf_gaps_ms: list[float] = []
         last_timestamp = None
         # Keep collecting until the requested number of valid samples is
         # available.  A temporary occlusion or a slow head-camera stream must
         # not abort the whole workflow after an arbitrary wall-clock timeout.
-        while len(observations) < args.head_samples:
+        # The hole (class 1) is sampled independently of the hinge and only
+        # until its own deadline, so a frame without a visible hole can never
+        # stall the hinge localization.
+        hole_deadline = time.monotonic() + float(args.hole_sample_timeout_s)
+        while len(observations) < args.head_samples or (
+            len(hole_observations) < args.head_samples and time.monotonic() < hole_deadline
+        ):
             color = head_camera.get_latest_image(gdk.CameraType.kHeadColor, 1000.0)
             timestamp_ns = int(color.timestamp_ns)
             if timestamp_ns == last_timestamp:
@@ -1955,10 +2128,9 @@ def run_head_coarse_approach_in_process(*, gdk, controller: G2Controller, tf, ar
                 head_model, bgr, confidence=args.head_yolo_confidence, imgsz=640, device=args.yolo_device,
             )
             selected = select_leftmost_hinge(masks, scores, classes)
+            selected_hole = select_highest_confidence_class(masks, scores, classes, 1)
             if shared is not None:
-                overlay = draw_head_coarse_overlay(
-                    bgr, masks, scores, classes, selected, len(observations), args.head_samples,
-                )
+                overlay = draw_head_targets_overlay(bgr, masks, scores, classes)
                 ok, encoded = cv2.imencode(".jpg", overlay, [cv2.IMWRITE_JPEG_QUALITY, 82])
                 if ok:
                     shared.update(encoded.tobytes(), {
@@ -1966,21 +2138,32 @@ def run_head_coarse_approach_in_process(*, gdk, controller: G2Controller, tf, ar
                         "source": "head_yolo",
                         "sequence": int(time.monotonic_ns()),
                         "selected_mask_index": selected,
+                        "selected_hole_mask_index": selected_hole,
                         "collected_samples": len(observations),
+                        "collected_hole_samples": len(hole_observations),
                         "required_samples": args.head_samples,
-                        "safety": "头部 RGB-D 正在定位最左铰链；尚未发送左手靠近目标。",
+                        "safety": "头部 RGB-D 正在定位最左铰链与 hole；尚未发送左手靠近目标。",
                     })
-            if selected is None:
+            if selected is None and selected_hole is None:
                 continue
-            _inliers, points = depth_points(masks[selected], aligned, DEPTH_SCALE_M, color_intrinsic)
-            if len(points) < 20:
-                continue
-            point_color = np.median(points, axis=0)
-            observations.append(np.asarray(apply_transform(
-                base_from_head, apply_transform(head_from_color, point_color),
-            ), dtype=float))
-            tf_modes.append(tf_mode)
-            tf_gaps_ms.append(tf_gap_ms)
+            if selected is not None and len(observations) < args.head_samples:
+                _inliers, points = depth_points(masks[selected], aligned, DEPTH_SCALE_M, color_intrinsic)
+                if len(points) >= 20:
+                    point_color = np.median(points, axis=0)
+                    observations.append(np.asarray(apply_transform(
+                        base_from_head, apply_transform(head_from_color, point_color),
+                    ), dtype=float))
+                    tf_modes.append(tf_mode)
+                    tf_gaps_ms.append(tf_gap_ms)
+            if selected_hole is not None and len(hole_observations) < args.head_samples:
+                _hole_inliers, hole_points = depth_points(
+                    masks[selected_hole], aligned, DEPTH_SCALE_M, color_intrinsic,
+                )
+                if len(hole_points) >= 20:
+                    hole_color = np.median(hole_points, axis=0)
+                    hole_observations.append(np.asarray(apply_transform(
+                        base_from_head, apply_transform(head_from_color, hole_color),
+                    ), dtype=float))
         hinge_base, inlier_mask, spread_m = dominant_sample_cluster(
             np.asarray(observations), args.head_max_sample_spread_mm / 1000.0,
         )
@@ -2000,6 +2183,29 @@ def run_head_coarse_approach_in_process(*, gdk, controller: G2Controller, tf, ar
             "max_tf_fallback_gap_ms": round(max(gap for gap, keep in zip(tf_gaps_ms, inlier_mask) if keep), 3),
             "hinge_position_base_link_m": [float(value) for value in hinge_base],
         }
+        hole_base = None
+        if len(hole_observations) >= args.head_min_inlier_samples:
+            try:
+                candidate, hole_inliers, hole_spread_m = dominant_sample_cluster(
+                    np.asarray(hole_observations), args.head_max_sample_spread_mm / 1000.0,
+                )
+                hole_inlier_count = int(np.count_nonzero(hole_inliers))
+                if hole_inlier_count >= args.head_min_inlier_samples:
+                    hole_base = candidate
+                    localization.update({
+                        "hole_samples": len(hole_observations),
+                        "hole_inlier_samples": hole_inlier_count,
+                        "hole_sample_spread_mm": round(hole_spread_m * 1000.0, 2),
+                        "hole_position_base_link_m": [float(value) for value in candidate],
+                    })
+            except ValueError:
+                hole_base = None
+        if hole_base is None:
+            localization.update({
+                "hole_samples": len(hole_observations),
+                "hole_inlier_samples": 0,
+                "hole_position_base_link_m": None,
+            })
         print(json.dumps(localization, ensure_ascii=False), flush=True)
         json_record(log, localization)
 
@@ -2011,6 +2217,7 @@ def run_head_coarse_approach_in_process(*, gdk, controller: G2Controller, tf, ar
             head_preview_stop, head_preview_thread = start_head_camera_web_preview(
                 gdk=gdk, head_model_path=head_model_path, args=args, shared=shared,
                 camera=head_camera, model=head_model,
+                owns_camera=owns_head_camera, owns_model=owns_head_model,
             )
             head_camera = None
             head_model = None
@@ -2071,36 +2278,160 @@ def run_head_coarse_approach_in_process(*, gdk, controller: G2Controller, tf, ar
         preview_transferred = True
         return head_preview_stop, head_preview_thread, {
             "hinge_position_base_link_m": [float(value) for value in hinge_base],
+            "hole_position_base_link_m": None if hole_base is None else [float(value) for value in hole_base],
             "target_end_link_base_m": [float(value) for value in target.position_m],
             "actual_end_link_base_m": [float(value) for value in actual.position_m],
         }
     finally:
         if not preview_transferred and head_preview_stop is not None:
             stop_head_camera_web_preview(head_preview_stop, head_preview_thread)
-        if head_camera is not None:
+        if owns_head_camera and head_camera is not None:
             try:
                 head_camera.close_camera()
             except Exception:
                 pass
-        if head_model is not None:
+        if owns_head_model and head_model is not None:
             del head_model
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
 
 
+def hole_target_from_context(head_coarse_context) -> list[float] | None:
+    """Return the head-localized hole, or ``None`` when it was not detected.
+
+    A missing hole is a downgrade, not a failure: the flow still grasps and
+    lifts, then holds at the lifted pose and waits for the operator instead of
+    moving above the hole.
+    """
+    hole = None if head_coarse_context is None else head_coarse_context.get("hole_position_base_link_m")
+    if hole is None:
+        return None
+    return [float(value) for value in hole]
+
+
+def hole_finalize_plan(hole_base_m) -> tuple[str, str]:
+    """Decide how the left stage ends after the held-part gate.
+
+    The only difference between a localized hole and a missing one is the final
+    move: everything before it (grasp, 150 mm lift, same-target verification,
+    both SpaceMouse gates) runs identically.
+    """
+    if hole_base_m is None:
+        return "skip_hole_move", "left_stage_complete_without_hole_move"
+    return "move_to_hole", "left_stage_complete_above_hole"
+
+
+def move_left_above_hole(*, controller: G2Controller, hole_base_m, args, log, link: str = LEFT_VISUAL_TIP_LINK) -> dict:
+    """Move the left end-link above the head-localized hole with a fixed pose.
+
+    The grasped part stays closed in the gripper; only the end-link pose is
+    commanded, so this is a single streamed Cartesian move with measured
+    arrival and a horizontal error check against the hole target.
+    """
+    try:
+        tcp_end_m = np.asarray([float(value) for value in args.step_tcp_end_mm.split(",")], dtype=float) / 1000.0
+        if tcp_end_m.shape != (3,) or not np.isfinite(tcp_end_m).all():
+            raise ValueError
+    except ValueError as exc:
+        raise SafetyError("--step-tcp-end-mm 必须是三个有限数值") from exc
+    hole_target = np.asarray(hole_base_m, dtype=float)
+    if hole_target.shape != (3,) or not np.isfinite(hole_target).all():
+        raise SafetyError(f"hole 目标三维坐标无效：{hole_base_m}")
+    speed_mm_s = float(args.hole_speed_mm_s)
+    if not (math.isfinite(speed_mm_s) and 0.0 < speed_mm_s <= 50.0):
+        raise SafetyError("--hole-speed-mm-s 必须在 (0, 50] mm/s")
+    if not (math.isfinite(args.hole_above_mm) and 0.0 < args.hole_above_mm <= 500.0):
+        raise SafetyError("--hole-above-mm 必须在 (0, 500] mm")
+
+    orientation = fixed_forward_down_orientation(
+        forward_yaw_deg=args.hole_forward_yaw_deg,
+        gripper_pitch_deg=args.hole_gripper_pitch_deg,
+        gripper_roll_deg=args.hole_gripper_roll_deg,
+    )
+    target = gripper_end_target(hole_target, orientation, tcp_end_m, args.hole_above_mm / 1000.0)
+    current = controller.read_end_effector_pose(link)
+    travel_mm = float(np.linalg.norm(np.asarray(target.position_m) - np.asarray(current.position_m)) * 1000.0)
+    max_travel_mm = float(getattr(args, "max_travel_mm", 450.0))
+    if not (math.isfinite(max_travel_mm) and 0.0 < max_travel_mm <= 800.0):
+        raise SafetyError("--max-travel-mm 必须在 (0, 800] mm")
+    if travel_mm > max_travel_mm:
+        raise SafetyError(
+            f"当前末端到 hole 上方目标直线距离 {travel_mm:.1f} mm，超过 --max-travel-mm={max_travel_mm:.1f}"
+        )
+    start = {
+        "event": "left_above_hole_motion_start", "travel_mm": round(travel_mm, 2),
+        "hole_position_base_link_m": [float(value) for value in hole_target],
+        "target_end_link_base_m": [float(value) for value in target.position_m],
+        "orientation_xyzw": [float(value) for value in target.orientation_xyzw],
+        "forward_yaw_deg": args.hole_forward_yaw_deg,
+        "gripper_pitch_deg": args.hole_gripper_pitch_deg,
+        "gripper_roll_deg": args.hole_gripper_roll_deg,
+        "above_mm": args.hole_above_mm,
+    }
+    print(json.dumps(start, ensure_ascii=False), flush=True)
+    json_record(log, start)
+    hole_rotation_deg_s = float(getattr(args, "hole_rotation_deg_s", 20.0))
+    if not (math.isfinite(hole_rotation_deg_s) and 0.0 < hole_rotation_deg_s <= 28.6):
+        raise SafetyError("--hole-rotation-deg-s 必须在 (0, 28.6] deg/s")
+    stream = controller.start_left_end_effector_position_stream(
+        current, rate_hz=50.0, life_time_s=0.10,
+        max_translation_velocity_mps=speed_mm_s / 1000.0,
+        allow_orientation_change=True,
+        max_angular_velocity_rad_s=math.radians(hole_rotation_deg_s),
+    )
+    try:
+        stream.update_target(target)
+        if not stream.wait_until_target(travel_mm / speed_mm_s + 5.0):
+            raise SafetyError("左手到 hole 上方的位姿流未在限定时间内发送到目标")
+        actual = wait_actual_left_target(
+            controller, stream, target,
+            timeout_s=max(5.0, travel_mm / speed_mm_s + 3.0),
+            tolerance_m=0.005,
+            orientation_tolerance_deg=2.0,
+        )
+    finally:
+        stream.stop()
+    actual_center = gripper_end_target(
+        np.asarray(actual.position_m), actual.orientation_xyzw, -tcp_end_m, 0.0,
+    ).position_m
+    xy_error_mm = float(np.linalg.norm(np.asarray(actual_center[:2]) - hole_target[:2]) * 1000.0)
+    if xy_error_mm > float(args.head_xy_tolerance_mm):
+        raise SafetyError(
+            f"夹持中心与 hole 目标水平误差 {xy_error_mm:.1f} mm，"
+            f"超过 {args.head_xy_tolerance_mm:.1f} mm"
+        )
+    arrived = {
+        "event": "left_above_hole_arrived", "travel_mm": round(travel_mm, 2),
+        "grasp_center_xy_error_mm": round(xy_error_mm, 2),
+        "actual_end_link_base_m": [float(value) for value in actual.position_m],
+    }
+    print(json.dumps(arrived, ensure_ascii=False), flush=True)
+    json_record(log, arrived)
+    return arrived
+
+
 def start_head_camera_web_preview(*, gdk, head_model_path: Path, args,
-                                  shared: SharedView | None, camera=None, model=None):
+                                  shared: SharedView | None, camera=None, model=None,
+                                  owns_camera: bool = True, owns_model: bool = True):
     """Keep the head RGB/YOLO view updating during coarse approach.
 
     Head preview is read-only: it never queries robot state or sends a
     command.  It uses the same initialized GDK session as the grasp process;
     the caller stops it before the left D405 perception stage begins.
+
+    ``owns_camera``/``owns_model`` say whether this preview may close/delete the
+    objects handed to it.  A single-process orchestrator injects a camera it
+    still owns, so the preview must not release it: closing the same native
+    camera twice aborts the interpreter inside the GDK binding.
     """
     if shared is None:
         return None, None
     stop = threading.Event()
     provided_camera = camera
     provided_model = model
+    # A camera this function creates itself is always its own to close.
+    closes_camera = provided_camera is None or bool(owns_camera)
+    drops_model = provided_model is None or bool(owns_model)
 
     def run() -> None:
         camera = provided_camera
@@ -2165,12 +2496,13 @@ def start_head_camera_web_preview(*, gdk, head_model_path: Path, args,
                 "error": str(exc),
             })
         finally:
-            if camera is not None:
+            if closes_camera and camera is not None:
                 try:
                     camera.close_camera()
                 except Exception:
                     pass
-            del model
+            if drops_model:
+                del model
 
     worker = threading.Thread(target=run, name="head-camera-web-preview", daemon=True)
     worker.start()
@@ -2186,8 +2518,19 @@ def stop_head_camera_web_preview(stop: threading.Event | None,
         worker.join(timeout=2.0)
 
 
-def main() -> int:
-    args = parse_args()
+def main(argv=None) -> int:
+    """Standalone CLI: this process owns its own GDK session and SpaceMouse worker."""
+    return run_left_cycle(services=None, argv=argv)
+
+
+def run_left_cycle(*, services=None, argv=None) -> int:
+    """Run the left-hand coarse-approach and visual grasp in this process.
+
+    ``services`` carries the orchestrator's GDK session, controller, gate,
+    SpaceMouse worker, cameras and preloaded models.  With ``services=None`` the
+    stage creates and owns all of them, which keeps the original CLI intact.
+    """
+    args = parse_args(argv)
     if not (
         0 <= args.threshold <= 1
         and 0 <= args.yolo_confidence <= 1
@@ -2233,6 +2576,11 @@ def main() -> int:
         and 0.02 <= args.post_grasp_verify_area_change_fraction <= 0.50
         and 0.002 <= args.post_grasp_verify_depth_change_m <= 0.050
         and 0.50 <= args.post_grasp_monitor_max_stale_s <= 5.0
+        and 0.0 <= args.post_grasp_lift_area_grace_s <= 10.0
+        and 0.5 <= args.post_grasp_lift_area_window_s <= 15.0
+        and 0.05 <= args.post_grasp_lift_area_spread <= 5.0
+        and 2 <= args.post_grasp_lift_area_min_samples <= 60
+        and 1 <= args.post_grasp_lift_area_confirmations <= 20
         and 0.10 <= args.post_grasp_target_lost_timeout_s <= 30.0
     ):
         print("参数错误：检测、预热、跟踪参数无效。", file=sys.stderr)
@@ -2391,6 +2739,15 @@ def main() -> int:
 
     initialized = False
     camera = None
+    # Only the head-coarse branch assigns this, but later code (height
+    # reference, hole gate) tests it, so it must exist for the legacy P1/P2
+    # path too.
+    head_coarse_context: dict | None = None
+    hole_target_base: list[float] | None = None
+    # Guarded in ``finally``; objects injected by an orchestrator are reused
+    # and must not be stopped or closed by this stage.
+    owns_camera = True
+    owns_worker = True
     perception: PersistentPerception | None = None
     position_stream: LeftEndEffectorPositionStream | None = None
     initial_gripper_open_stream: LeftEndEffectorPositionStream | None = None
@@ -2406,7 +2763,11 @@ def main() -> int:
     takeover_worker: SpaceMouseTakeoverWorker | None = None
     dianpi_runner: DianpiCycleRunner | None = None
     try:
-        if args.web_port:
+        if services is not None and services.web is not None:
+            # Single-process orchestrator: publish into its shared three-camera
+            # page instead of starting a second HTTP server.
+            web_shared = services.web
+        elif args.web_port:
             web_shared = CompositeSharedView()
             web_server = ThreadingHTTPServer(
                 (args.web_host, args.web_port),
@@ -2415,22 +2776,31 @@ def main() -> int:
             threading.Thread(target=web_server.serve_forever, daemon=True).start()
             model_note = "YOLO 实时分割" if args.detector == "yolo" else "与抓取共用同一 SAM3 模型"
             print(f"内嵌实时页面：http://{args.web_host}:{args.web_port}（头部粗定位阶段双画面；左手阶段仅左手 D405：{model_note}）")
-        if agibot_gdk.gdk_init() != agibot_gdk.GDKRes.kSuccess:
-            raise RuntimeError("GDK 初始化失败")
-        initialized = True
-        robot = agibot_gdk.Robot()
-        time.sleep(1.0)
-        if args.spacemouse_device:
-            motion_gate = MotionPauseGate()
-        controller = G2Controller(
-            agibot_gdk,
-            robot,
-            allow_motion=args.allow_motion,
-            control_period_s=args.control_period_s,
-            motion_gate=motion_gate,
-        )
-        controller.checked_arm_state()
-        if args.spacemouse_device:
+        if services is None:
+            if agibot_gdk.gdk_init() != agibot_gdk.GDKRes.kSuccess:
+                raise RuntimeError("GDK 初始化失败")
+            initialized = True
+            robot = agibot_gdk.Robot()
+            time.sleep(1.0)
+        else:
+            robot = services.robot
+        if services is not None and services.controller is not None:
+            controller = services.controller
+            motion_gate = services.gate
+        else:
+            if args.spacemouse_device:
+                motion_gate = MotionPauseGate()
+            controller = G2Controller(
+                agibot_gdk,
+                robot,
+                allow_motion=args.allow_motion,
+                control_period_s=args.control_period_s,
+                motion_gate=motion_gate,
+            )
+            controller.checked_arm_state()
+        if services is not None:
+            dianpi_runner = services.dianpi_runner
+        if args.spacemouse_device and dianpi_runner is None:
             # Keep the RM1010 P10 monitor alive for the whole integrated
             # process, including the head-camera coarse stage.  The monitor
             # and SpaceMouse chord share this runner/controller.
@@ -2438,7 +2808,7 @@ def main() -> int:
                 event_sink=lambda event: print(json.dumps(event, ensure_ascii=False), flush=True),
             )
             dianpi_runner.start_p10_monitor()
-        if args.full_cycle:
+        if args.full_cycle and not args.skip_workflow_home:
             assert workflow_home_target is not None
             print(json.dumps({
                 "event": "workflow_home_start",
@@ -2478,6 +2848,8 @@ def main() -> int:
                     gdk=agibot_gdk, controller=controller, tf=tf, args=args,
                     head_model_path=head_model_path, log=head_log,
                     shared=None if web_shared is None else web_shared.pane("head"),
+                    head_camera=None if services is None else services.head_camera,
+                    head_model=None if services is None else services.head_yolo,
                 )
             except Exception as exc:
                 print(f"头部铰链定位/左手预移动失败：{exc}", file=sys.stderr)
@@ -2491,9 +2863,15 @@ def main() -> int:
             if head_preview_stop is not None:
                 stop_head_camera_web_preview(head_preview_stop, head_preview_thread)
                 head_preview_stop = head_preview_thread = None
-                if isinstance(web_shared, CompositeSharedView):
+                if hasattr(web_shared, "hide_pane"):
                     web_shared.hide_pane("head")
-        if args.spacemouse_device:
+        # The hole may legitimately be missing: grasp and lift anyway, then hold
+        # and wait for the operator instead of moving above the hole.
+        hole_target_base = hole_target_from_context(head_coarse_context)
+        if services is not None and services.worker is not None:
+            takeover_worker = services.worker
+            owns_worker = False
+        elif args.spacemouse_device:
             takeover_worker = SpaceMouseTakeoverWorker(
                 controller,
                 motion_gate,
@@ -2506,14 +2884,19 @@ def main() -> int:
                 ),
                 allow_advance_right=True,
                 dianpi_runner=dianpi_runner,
+                event_sink=lambda event: print(json.dumps(event, ensure_ascii=False), flush=True),
             )
             takeover_worker.start()
         camera_type = agibot_gdk.CameraType.kHandLeftColor
         depth_type = agibot_gdk.CameraType.kHandLeftDepth
-        camera = agibot_gdk.Camera([camera_type] if args.step_profile is not None else [camera_type, depth_type])
+        owns_camera = services is None or services.left_camera is None
+        camera = (
+            services.left_camera if not owns_camera
+            else agibot_gdk.Camera([camera_type] if args.step_profile is not None else [camera_type, depth_type])
+        )
         processor = None
-        yolo_model = None
-        if args.detector in {"yolo", "yolo-sam"}:
+        yolo_model = services.left_yolo if services is not None and services.left_yolo is not None else None
+        if yolo_model is None and args.detector in {"yolo", "yolo-sam"}:
             print(f"加载 G2 原生 YOLO 主检测器：{yolo_model_path}", flush=True)
             yolo_model = load_yolo_segmentation_model(yolo_model_path, device=args.yolo_device)
         # The left worker remains the sole owner of the hand camera/model.
@@ -2555,6 +2938,9 @@ def main() -> int:
         post_grasp_verify_samples: list[dict] = []
         post_grasp_verified = False
         post_grasp_lift_monitor: dict | None = None
+        # One fresh same-target frame must confirm the part is still held after
+        # the monitored lift before the arm moves toward the hole.
+        post_grasp_hole_monitor: dict | None = None
         post_grasp_p4_sequence: NonBlockingLeftPresetSequence | None = None
         post_grasp_p4_monitor: dict | None = None
         post_grasp_regrasp_open: dict | None = None
@@ -2574,6 +2960,19 @@ def main() -> int:
         perception_sequence = 0
         web_sequence = 0
         with log_path.open("a", encoding="utf-8") as log:
+            if args.move_above_hole and hole_target_base is None:
+                warning = {
+                    "event": "head_hole_missing",
+                    "level": "warning",
+                    "utc": datetime.now(timezone.utc).isoformat(),
+                    "reason": "头部定位没有可用的 class 1 hole 三维目标",
+                    "action": "继续抓取并上抬 150 mm；随后停在原地等待 SpaceMouse 下一阶段指令，不做 hole 移动",
+                }
+                json_record(log, warning)
+                print(
+                    "警告：头部没有识别到 hole；仍会抓取并上抬，然后停在上抬位置等待下一阶段指令。",
+                    flush=True,
+                )
             json_record(log, {
                 "event": "start",
                 "utc": datetime.now(timezone.utc).isoformat(),
@@ -2887,6 +3286,65 @@ def main() -> int:
                             max_area_change_fraction=args.post_grasp_verify_area_change_fraction,
                             check_geometry=False,
                         )
+                        # A tracked mask is not proof of a held part.  Feed the
+                        # closed-gripper lift with the observed mask areas and
+                        # veto transport as soon as the area keeps changing
+                        # instead of settling (empty grasp / part sliding out).
+                        if (
+                            monitor["failure"] is None
+                            and observation.get("valid") is True
+                            and isinstance(observation.get("area_px"), (int, float))
+                            and observed_at - monitor["lift_started_at"]
+                            >= args.post_grasp_lift_area_grace_s
+                        ):
+                            monitor["area_samples"].append(
+                                (observed_at, float(observation["area_px"]))
+                            )
+                            history_limit_s = max(
+                                args.post_grasp_lift_area_window_s,
+                                args.post_grasp_lift_area_grace_s,
+                            )
+                            monitor["area_samples"][:] = [
+                                sample for sample in monitor["area_samples"]
+                                if observed_at - sample[0] <= history_limit_s
+                            ]
+                            instability = held_part_area_instability(
+                                monitor["area_samples"],
+                                now=observed_at,
+                                window_s=args.post_grasp_lift_area_window_s,
+                                max_spread=args.post_grasp_lift_area_spread,
+                                min_samples=args.post_grasp_lift_area_min_samples,
+                            )
+                            if instability is not None:
+                                monitor["max_area_spread_fraction"] = max(
+                                    monitor["max_area_spread_fraction"],
+                                    instability["spread_fraction"],
+                                )
+                                monitor["area_instability"] = instability
+                                # "仍在变化" must persist: a single jittery
+                                # window is not enough.  Require consecutive
+                                # unstable windows before dropping the part.
+                                monitor["area_unstable_streak"] = (
+                                    monitor["area_unstable_streak"] + 1
+                                    if instability["unstable"]
+                                    else 0
+                                )
+                                if (
+                                    instability["unstable"]
+                                    and monitor["area_unstable_streak"]
+                                    >= args.post_grasp_lift_area_confirmations
+                                ):
+                                    monitor["failure"] = instability
+                                    json_record(log, {
+                                        "event": "post_grasp_lift_area_unstable",
+                                        "utc": datetime.now(timezone.utc).isoformat(),
+                                        "reason": instability["reason"],
+                                        "area": instability,
+                                        "unstable_streak": monitor["area_unstable_streak"],
+                                        "confirmations": args.post_grasp_lift_area_confirmations,
+                                        "action": "cancel_lift_open_gripper_and_regrasp",
+                                        "nonblocking": True,
+                                    })
                         stale_since = monitor.get("stale_since")
                         if stale_since is not None and monitor.get("failure") is None:
                             was_paused = bool(monitor.get("paused"))
@@ -2933,9 +3391,13 @@ def main() -> int:
                         and float(np.linalg.norm(delta[:2])) <= PRE_P4_LIFT_TOLERANCE_M
                     )
                     if monitor.get("failure") is not None:
-                        # The mailbox has confirmed target loss after the
-                        # configured timeout. Hold immediately; the existing
-                        # recovery path then opens and restarts acquisition.
+                        # Either the mailbox confirmed target loss after the
+                        # configured timeout, or the trailing mask-area history
+                        # showed that the closed gripper never actually held the
+                        # part.  Hold immediately; the existing recovery path
+                        # then opens and restarts acquisition.
+                        failure = monitor["failure"]
+                        area_unstable = failure.get("reason") == HELD_PART_AREA_UNSTABLE_REASON
                         position_stream.update_target(CartesianPoseTarget(
                             actual.position_m, last_end_link_target.orientation_xyzw,
                         ))
@@ -2944,8 +3406,13 @@ def main() -> int:
                         assert gripper_open is not None and gripper_tolerance is not None and gripper_close_timeout is not None
                         post_grasp_regrasp_open_stream = controller.start_left_gripper_position_stream(gripper_open)
                         post_grasp_regrasp_open = {
-                            "reason": "held_target_lost_after_timeout_during_pre_p4_lift",
-                            "monitor": monitor["failure"],
+                            "reason": (
+                                "held_target_area_unstable_during_pre_p4_lift"
+                                if area_unstable
+                                else "held_target_lost_after_timeout_during_pre_p4_lift"
+                            ),
+                            "monitor": failure,
+                            "area_monitor": monitor.get("area_instability"),
                             "orientation_xyzw": last_end_link_target.orientation_xyzw,
                             "deadline": time.monotonic() + gripper_close_timeout,
                             "next_command_at": time.monotonic() + 0.10,
@@ -2954,7 +3421,9 @@ def main() -> int:
                         json_record(log, {
                             "event": "post_grasp_lift_monitor_regrasp_started",
                             "utc": datetime.now(timezone.utc).isoformat(),
-                            "monitor": monitor["failure"],
+                            "monitor": failure,
+                            "area_unstable": area_unstable,
+                            "area_monitor": monitor.get("area_instability"),
                             "nonblocking": True,
                         })
                         post_grasp_lift_monitor = None
@@ -2972,9 +3441,56 @@ def main() -> int:
                             "utc": datetime.now(timezone.utc).isoformat(),
                             "actual_delta_base_m": [float(value) for value in delta],
                             "same_target_monitor_samples": monitor["mailbox_sequence"],
+                            "area_monitor": monitor.get("area_instability"),
+                            "area_monitor_samples": len(monitor["area_samples"]),
+                            "area_monitor_max_spread_fraction": monitor["max_area_spread_fraction"],
+                            "area_monitor_grace_s": args.post_grasp_lift_area_grace_s,
+                            "area_monitor_window_s": args.post_grasp_lift_area_window_s,
+                            "area_monitor_max_spread": args.post_grasp_lift_area_spread,
                             "nonblocking": True,
                         })
                         post_grasp_lift_monitor = None
+                        if args.move_above_hole:
+                            hole_base = hole_target_base
+                            # Identical flow either way: the same held-part gate
+                            # below must still confirm the part is held.  Only
+                            # the final move differs when no hole was localized.
+                            # Do not start the hole move straight from the lift
+                            # arrival.  The P3/P4 path required one fresh
+                            # same-target frame here, which closes the race
+                            # where the part drops exactly as the lift ends;
+                            # the hole move must keep that gate.
+                            post_grasp_hole_monitor = {
+                                "mailbox": monitor["mailbox"],
+                                "mailbox_sequence": monitor["mailbox_sequence"],
+                                "reference_center_px": monitor["reference_center_px"],
+                                "reference_area_px": monitor["reference_area_px"],
+                                "last_observation_at": time.monotonic(),
+                                "stale_since": None,
+                                "stale_logged": False,
+                                "paused": False,
+                                "failure": None,
+                                "awaiting_fresh_observation": True,
+                                "hole_base_m": None if hole_base is None else [float(value) for value in hole_base],
+                                "deadline": time.monotonic() + max(
+                                    10.0,
+                                    3.0 * float(args.post_grasp_target_lost_timeout_s) + 5.0,
+                                ),
+                            }
+                            perception.set_phase(
+                                "post_grasp_hole",
+                                "同目标确认仍然夹持后才结束本阶段（有 hole 时再移动到 hole 上方）",
+                            )
+                            json_record(log, {
+                                "event": "post_grasp_hole_gate_wait",
+                                "utc": datetime.now(timezone.utc).isoformat(),
+                                "reason": "require_one_fresh_same_target_frame_after_lift",
+                                "hole_position_base_link_m": [float(value) for value in hole_base],
+                                "target_lost_timeout_s": args.post_grasp_target_lost_timeout_s,
+                                "action": "hold_position_keep_gripper_closed",
+                                "nonblocking": True,
+                            })
+                            continue
                         assert post_grasp_presets is not None
                         post_grasp_p4_sequence = NonBlockingLeftPresetSequence(
                             post_grasp_presets, motion_preset_velocity_rad_s,
@@ -3009,6 +3525,105 @@ def main() -> int:
                     # This branch is intentionally non-blocking, but a tight
                     # GDK polling loop can starve the perception worker under
                     # CPython's GIL.  Yield briefly so YOLO keeps publishing.
+                    time.sleep(0.01)
+                    continue
+                if post_grasp_hole_monitor is not None:
+                    monitor = post_grasp_hole_monitor
+                    observation = monitor["mailbox"].newer_than(monitor["mailbox_sequence"])
+                    if observation is not None:
+                        monitor["mailbox_sequence"] = int(observation["sequence"])
+                    now = time.monotonic()
+                    gate = held_part_gate_step(
+                        monitor,
+                        observation,
+                        now=now,
+                        max_stale_s=args.post_grasp_monitor_max_stale_s,
+                        center_drift_px=args.post_grasp_verify_center_drift_px,
+                        area_change_fraction=args.post_grasp_verify_area_change_fraction,
+                    )
+                    if gate == "stale":
+                        # Stale perception is an unknown state, never proof of a
+                        # dropped part.  Hold position, keep the gripper closed,
+                        # and wait for a fresh frame instead of moving blind.
+                        json_record(log, {
+                            "event": "post_grasp_hole_monitor_stale_hold",
+                            "utc": datetime.now(timezone.utc).isoformat(),
+                            "reason": "perception_stale_unknown_not_confirmed_lost",
+                            "stale_age_s": round(now - monitor["last_observation_at"], 3),
+                            "max_stale_s": args.post_grasp_monitor_max_stale_s,
+                            "action": "hold_before_hole_move_and_keep_gripper_closed",
+                            "nonblocking": True,
+                        })
+                    if gate == "lost":
+                        # Confirmed loss right after the lift: open and reacquire
+                        # through the same generic recovery path P4 uses.  The
+                        # hole move has not started, so this is safe.
+                        stop_force_descent_sam_preview(force_preview_stop, force_preview_thread)
+                        force_preview_stop = force_preview_thread = None
+                        force_preview_phase = None
+                        assert gripper_open is not None and gripper_close_timeout is not None
+                        post_grasp_regrasp_open_stream = controller.start_left_gripper_position_stream(gripper_open)
+                        post_grasp_regrasp_open = {
+                            "reason": "held_target_lost_after_timeout_before_hole_move",
+                            "monitor": monitor["failure"],
+                            "orientation_xyzw": last_end_link_target.orientation_xyzw,
+                            "deadline": time.monotonic() + gripper_close_timeout,
+                            "next_command_at": time.monotonic() + 0.10,
+                            "attempts": 1,
+                        }
+                        json_record(log, {
+                            "event": "post_grasp_hole_monitor_regrasp_started",
+                            "utc": datetime.now(timezone.utc).isoformat(),
+                            "monitor": monitor["failure"],
+                            "nonblocking": True,
+                        })
+                        post_grasp_hole_monitor = None
+                        continue
+                    if gate == "proceed":
+                        hole_base = monitor["hole_base_m"]
+                        action, complete_event = hole_finalize_plan(hole_base)
+                        json_record(log, {
+                            "event": "post_grasp_hole_verified",
+                            "utc": datetime.now(timezone.utc).isoformat(),
+                            "reason": "fresh_same_target_frame_confirms_the_part_is_still_held",
+                            "mailbox_sequence": monitor["mailbox_sequence"],
+                            "next_action": action,
+                            "hole_position_base_link_m": (
+                                None if hole_base is None else [float(value) for value in hole_base]
+                            ),
+                            "nonblocking": True,
+                        })
+                        post_grasp_hole_monitor = None
+                        if action == "skip_hole_move":
+                            json_record(log, {
+                                "event": complete_event,
+                                "utc": datetime.now(timezone.utc).isoformat(),
+                                "reason": "head_hole_missing",
+                                "note": "除不移动到 hole 上方外，后续流程与识别到 hole 时完全一致",
+                                "gripper": "preserved_closed",
+                                "nonblocking": True,
+                            })
+                            print(
+                                "未识别到 hole：跳过 hole 上方移动，本阶段结束（其余流程与正常一致）。",
+                                flush=True,
+                            )
+                            return 0
+                        move_left_above_hole(
+                            controller=controller, hole_base_m=hole_base, args=args, log=log,
+                        )
+                        done = {
+                            "event": complete_event,
+                            "utc": datetime.now(timezone.utc).isoformat(),
+                            "hole_position_base_link_m": [float(value) for value in hole_base],
+                        }
+                        json_record(log, done)
+                        print("左手已到 hole 上方；本阶段完成。", flush=True)
+                        return 0
+                    if now >= monitor["deadline"]:
+                        raise SafetyError(
+                            "抓取并上抬后一直拿不到新的同目标观测；无法确认仍然夹持，"
+                            "拒绝盲目移动到 hole 上方"
+                        )
                     time.sleep(0.01)
                     continue
                 if post_grasp_p4_sequence is not None:
@@ -4441,6 +5056,17 @@ def main() -> int:
                                     "pre_p4_lift_m": PRE_P4_LIFT_M,
                                     "monitor_center_drift_px": args.post_grasp_verify_center_drift_px,
                                     "monitor_area_change_fraction": args.post_grasp_verify_area_change_fraction,
+                                    "monitor_area_grace_s": args.post_grasp_lift_area_grace_s,
+                                    "monitor_area_window_s": args.post_grasp_lift_area_window_s,
+                                    "monitor_area_max_spread": args.post_grasp_lift_area_spread,
+                                    "monitor_area_min_samples": args.post_grasp_lift_area_min_samples,
+                                    "monitor_area_confirmations": args.post_grasp_lift_area_confirmations,
+                                    # Diagnostics for the next hardware run: a
+                                    # close travel near the full stroke means
+                                    # the jaws met nothing, which is the empty
+                                    # grasp the area monitor then has to catch.
+                                    "gripper_close_travel_rad": record.get("adaptive_gripper_close_travel_rad"),
+                                    "gripper_stall": record.get("adaptive_gripper_stall"),
                                     "target_lost_timeout_s": args.post_grasp_target_lost_timeout_s,
                                     "presets": [name for name, _ in post_grasp_presets],
                                 })
@@ -4458,6 +5084,16 @@ def main() -> int:
                                     "stale_since": None,
                                     "stale_logged": False,
                                     "paused": False,
+                                    # Empty-grasp detection: a closed gripper can
+                                    # still track a hinge that was never inside
+                                    # the jaws, so keep the trailing mask-area
+                                    # history of the lift and fail the hold when
+                                    # it keeps changing instead of settling.
+                                    "lift_started_at": time.monotonic(),
+                                    "area_samples": [],
+                                    "max_area_spread_fraction": 0.0,
+                                    "area_instability": None,
+                                    "area_unstable_streak": 0,
                                     "deadline": time.monotonic() + PRE_P4_LIFT_M / parameters.final_descent_speed_mps + 1.0,
                                 }
                                 # The next main-loop ticks poll this target;
@@ -4516,9 +5152,9 @@ def main() -> int:
         print(f"左手 G2 抓取流程失败：{exc}", file=sys.stderr)
         return 1
     finally:
-        if takeover_worker is not None:
+        if owns_worker and takeover_worker is not None:
             takeover_worker.stop()
-        if dianpi_runner is not None:
+        if owns_worker and dianpi_runner is not None:
             dianpi_runner.close()
         stop_head_camera_web_preview(head_preview_stop, head_preview_thread)
         stop_force_descent_sam_preview(force_preview_stop, force_preview_thread)
@@ -4533,7 +5169,7 @@ def main() -> int:
         if web_server is not None:
             web_server.shutdown()
             web_server.server_close()
-        if camera is not None:
+        if owns_camera and camera is not None:
             try:
                 camera.close_camera()
             except Exception:
