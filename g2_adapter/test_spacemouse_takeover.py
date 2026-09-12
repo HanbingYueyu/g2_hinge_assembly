@@ -73,6 +73,51 @@ class GestureTests(unittest.TestCase):
         result = state.update(frame(1.02), 1.02)
         self.assertFalse(result.activity)
 
+    def test_dual_button_chord_emits_once_after_neutral_hold(self):
+        state = SpaceMouseGestureState()
+        state.update(frame(0.00, buttons=(True, False), pressed=(0,)), 0.00)
+        state.update(frame(0.10, buttons=(True, True), pressed=(1,)), 0.10)
+        result = state.update(frame(0.41, buttons=(True, True)), 0.41)
+        self.assertEqual(result.events, (TakeoverEvent.START_DIANPI,))
+        self.assertEqual(result.consumed_buttons, (0, 1))
+        result = state.update(frame(0.50, buttons=(True, True)), 0.50)
+        self.assertEqual(result.events, ())
+        state.update(frame(0.60, buttons=(False, False)), 0.60)
+
+    def test_dual_button_chord_suppresses_all_single_button_gestures(self):
+        state = SpaceMouseGestureState()
+        state.update(frame(1.00, buttons=(True, True), pressed=(0, 1)), 1.00)
+        result = state.update(frame(3.00, buttons=(True, True)), 3.00)
+        self.assertEqual(result.events, (TakeoverEvent.START_DIANPI,))
+        self.assertNotIn(TakeoverEvent.ADVANCE_RIGHT, result.events)
+        state.update(frame(3.10, buttons=(False, False)), 3.10)
+        result = state.update(frame(3.20, pressed=(1,)), 3.20)
+        self.assertEqual(result.events, ())
+
+    def test_dual_button_chord_requires_press_window_hold_and_neutral_axes(self):
+        state = SpaceMouseGestureState()
+        state.update(frame(0.00, buttons=(True, False), pressed=(0,)), 0.00)
+        state.update(frame(0.20, buttons=(True, True), pressed=(1,)), 0.20)
+        result = state.update(frame(0.60, buttons=(True, True)), 0.60)
+        self.assertEqual(result.events, ())
+        state.update(frame(0.70, buttons=(False, False)), 0.70)
+
+        state.update(
+            frame(1.00, buttons=(True, True), axes=(0.5, 0, 0, 0, 0, 0), pressed=(0, 1)),
+            1.00,
+        )
+        self.assertEqual(
+            state.update(
+                frame(1.31, buttons=(True, True), axes=(0.5, 0, 0, 0, 0, 0)),
+                1.31,
+            ).events,
+            (),
+        )
+        self.assertEqual(
+            state.update(frame(1.32, buttons=(True, True)), 1.32).events,
+            (TakeoverEvent.START_DIANPI,),
+        )
+
 
 class MotionPauseGateTests(unittest.TestCase):
     def test_pause_waits_for_an_inflight_automatic_write_before_manual_access(self):

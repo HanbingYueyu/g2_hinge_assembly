@@ -26,6 +26,10 @@ except ImportError:
 DOUBLE_CLICK_WINDOW_S = 0.55
 LONG_PRESS_S = 0.40
 RIGHT_LONG_PRESS_S = 2.0
+# The dual-button chord is deliberately shorter than a right-button stage
+# advance and is recognized before any single-button gesture is evaluated.
+DIANPI_CHORD_WINDOW_S = 0.15
+DIANPI_CHORD_HOLD_S = 0.30
 # Kept as a compatibility constant for callers that imported the old policy;
 # takeover release is now explicit (double-click the active hand) and never
 # occurs solely because the SpaceMouse is idle.
@@ -37,6 +41,7 @@ class TakeoverEvent(str, Enum):
     TAKEOVER_LEFT = "takeover_left"
     TAKEOVER_RIGHT = "takeover_right"
     ADVANCE_RIGHT = "advance_right"
+    START_DIANPI = "start_dianpi"
     TIMEOUT = "timeout"
 
 
@@ -58,6 +63,10 @@ class SpaceMouseGestureState:
         self._down_since: list[float | None] = [None, None]
         self._long = [False, False]
         self._pending_click: list[float | None] = [None, None]
+        self._chord_blocked = False
+        self._chord_valid = False
+        self._chord_since: float | None = None
+        self._chord_triggered = False
 
     def _short_release(self, button: int, now: float) -> tuple[TakeoverEvent | None, bool]:
         down_since = self._down_since[button]
@@ -106,6 +115,59 @@ class SpaceMouseGestureState:
         for button, pending in enumerate(self._pending_click):
             if pending is not None and now - pending > DOUBLE_CLICK_WINDOW_S:
                 self._pending_click[button] = None
+
+        # The overlap itself is a conflict boundary.  Once both buttons are
+        # down, never let a partially completed single-button gesture leak
+        # through, even when the second press arrived too late for a valid
+        # Dianpi chord.  The state is held until both buttons are released.
+        both_down = bool(frame.buttons[0]) and bool(frame.buttons[1])
+        if both_down and not self._chord_blocked:
+            starts = [
+                self._down_since[index] if self._was_down[index] else now
+                for index in (0, 1)
+            ]
+            self._chord_since = max(starts)
+            self._chord_valid = abs(starts[0] - starts[1]) <= DIANPI_CHORD_WINDOW_S
+            self._chord_triggered = False
+            self._chord_blocked = True
+            self._pending_click = [None, None]
+            self._long = [False, False]
+        if self._chord_blocked:
+            consumed.update((0, 1))
+            if not both_down:
+                # Suppress the release edge too, then re-arm only after both
+                # buttons are fully up.  No pending click survives a chord.
+                if not frame.buttons[0] and not frame.buttons[1]:
+                    self._chord_blocked = False
+                    self._chord_valid = False
+                    self._chord_since = None
+                    self._chord_triggered = False
+                    self._was_down = [False, False]
+                    self._down_since = [None, None]
+                    self._long = [False, False]
+                    self._pending_click = [None, None]
+                else:
+                    self._was_down = [bool(frame.buttons[0]), bool(frame.buttons[1])]
+                return GestureResult((), tuple(sorted(consumed)), activity)
+            self._was_down = [True, True]
+            if (
+                self._chord_valid
+                and not self._chord_triggered
+                and self._chord_since is not None
+                and now - self._chord_since >= DIANPI_CHORD_HOLD_S
+                and all(
+                    math.isfinite(float(value))
+                    and abs(float(value)) <= self.deadzone
+                    for value in frame.axes
+                )
+            ):
+                self._chord_triggered = True
+                return GestureResult(
+                    (TakeoverEvent.START_DIANPI,),
+                    tuple(sorted(consumed)),
+                    activity,
+                )
+            return GestureResult((), tuple(sorted(consumed)), activity)
 
         for button in (0, 1):
             down = bool(frame.buttons[button])
