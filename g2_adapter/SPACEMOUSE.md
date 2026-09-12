@@ -1,6 +1,6 @@
 # SpaceMouse Compact 控制 G2 左右末端
 
-单臂入口：`g2_adapter/run_spacemouse_gdk.py`；左右视觉流程串联入口：`g2_adapter/run_bilateral_workflow_gdk.py`。两者仅支持 Linux USB SpaceMouse Compact（`256f:c635`），通过只读、非阻塞 `hidraw` 读取，不需要安装 PySpaceMouse 或启动 spacenavd。Python 环境需要已有的 NumPy；真机使用仓库 GDK Python 3.10 启动脚本。
+单臂入口：`g2_adapter/run_spacemouse_gdk.py`；左右视觉流程串联入口：`g2_adapter/run_bilateral_flow_gdk.py`。两者仅支持 Linux USB SpaceMouse Compact（`256f:c635`），通过只读、非阻塞 `hidraw` 读取，不需要安装 PySpaceMouse 或启动 spacenavd。Python 环境需要已有的 NumPy；真机使用仓库 GDK Python 3.10 启动脚本。
 
 ## 启动
 
@@ -43,7 +43,7 @@ python3 g2_adapter/run_spacemouse_gdk.py --list-devices
 ## 左右视觉流程串联与临时接管
 
 ```bash
-./scripts/run_gdk_sam3_python.sh g2_adapter/run_bilateral_workflow_gdk.py \
+./scripts/run_gdk_sam3_python.sh g2_adapter/run_bilateral_flow_gdk.py \
   --device /dev/spacemouse-compact \
   --left-web-port 8767 \
   --right-web-port 8767 \

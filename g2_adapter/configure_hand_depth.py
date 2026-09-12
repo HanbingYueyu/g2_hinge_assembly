@@ -104,7 +104,7 @@ def main() -> int:
         camera = agibot_gdk.Camera()
         camera.set_dev_camera_config(str(config_path))
         print("GDK 已接受相机配置；尚未执行模式切换。")
-        print("请由操作员执行官方 mode_switch --mode develop，并重启机器人/GDK 服务使模式与相机配置生效后，再运行 inspect_cameras.py。")
+        print("请由操作员执行官方 mode_switch --mode develop，并重启机器人/GDK 服务使模式与相机配置生效后，再用页面/GDK 相机预览确认实际生效的流。")
         return 0
     except Exception as exc:
         print(f"应用相机配置失败：{exc}", file=sys.stderr)
