@@ -1,6 +1,7 @@
 # Codex / local workspace state
 /.agents/
 /.codex/
+/.worktrees/
 
 # Python caches and local environments
 **/__pycache__/
