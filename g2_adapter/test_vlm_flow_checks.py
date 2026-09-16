@@ -1,5 +1,8 @@
 import threading
 import unittest
+import tempfile
+from pathlib import Path
+from unittest.mock import patch
 
 import cv2
 import numpy as np
@@ -22,6 +25,52 @@ class FakeWeb:
 
 
 class VlmFlowChecksTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.output = Path(self.temp.name)
+        self.directory_patch = patch("vlm_flow_checks.OUTPUT_DIR", self.output, create=True)
+        self.directory_patch.start()
+        self.addCleanup(self.directory_patch.stop)
+
+    def test_gripper_saves_exact_sent_bytes_with_stage_and_camera(self):
+        sent = []
+        class Client:
+            def run_bytes(self, task, images):
+                sent.extend(images)
+                return {"state": "attached"}
+        run_gripper_check(FakeWeb({"left": jpeg()}), Client(), (80, 120, 560, 480))
+        files = sorted(self.output.glob("*.jpg"))
+        self.assertEqual(len(files), 2)
+        for file in files:
+            self.assertRegex(file.name, r"^\d{8}_\d{6}_\d{6}_left_vlm_gripper_check(?:_crop)?\.jpg$")
+        full = next(file for file in files if not file.stem.endswith("_crop"))
+        crop = next(file for file in files if file.stem.endswith("_crop"))
+        self.assertEqual([full.read_bytes(), crop.read_bytes()], sent)
+
+    def test_assembly_saves_shared_frames_once_even_on_api_failure(self):
+        class Client:
+            def run_bytes(self, task, images):
+                raise RuntimeError("timeout")
+        frames = {"head": b"head", "left": b"left", "right": b"right"}
+        run_assembly_checks(FakeWeb(frames), Client())
+        files = list(self.output.glob("*.jpg"))
+        self.assertEqual(len(files), 3)
+        for camera, data in frames.items():
+            file = next(self.output.glob(f"*_{camera}_vlm_assembly_check.jpg"))
+            self.assertEqual(file.read_bytes(), data)
+
+    def test_save_failure_warns_but_still_calls_vlm(self):
+        blocker = self.output / "not_a_directory"
+        blocker.touch()
+        class Client:
+            def run_bytes(self, task, images):
+                return {"state": "attached"}
+        with patch("vlm_flow_checks.OUTPUT_DIR", blocker):
+            with self.assertWarnsRegex(RuntimeWarning, "VLM.*保存"):
+                record = run_gripper_check(FakeWeb({"left": jpeg()}), Client(), (80, 120, 560, 480))
+        self.assertTrue(record["ok"])
+
     def test_crop_parser_and_jpeg_crop(self):
         crop = parse_crop_xyxy("80,120,560,480")
         output = cv2.imdecode(np.frombuffer(crop_jpeg(jpeg(), crop), np.uint8), cv2.IMREAD_COLOR)

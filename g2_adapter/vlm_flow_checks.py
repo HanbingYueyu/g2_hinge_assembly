@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 import time
+import warnings
+from datetime import datetime
+from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor
 
 import cv2
@@ -10,6 +13,25 @@ import numpy as np
 
 
 RESULT_EVENTS = {"gripper": "vlm_gripper_result", "pin": "vlm_pin_result", "c-hole": "vlm_c_hole_result"}
+OUTPUT_DIR = Path(__file__).resolve().parents[1] / "outputs" / "vlm"
+
+
+def _save_inputs(stage: str, images: dict[str, bytes], statuses: dict) -> None:
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+    paths = []
+    try:
+        OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+        for camera, data in images.items():
+            name, _, variant = camera.partition("_")
+            suffix = f"_{variant}" if variant else ""
+            path = OUTPUT_DIR / f"{timestamp}_{name}_{stage}{suffix}.jpg"
+            with path.open("xb") as output:
+                output.write(data)
+            paths.append(str(path))
+    except OSError as exc:
+        statuses["image_save_error"] = str(exc)
+        warnings.warn(f"[VLM 警告] 图片保存失败：{exc}", RuntimeWarning, stacklevel=2)
+    statuses["saved_images"] = paths
 
 
 def parse_crop_xyxy(value: str) -> tuple[int, int, int, int]:
@@ -79,6 +101,7 @@ def run_gripper_check(web, client, crop_xyxy, clock=time.monotonic) -> dict:
         images = [frames["left"], crop_jpeg(frames["left"], crop_xyxy)]
     except Exception as exc:
         return _warning("gripper", exc, locals().get("statuses", {}))
+    _save_inputs("vlm_gripper_check", {"left": images[0], "left_crop": images[1]}, statuses)
     return _safe_check(client, "gripper", images, statuses, clock)
 
 
@@ -89,6 +112,7 @@ def run_assembly_checks(web, client, clock=time.monotonic) -> list[dict]:
             raise RuntimeError("VLM client is unavailable")
     except Exception as exc:
         return [_warning("pin", exc, locals().get("statuses", {})), _warning("c-hole", exc, locals().get("statuses", {}))]
+    _save_inputs("vlm_assembly_check", frames, statuses)
     with ThreadPoolExecutor(max_workers=2, thread_name_prefix="vlm-assembly") as pool:
         pin = pool.submit(_safe_check, client, "pin", [frames["right"], frames["left"], frames["head"]], statuses, clock)
         c_hole = pool.submit(_safe_check, client, "c-hole", [frames["left"], frames["right"]], statuses, clock)
