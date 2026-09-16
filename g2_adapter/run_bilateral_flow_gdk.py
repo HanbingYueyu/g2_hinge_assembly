@@ -228,6 +228,12 @@ def parse_args(argv=None) -> argparse.Namespace:
         "--right-grasp-distance-mm", type=float, default=152.0,
         help="右手末端原点到电批红色抓取中心的距离，默认 152 mm。",
     )
+    parser.add_argument("--disable-vlm-checks", action="store_true")
+    parser.add_argument("--vlm-env-file", type=Path, default=PROJECT_ROOT / "vlm_checks" / "config" / "vlm.env")
+    parser.add_argument("--vlm-model", default="qwen3.8-flash")
+    parser.add_argument("--vlm-api-url", default="https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions")
+    parser.add_argument("--vlm-timeout-s", type=float, default=60.0)
+    parser.add_argument("--vlm-gripper-crop", default="80,120,560,480")
     parser.add_argument("--auto-speed-mm-s", type=float, default=10.0)
     parser.add_argument("--auto-preset-velocity-rad-s", type=float, default=0.08)
     parser.add_argument("--left-seat-max-descent-mm", type=float, default=10.0,
@@ -290,6 +296,15 @@ def validate_args(args: argparse.Namespace) -> int | None:
         if order.index(args.through_stage) < order.index(args.from_stage):
             print("--through-stage 不能位于 --from-stage 之前。", file=sys.stderr)
             return 2
+    try:
+        try:
+            from .vlm_flow_checks import parse_crop_xyxy
+        except ImportError:
+            from vlm_flow_checks import parse_crop_xyxy
+        parse_crop_xyxy(args.vlm_gripper_crop)
+    except ValueError as exc:
+        print(f"VLM 参数错误：{exc}", file=sys.stderr)
+        return 2
     checks = (
         math.isfinite(args.head_samples) and 1 <= args.head_samples <= 30,
         1 <= args.head_min_inlier_samples <= args.head_samples,
@@ -305,6 +320,7 @@ def validate_args(args: argparse.Namespace) -> int | None:
         math.isfinite(args.right_hole_y_mm) and abs(args.right_hole_y_mm) <= 500,
         math.isfinite(args.right_hole_z_mm) and 0 < args.right_hole_z_mm <= 500,
         math.isfinite(args.right_grasp_distance_mm) and 10 <= args.right_grasp_distance_mm <= 300,
+        math.isfinite(args.vlm_timeout_s) and 1 <= args.vlm_timeout_s <= 300,
         math.isfinite(args.approach_above_mm) and 0 < args.approach_above_mm <= 500,
         1.0 <= args.spacemouse_speed_mm_s <= 30.0,
         1.0 <= args.spacemouse_rotation_deg_s <= 28.6,
@@ -570,6 +586,31 @@ def stage_right_to_lr1(ctx: FlowContext) -> dict:
     return {"preset": record["preset"]}
 
 
+def stage_vlm_gripper_check(ctx: FlowContext) -> dict:
+    if ctx.args.disable_vlm_checks:
+        return {"skipped": True, "reason": "disabled"}
+    try:
+        from .vlm_flow_checks import parse_crop_xyxy, run_gripper_check
+    except ImportError:
+        from vlm_flow_checks import parse_crop_xyxy, run_gripper_check
+    record = run_gripper_check(ctx.services.web, ctx.services.get("vlm_client"), parse_crop_xyxy(ctx.args.vlm_gripper_crop))
+    ctx.runtime.emit_event(record)
+    return {"task": "gripper", "ok": record["ok"]}
+
+
+def stage_vlm_assembly_check(ctx: FlowContext) -> dict:
+    if ctx.args.disable_vlm_checks:
+        return {"skipped": True, "reason": "disabled"}
+    try:
+        from .vlm_flow_checks import run_assembly_checks
+    except ImportError:
+        from vlm_flow_checks import run_assembly_checks
+    records = run_assembly_checks(ctx.services.web, ctx.services.get("vlm_client"))
+    for record in records:
+        ctx.runtime.emit_event(record)
+    return {"tasks": [record["task"] for record in records], "ok": all(record["ok"] for record in records)}
+
+
 def stage_right_grasp(ctx: FlowContext) -> dict:
     try:
         from .right_apriltag_grasp_gdk import run_right_grasp_stage
@@ -643,9 +684,11 @@ STAGE_HANDLERS = {
     Stage.HOME: stage_home,
     Stage.HEAD_LOCALIZE: stage_head_localize,
     Stage.LEFT_GRASP: stage_left_grasp,
+    Stage.VLM_GRIPPER_CHECK: stage_vlm_gripper_check,
     Stage.RIGHT_TO_LR1: stage_right_to_lr1,
     Stage.LEFT_TO_LL1_AND_SEAT: stage_left_to_ll1_and_seat,
     Stage.LEFT_RELEASE_LIFT_TO_LL2: stage_left_release_lift_to_ll2,
+    Stage.VLM_ASSEMBLY_CHECK: stage_vlm_assembly_check,
     Stage.RIGHT_GRASP: stage_right_grasp,
     Stage.RIGHT_RETURN: stage_right_return,
     Stage.FINISH: stage_finish,
@@ -780,6 +823,15 @@ def run_flow(args: argparse.Namespace) -> int:
             head_camera=head_camera, left_camera=left_camera, right_camera=right_camera,
             web=web,
         )
+        if not args.disable_vlm_checks:
+            try:
+                from vlm_checks.src.vlm_three_checks import VlmClient
+                services.put("vlm_client", VlmClient(
+                    args.vlm_env_file, args.vlm_model, args.vlm_api_url, args.vlm_timeout_s,
+                ))
+            except Exception as exc:
+                services.put("vlm_client", None)
+                flow_event_sink({"event": "vlm_check_warning", "task": "init", "error": str(exc)})
         services.extra["right_color_type"] = agibot_gdk.CameraType.kHandRightColor
         runtime = BilateralRuntime(
             args=args, controller=controller, gate=gate, worker=worker,

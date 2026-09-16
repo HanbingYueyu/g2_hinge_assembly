@@ -6,7 +6,7 @@ from bilateral_stages import DEFAULT_PLAN, Stage, StageSequencer, stage_names
 class BilateralStagePlanTests(unittest.TestCase):
     def test_plan_covers_the_nine_operator_steps_in_order(self):
         steps = [spec.user_step for spec in DEFAULT_PLAN]
-        self.assertEqual(steps, ["1", "2", "3", "4", "5", "5", "5", "6-7", "8", "8", "9"])
+        self.assertEqual(steps, ["1", "2", "3", "3", "4", "5", "5", "5", "5", "6-7", "8", "8", "9"])
         self.assertEqual(stage_names()[0], "home")
         self.assertEqual(stage_names()[-1], "finish")
 

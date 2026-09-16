@@ -1,0 +1,17 @@
+{
+  "recordings": [
+    {"id":"20260915_100130","pin_inserted":true,"obvious_c_leak":false},
+    {"id":"20260915_101514","pin_inserted":true,"obvious_c_leak":null,"note":"无明显板外C，但用户确认D孔内部错位；不属于当前粗粒度C外漏任务"},
+    {"id":"20260915_101601","pin_inserted":true,"obvious_c_leak":false},
+    {"id":"20260915_102252","pin_inserted":false,"obvious_c_leak":true},
+    {"id":"20260915_102318","pin_inserted":false,"obvious_c_leak":true},
+    {"id":"20260915_102341","pin_inserted":true,"obvious_c_leak":true},
+    {"id":"20260915_102419","pin_inserted":true,"obvious_c_leak":true},
+    {"id":"20260915_102606","pin_inserted":true,"obvious_c_leak":false}
+  ],
+  "summary": {
+    "pin_inserted_qwen3.8_flash": "8/8 on these recordings",
+    "obvious_c_leak_qwen3.8_flash": "7/7 on samples with a coarse-label ground truth; 101514 excluded",
+    "d_hole_fine_offset": "not shipped as a production decision; both qwen3.8-flash and qwen3.8-max produced false positives"
+  }
+}

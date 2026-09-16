@@ -64,6 +64,13 @@ def console_event_summary(record: dict) -> str | None:
         return "[初始化] 正在加载视觉模型…"
     if event == "bilateral_models_preloaded":
         return "[初始化] 视觉模型加载完成"
+    if event in {"vlm_gripper_result", "vlm_pin_result", "vlm_c_hole_result"}:
+        result = record.get("result") or {}
+        label = {"vlm_gripper_result": "夹持", "vlm_pin_result": "凸轴", "vlm_c_hole_result": "C孔"}[event]
+        value = result.get("state", result.get("obvious_c_leak"))
+        return f"[VLM {label}] result={value} confidence={result.get('confidence')} reason={result.get('reason')}"
+    if event == "vlm_check_warning":
+        return f"[VLM 警告] task={record.get('task')} error={record.get('error')}"
     if record.get("level") == "warning":
         return f"[警告] {record.get('reason', event)}"
     return None

@@ -425,7 +425,7 @@ class DispatchTests(unittest.TestCase):
             code = flow._drive(context, flow.parse_args(["--through-stage", "right_to_lr1"]))
         self.assertEqual(code, 0)
         completed = [fields["stage"] for event, fields in runtime.events if event == "stage_complete"]
-        self.assertEqual(completed, ["home", "head_localize", "left_grasp", "right_to_lr1"])
+        self.assertEqual(completed, ["home", "head_localize", "left_grasp", "vlm_gripper_check", "right_to_lr1"])
         events = [event for event, _fields in runtime.events]
         self.assertIn("bilateral_flow_stopped_at_stage", events)
         self.assertNotIn("bilateral_flow_complete", events)

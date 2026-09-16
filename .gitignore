@@ -44,6 +44,7 @@ compile_commands.json
 # Raw G2 capture/probe output. The reviewed workcell config remains trackable.
 /g2_adapter/recorded_poses.json
 /g2_adapter/camera_probe.json
+/vlm_checks/config/vlm.env
 
 # Training datasets and large model checkpoints are provisioned separately.
 /datasets/
