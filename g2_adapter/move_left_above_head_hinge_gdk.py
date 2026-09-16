@@ -15,6 +15,7 @@ import cv2
 import numpy as np
 
 try:
+    from .arm_orientation import fixed_forward_down_orientation
     from .bilateral_rgbd_geometry import apply_transform, inverse_transform
     from .camera import align_depth_to_color, decode_color_rgb, decode_depth_u16, intrinsic_to_dict, transform_to_dict
     from .apriltag_workpiece import quaternion_from_rotation
@@ -23,6 +24,7 @@ try:
     from .record_pose import DEFAULT_OUTPUT
     from .yolo_hinge import infer_yolo_masks, load_yolo_segmentation_model
 except ImportError:
+    from arm_orientation import fixed_forward_down_orientation
     from bilateral_rgbd_geometry import apply_transform, inverse_transform
     from camera import align_depth_to_color, decode_color_rgb, decode_depth_u16, intrinsic_to_dict, transform_to_dict
     from apriltag_workpiece import quaternion_from_rotation
@@ -137,46 +139,6 @@ def load_left_preset(path: Path, name: str) -> list[float]:
     if len(values) != 7 or not np.all(np.isfinite(values)):
         raise RuntimeError(f"{name} 必须包含 7 个有限关节值")
     return values
-
-
-def fixed_forward_down_orientation(
-    *, forward_yaw_deg: float = 0.0,
-    gripper_pitch_deg: float = 30.0,
-    gripper_roll_deg: float = 180.0,
-) -> tuple[float, float, float, float]:
-    """Build a base-frame orientation with end +Z forward and pitched down.
-
-    G2's end-link convention uses +Z as the gripper's forward extension axis.
-    At zero yaw/pitch, +Z points along ``base_link +X`` and +Y points up.  A
-    positive pitch tilts +Z downward while preserving zero roll.  Roll is
-    applied around the local +Z axis so callers can tune the tool orientation
-    without involving a recorded joint preset.
-    """
-    values = (forward_yaw_deg, gripper_pitch_deg, gripper_roll_deg)
-    if not all(math.isfinite(float(value)) for value in values):
-        raise ValueError("末端固定姿态参数必须是有限数值")
-    if not -180.0 <= float(forward_yaw_deg) <= 180.0:
-        raise ValueError("forward_yaw_deg must be in [-180, 180]")
-    if not -89.0 <= float(gripper_pitch_deg) <= 89.0:
-        raise ValueError("gripper_pitch_deg must be in [-89, 89]")
-    if not -180.0 <= float(gripper_roll_deg) <= 180.0:
-        raise ValueError("gripper_roll_deg must be in [-180, 180]")
-    yaw = math.radians(float(forward_yaw_deg))
-    pitch = math.radians(float(gripper_pitch_deg))
-    roll = math.radians(float(gripper_roll_deg))
-    sin_pitch, cos_pitch = math.sin(pitch), math.cos(pitch)
-    # Columns are end-link +X, +Y, +Z in base_link.  +Z is forward and
-    # tilts downward by ``pitch``; +Y is the no-roll up direction.
-    base_rotation = np.column_stack((
-        np.array([0.0, 1.0, 0.0]),
-        np.array([sin_pitch, 0.0, cos_pitch]),
-        np.array([cos_pitch, 0.0, -sin_pitch]),
-    ))
-    cy, sy = math.cos(yaw), math.sin(yaw)
-    yaw_rotation = np.array(((cy, -sy, 0.0), (sy, cy, 0.0), (0.0, 0.0, 1.0)))
-    cr, sr = math.cos(roll), math.sin(roll)
-    local_roll = np.array(((cr, -sr, 0.0), (sr, cr, 0.0), (0.0, 0.0, 1.0)))
-    return quaternion_from_rotation(yaw_rotation @ base_rotation @ local_roll)
 
 
 def gripper_end_target(

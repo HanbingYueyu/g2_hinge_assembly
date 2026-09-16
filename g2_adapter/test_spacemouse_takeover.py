@@ -201,11 +201,14 @@ class MotionPauseGateTests(unittest.TestCase):
         pausing.start()
         time.sleep(0.02)
         self.assertTrue(pausing.is_alive())
+        self.assertTrue(gate.is_paused())
+        self.assertEqual(gate.pause_generation, 0)
         release.set()
         pausing.join(1.0)
         thread.join(1.0)
         self.assertFalse(pausing.is_alive())
         self.assertTrue(gate.is_paused())
+        self.assertEqual(gate.pause_generation, 1)
         gate.resume()
 
     def test_automatic_waits_until_resume_but_manual_context_bypasses(self):
@@ -288,6 +291,30 @@ class MotionPauseGateTests(unittest.TestCase):
         self.assertTrue(gate.is_paused())
         with self.assertRaises(SafetyError):
             gate.wait_for_auto()
+
+    def test_pause_that_wins_before_writer_lock_prevents_the_queued_write(self):
+        gate = MotionPauseGate()
+        entered = threading.Event()
+        gate._writer_lock.acquire()
+        try:
+            automatic = threading.Thread(target=lambda: self._enter_automatic(gate, entered))
+            automatic.start()
+            time.sleep(0.02)
+            pausing = threading.Thread(target=gate.pause)
+            pausing.start()
+            time.sleep(0.02)
+        finally:
+            gate._writer_lock.release()
+        pausing.join(1.0)
+        self.assertFalse(entered.wait(0.05))
+        gate.resume()
+        self.assertTrue(entered.wait(1.0))
+        automatic.join(1.0)
+
+    @staticmethod
+    def _enter_automatic(gate, entered):
+        with gate.automatic_motion():
+            entered.set()
 
 
 class WorkerTests(unittest.TestCase):
@@ -400,7 +427,7 @@ class WorkerTests(unittest.TestCase):
         self.assertEqual(result.events, (TakeoverEvent.START_DIANPI,))
         worker.raise_if_failed()
 
-    def test_transient_gdk_read_timeout_cancels_takeover_and_resumes_auto(self):
+    def test_transient_gdk_read_timeout_keeps_takeover_and_auto_paused(self):
         robot = BilateralRobot()
         gate = MotionPauseGate()
         controller = G2Controller(FakeGdk, robot, allow_motion=True, motion_gate=gate)
@@ -434,9 +461,9 @@ class WorkerTests(unittest.TestCase):
         worker.step = step
         worker._run()
         self.assertIsNone(worker._failed)
-        self.assertIsNone(worker.active_side)
-        self.assertIsNone(worker._session)
-        self.assertFalse(gate.is_paused())
+        self.assertEqual(worker.active_side, "left")
+        self.assertIsNotNone(worker._session)
+        self.assertTrue(gate.is_paused())
 
     def test_disconnect_holds_and_reopens_device_without_failing_workflow(self):
         robot = BilateralRobot()
@@ -567,6 +594,56 @@ class WorkerTests(unittest.TestCase):
         worker.step(frame(4.48), 4.48)
         self.assertIsNone(worker.active_side)
         self.assertFalse(gate.is_paused())
+        gripper_positions = [
+            tuple(request.end_effector_joint_positions) for request in robot.requests
+            if request.end_effector_joint_positions
+        ]
+        self.assertEqual(gripper_positions, [])
+
+    def test_dianpi_chord_holds_measured_pose_until_both_buttons_release(self):
+        robot = BilateralRobot()
+        gate = MotionPauseGate()
+        controller = G2Controller(FakeGdk, robot, allow_motion=True, motion_gate=gate)
+        worker = SpaceMouseTakeoverWorker(
+            controller, gate, device=None,
+            config=TeleopConfig(side="left", axis_map=(1, 2, 3, 4, 5, 6)),
+            dianpi_runner=FakeDianpiRunner(),
+            clock=lambda: 1.0,
+        )
+        worker._activate("left", frame(1.0), 1.0, ())
+        worker.step(frame(1.02, buttons=(True, False), pressed=(0,)), 1.02)
+        for index in range(1, 22):
+            now = 1.02 + index * .02
+            worker.step(frame(now, buttons=(True, False)), now)
+        worker.step(frame(1.46, axes=(.8, 0, 0, 0, 0, 0), buttons=(True, True), pressed=(1,)), 1.46)
+        x_after_trigger = robot.requests[-1].left_end_effector_pose.position.x
+        worker.step(frame(1.48, axes=(.8, 0, 0, 0, 0, 0), buttons=(True, True)), 1.48)
+        self.assertEqual(robot.requests[-1].left_end_effector_pose.position.x, x_after_trigger)
+
+    def test_right_double_click_never_opens_the_right_gripper(self):
+        robot = BilateralRobot()
+        gate = MotionPauseGate()
+        controller = G2Controller(FakeGdk, robot, allow_motion=True, motion_gate=gate)
+        worker = SpaceMouseTakeoverWorker(
+            controller, gate, device=None,
+            config=TeleopConfig(side="right", axis_map=(1, 2, 3, 4, 5, 6)),
+            clock=lambda: 1.34,
+        )
+        worker.step(frame(1.0), 1.0)
+        worker.step(frame(1.02, buttons=(False, True), pressed=(1,)), 1.02)
+        worker.step(frame(1.06), 1.06)
+        worker.step(frame(1.30, buttons=(False, True), pressed=(1,)), 1.30)
+        worker.step(frame(1.34), 1.34)
+        self.assertEqual(worker.active_side, "right")
+        for index in range(1, 33):
+            now = 1.34 + index * .02
+            worker.step(frame(now), now)
+        worker.step(frame(2.00, buttons=(False, True), pressed=(1,)), 2.00)
+        worker.step(frame(2.04), 2.04)
+        worker.step(frame(2.08, buttons=(False, True), pressed=(1,)), 2.08)
+        worker.step(frame(2.12), 2.12)
+        self.assertIsNone(worker.active_side)
+        self.assertFalse(any(request.end_effector_joint_positions for request in robot.requests))
 
     def test_left_stage_right_long_press_requests_advance_without_resuming_gate(self):
         robot = BilateralRobot()

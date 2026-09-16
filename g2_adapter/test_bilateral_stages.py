@@ -6,7 +6,7 @@ from bilateral_stages import DEFAULT_PLAN, Stage, StageSequencer, stage_names
 class BilateralStagePlanTests(unittest.TestCase):
     def test_plan_covers_the_nine_operator_steps_in_order(self):
         steps = [spec.user_step for spec in DEFAULT_PLAN]
-        self.assertEqual(steps, ["1", "2", "3", "4", "5", "5", "6-7", "8", "8", "9"])
+        self.assertEqual(steps, ["1", "2", "3", "4", "5", "5", "5", "6-7", "8", "8", "9"])
         self.assertEqual(stage_names()[0], "home")
         self.assertEqual(stage_names()[-1], "finish")
 
@@ -14,10 +14,12 @@ class BilateralStagePlanTests(unittest.TestCase):
         waiting = [spec.stage for spec in DEFAULT_PLAN if spec.waits_for_advance]
         self.assertEqual(waiting, [Stage.GATE_LEFT, Stage.GATE_RIGHT])
 
-    def test_gate_left_precedes_the_left_ll_move_and_gate_right_precedes_the_return(self):
+    def test_ll1_and_force_descent_precede_gate_then_release_lift_and_ll2(self):
         order = stage_names()
         self.assertLess(order.index("right_to_lr1"), order.index("gate_left"))
-        self.assertLess(order.index("gate_left"), order.index("left_to_ll"))
+        self.assertLess(order.index("right_to_lr1"), order.index("left_to_ll1_and_seat"))
+        self.assertLess(order.index("left_to_ll1_and_seat"), order.index("gate_left"))
+        self.assertLess(order.index("gate_left"), order.index("left_release_lift_to_ll2"))
         self.assertLess(order.index("right_grasp"), order.index("gate_right"))
         self.assertLess(order.index("gate_right"), order.index("right_return"))
 
@@ -25,7 +27,8 @@ class BilateralStagePlanTests(unittest.TestCase):
         expected = {
             Stage.HEAD_LOCALIZE: "head",
             Stage.LEFT_GRASP: "left",
-            Stage.LEFT_TO_LL: "left",
+            Stage.LEFT_TO_LL1_AND_SEAT: "left",
+            Stage.LEFT_RELEASE_LIFT_TO_LL2: "left",
             Stage.RIGHT_TO_LR1: "right",
             Stage.RIGHT_GRASP: "right",
             Stage.RIGHT_RETURN: "right",

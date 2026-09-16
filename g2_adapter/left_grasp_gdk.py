@@ -107,6 +107,7 @@ except ImportError:
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
+INTERRUPTED_EXIT_CODE = 130
 DEPTH_SCALE_M = 0.001
 # GDK's kLeftHandRGBDToArmLEndLink external calibration terminates here.  GDK
 # mode-1 end-effector pose control uses the same flange link by default.
@@ -457,10 +458,8 @@ HELD_PART_AREA_UNSTABLE_REASON = "held_target_mask_area_unstable_during_lift"
 def held_part_area_instability(
     samples: Sequence[tuple[float, float]],
     *,
-    now: float,
-    window_s: float,
     max_spread: float,
-    min_samples: int,
+    window_frames: int,
 ) -> dict | None:
     """Judge a closed-gripper lift from the trailing mask-area history.
 
@@ -472,22 +471,23 @@ def held_part_area_instability(
     held keeps a nearly constant apparent mask area, while a part that was
     never gripped (or is sliding out) keeps changing size frame after frame.
     Areas normally drift right after the close, so only the trailing
-    ``window_s`` of the lift is judged and the caller feeds this helper only
+    latest ``window_frames`` are judged and the caller feeds this helper only
     after its grace period.
 
-    Returns ``None`` until the trailing window holds at least ``min_samples``
+    Returns ``None`` until the trailing window holds ``window_frames``
     finite, positive areas.  Otherwise returns the measured spread together
     with ``unstable`` telling whether it exceeds ``max_spread``.
     """
-    window = [
+    valid = [
         (float(timestamp), float(area))
         for timestamp, area in samples
-        if now - float(timestamp) <= window_s
-        and math.isfinite(float(area))
+        if math.isfinite(float(area))
         and float(area) > 0.0
     ]
-    if len(window) < max(1, int(min_samples)):
+    required = max(1, int(window_frames))
+    if len(valid) < required:
         return None
+    window = valid[-required:]
     areas = [area for _, area in window]
     median_area = float(np.median(areas))
     spread_fraction = (max(areas) - min(areas)) / median_area
@@ -500,9 +500,8 @@ def held_part_area_instability(
         "median_area_px": median_area,
         "latest_area_px": areas[-1],
         "samples": len(window),
-        "window_s": window_s,
+        "window_frames": required,
         "max_spread": max_spread,
-        "min_samples": int(min_samples),
     }
 
 
@@ -771,26 +770,20 @@ def parse_args(argv=None) -> argparse.Namespace:
     parser.add_argument(
         "--post-grasp-lift-area-grace-s",
         type=float,
-        default=2.0,
-        help="闭爪上抬后跳过多久的面积变化（闭爪/起抬瞬间面积本来就会变），默认 2 秒。",
+        default=1.0,
+        help="闭爪上抬后跳过多久的面积变化（闭爪/起抬瞬间面积本来就会变），默认 1 秒。",
     )
     parser.add_argument(
-        "--post-grasp-lift-area-window-s",
-        type=float,
-        default=3.0,
-        help="空夹判定的滑动窗口长度，默认 3 秒；只看窗口内掩膜面积的相对波动。",
+        "--post-grasp-lift-area-window-frames",
+        type=int,
+        default=5,
+        help="空夹判定使用最近多少个有效面积帧，默认 5 帧。",
     )
     parser.add_argument(
         "--post-grasp-lift-area-spread",
         type=float,
-        default=0.5,
-        help="窗口内掩膜面积相对中位数的最大波动比例；超过即认为没夹住（空夹/滑落），默认 0.5（50%%）。",
-    )
-    parser.add_argument(
-        "--post-grasp-lift-area-min-samples",
-        type=int,
-        default=4,
-        help="窗口内至少需要多少个面积样本才开始判定空夹，默认 4。",
+        default=0.20,
+        help="窗口内掩膜面积相对中位数的最大波动比例，默认 0.20（20%%）。",
     )
     parser.add_argument(
         "--post-grasp-lift-area-confirmations",
@@ -801,8 +794,8 @@ def parse_args(argv=None) -> argparse.Namespace:
     parser.add_argument(
         "--post-grasp-target-lost-timeout-s",
         type=float,
-        default=3.0,
-        help="抓取后同一目标连续不可见多久才重新抓取，默认 3 秒。",
+        default=1.0,
+        help="抓取后同一目标连续不可见多久才重新抓取，默认 1 秒。",
     )
     parser.add_argument("--log", type=Path, default=None, help="默认写入 logs/left_grasp_*.jsonl")
     parser.add_argument("--web-host", default="127.0.0.1", help="内嵌只读网页监听地址。")
@@ -853,8 +846,12 @@ def parse_args(argv=None) -> argparse.Namespace:
                         help="头部同时采样 class 1 hole 的最长等待；超时后仍可只用 hinge 继续。")
     parser.add_argument("--move-above-hole", action="store_true",
                         help="分阶段流程：抓取并 +Z 上抬 150 mm 后，以 --hole-* 姿态移动到 hole 上方后结束本阶段。")
-    parser.add_argument("--hole-above-mm", type=float, default=100.0,
-                        help="左手夹爪中心位于 hole 上方的距离，默认 100 mm。")
+    parser.add_argument("--hole-x-mm", type=float, default=0.0,
+                        help="左手夹爪中心相对 hole 的 base_link X 偏移，默认 0 mm。")
+    parser.add_argument("--hole-y-mm", type=float, default=0.0,
+                        help="左手夹爪中心相对 hole 的 base_link Y 偏移，默认 0 mm。")
+    parser.add_argument("--hole-z-mm", type=float, default=100.0,
+                        help="左手夹爪中心相对 hole 的 base_link Z 偏移，默认 100 mm。")
     parser.add_argument("--hole-forward-yaw-deg", type=float, default=20.0,
                         help="到 hole 上方时末端 +Z 相对 base_link +X 的水平偏航角，默认 20 度。")
     parser.add_argument("--hole-gripper-pitch-deg", type=float, default=42.0,
@@ -2052,7 +2049,7 @@ def stop_force_descent_sam_preview(stop: threading.Event | None, worker: threadi
 
 def run_head_coarse_approach_in_process(*, gdk, controller: G2Controller, tf, args, head_model_path: Path, log,
                                         shared: SharedView | None = None, head_camera=None,
-                                        head_model=None) -> tuple[threading.Event | None, threading.Thread | None, dict]:
+                                        head_model=None, prelocalized_targets=None) -> tuple[threading.Event | None, threading.Thread | None, dict]:
     """Locate the leftmost head-camera hinge and move above it in this GDK session.
 
     ``head_camera`` and ``head_model`` may be supplied by a single-process
@@ -2071,25 +2068,39 @@ def run_head_coarse_approach_in_process(*, gdk, controller: G2Controller, tf, ar
         gripper_pitch_deg=args.head_gripper_pitch_deg,
         gripper_roll_deg=args.head_gripper_roll_deg,
     )
-    owns_head_camera = head_camera is None
-    owns_head_model = head_model is None
-    head_camera = head_camera if head_camera is not None else gdk.Camera(
-        [gdk.CameraType.kHeadColor, gdk.CameraType.kHeadDepth]
-    )
+    owns_head_camera = head_camera is None and prelocalized_targets is None
+    owns_head_model = head_model is None and prelocalized_targets is None
+    if head_camera is None and prelocalized_targets is None:
+        head_camera = gdk.Camera([gdk.CameraType.kHeadColor, gdk.CameraType.kHeadDepth])
     head_preview_stop: threading.Event | None = None
     head_preview_thread: threading.Thread | None = None
     head_coarse_context: dict | None = None
     preview_transferred = False
     try:
-        if head_model is None:
+        if head_model is None and prelocalized_targets is None:
             head_model = load_yolo_segmentation_model(head_model_path, device=args.yolo_device)
-        depth_to_color = transform_to_dict(tf.get_tf_from_sensor(gdk.SensorExtrinsicType.kHeadDepthToHeadColor))
-        head_from_color = transform_to_dict(tf.get_tf_from_sensor(gdk.SensorExtrinsicType.kHeadRGBDToHeadLink3))
+        depth_to_color = head_from_color = None
+        if prelocalized_targets is None:
+            depth_to_color = transform_to_dict(tf.get_tf_from_sensor(gdk.SensorExtrinsicType.kHeadDepthToHeadColor))
+            head_from_color = transform_to_dict(tf.get_tf_from_sensor(gdk.SensorExtrinsicType.kHeadRGBDToHeadLink3))
         color_intrinsic = depth_intrinsic = None
         observations: list[np.ndarray] = []
         hole_observations: list[np.ndarray] = []
         tf_modes: list[str] = []
         tf_gaps_ms: list[float] = []
+        if prelocalized_targets is not None:
+            known = head_context_from_targets(prelocalized_targets)
+            observations = [
+                np.asarray(known["hinge_position_base_link_m"], dtype=float)
+                for _ in range(args.head_samples)
+            ]
+            if known["hole_position_base_link_m"] is not None:
+                hole_observations = [
+                    np.asarray(known["hole_position_base_link_m"], dtype=float)
+                    for _ in range(args.head_samples)
+                ]
+            tf_modes = ["orchestrator_head_localize"] * args.head_samples
+            tf_gaps_ms = [0.0] * args.head_samples
         last_timestamp = None
         # Keep collecting until the requested number of valid samples is
         # available.  A temporary occlusion or a slow head-camera stream must
@@ -2098,9 +2109,9 @@ def run_head_coarse_approach_in_process(*, gdk, controller: G2Controller, tf, ar
         # until its own deadline, so a frame without a visible hole can never
         # stall the hinge localization.
         hole_deadline = time.monotonic() + float(args.hole_sample_timeout_s)
-        while len(observations) < args.head_samples or (
+        while prelocalized_targets is None and (len(observations) < args.head_samples or (
             len(hole_observations) < args.head_samples and time.monotonic() < hole_deadline
-        ):
+        )):
             color = head_camera.get_latest_image(gdk.CameraType.kHeadColor, 1000.0)
             timestamp_ns = int(color.timestamp_ns)
             if timestamp_ns == last_timestamp:
@@ -2211,7 +2222,7 @@ def run_head_coarse_approach_in_process(*, gdk, controller: G2Controller, tf, ar
         # worker before the arm starts moving.  This keeps the head image live
         # during the coarse approach as well as during the later hand motion,
         # without initializing GDK or loading the model a second time.
-        if shared is not None:
+        if shared is not None and prelocalized_targets is None:
             head_preview_stop, head_preview_thread = start_head_camera_web_preview(
                 gdk=gdk, head_model_path=head_model_path, args=args, shared=shared,
                 camera=head_camera, model=head_model,
@@ -2307,6 +2318,23 @@ def hole_target_from_context(head_coarse_context) -> list[float] | None:
     return [float(value) for value in hole]
 
 
+def optional_point(point) -> list[float] | None:
+    """Convert an optional 3-D point for JSON without iterating over None."""
+    return None if point is None else [float(value) for value in point]
+
+
+def head_context_from_targets(targets: dict) -> dict:
+    """Adapt the orchestrator's first localization result for the left stage."""
+    hinge = (targets.get("hinge") or {}).get("position_base_link_m")
+    if hinge is None:
+        raise SafetyError("编排器未提供 head_localize 的 hinge 三维坐标")
+    hole = (targets.get("hole") or {}).get("position_base_link_m")
+    return {
+        "hinge_position_base_link_m": [float(value) for value in hinge],
+        "hole_position_base_link_m": optional_point(hole),
+    }
+
+
 def hole_finalize_plan(hole_base_m) -> tuple[str, str]:
     """Decide how the left stage ends after the held-part gate.
 
@@ -2338,15 +2366,21 @@ def move_left_above_hole(*, controller: G2Controller, hole_base_m, args, log, li
     speed_mm_s = float(args.hole_speed_mm_s)
     if not (math.isfinite(speed_mm_s) and 0.0 < speed_mm_s <= 50.0):
         raise SafetyError("--hole-speed-mm-s 必须在 (0, 50] mm/s")
-    if not (math.isfinite(args.hole_above_mm) and 0.0 < args.hole_above_mm <= 500.0):
-        raise SafetyError("--hole-above-mm 必须在 (0, 500] mm")
+    offsets_mm = np.asarray([args.hole_x_mm, args.hole_y_mm, args.hole_z_mm], dtype=float)
+    if not np.isfinite(offsets_mm).all():
+        raise SafetyError("--hole-x-mm/--hole-y-mm/--hole-z-mm 必须是有限数值")
+    if abs(float(args.hole_x_mm)) > 500.0 or abs(float(args.hole_y_mm)) > 500.0:
+        raise SafetyError("--hole-x-mm/--hole-y-mm 必须在 [-500, 500] mm")
+    if not 0.0 < float(args.hole_z_mm) <= 500.0:
+        raise SafetyError("--hole-z-mm 必须在 (0, 500] mm")
 
     orientation = fixed_forward_down_orientation(
         forward_yaw_deg=args.hole_forward_yaw_deg,
         gripper_pitch_deg=args.hole_gripper_pitch_deg,
         gripper_roll_deg=args.hole_gripper_roll_deg,
     )
-    target = gripper_end_target(hole_target, orientation, tcp_end_m, args.hole_above_mm / 1000.0)
+    grasp_center_target = hole_target + offsets_mm / 1000.0
+    target = gripper_end_target(grasp_center_target, orientation, tcp_end_m, 0.0)
     current = controller.read_end_effector_pose(link)
     travel_mm = float(np.linalg.norm(np.asarray(target.position_m) - np.asarray(current.position_m)) * 1000.0)
     max_travel_mm = float(getattr(args, "max_travel_mm", 450.0))
@@ -2359,12 +2393,13 @@ def move_left_above_hole(*, controller: G2Controller, hole_base_m, args, log, li
     start = {
         "event": "left_above_hole_motion_start", "travel_mm": round(travel_mm, 2),
         "hole_position_base_link_m": [float(value) for value in hole_target],
+        "hole_offset_mm": [float(value) for value in offsets_mm],
+        "grasp_center_target_base_link_m": [float(value) for value in grasp_center_target],
         "target_end_link_base_m": [float(value) for value in target.position_m],
         "orientation_xyzw": [float(value) for value in target.orientation_xyzw],
         "forward_yaw_deg": args.hole_forward_yaw_deg,
         "gripper_pitch_deg": args.hole_gripper_pitch_deg,
         "gripper_roll_deg": args.hole_gripper_roll_deg,
-        "above_mm": args.hole_above_mm,
     }
     print(json.dumps(start, ensure_ascii=False), flush=True)
     json_record(log, start)
@@ -2392,15 +2427,15 @@ def move_left_above_hole(*, controller: G2Controller, hole_base_m, args, log, li
     actual_center = gripper_end_target(
         np.asarray(actual.position_m), actual.orientation_xyzw, -tcp_end_m, 0.0,
     ).position_m
-    xy_error_mm = float(np.linalg.norm(np.asarray(actual_center[:2]) - hole_target[:2]) * 1000.0)
-    if xy_error_mm > float(args.head_xy_tolerance_mm):
+    xyz_error_mm = float(np.linalg.norm(np.asarray(actual_center) - grasp_center_target) * 1000.0)
+    if xyz_error_mm > float(args.head_xy_tolerance_mm):
         raise SafetyError(
-            f"夹持中心与 hole 目标水平误差 {xy_error_mm:.1f} mm，"
+            f"夹持中心与偏移后 hole 目标误差 {xyz_error_mm:.1f} mm，"
             f"超过 {args.head_xy_tolerance_mm:.1f} mm"
         )
     arrived = {
         "event": "left_above_hole_arrived", "travel_mm": round(travel_mm, 2),
-        "grasp_center_xy_error_mm": round(xy_error_mm, 2),
+        "grasp_center_xyz_error_mm": round(xyz_error_mm, 2),
         "actual_end_link_base_m": [float(value) for value in actual.position_m],
     }
     print(json.dumps(arrived, ensure_ascii=False), flush=True)
@@ -2575,9 +2610,8 @@ def run_left_cycle(*, services=None, argv=None) -> int:
         and 0.002 <= args.post_grasp_verify_depth_change_m <= 0.050
         and 0.50 <= args.post_grasp_monitor_max_stale_s <= 5.0
         and 0.0 <= args.post_grasp_lift_area_grace_s <= 10.0
-        and 0.5 <= args.post_grasp_lift_area_window_s <= 15.0
+        and 2 <= args.post_grasp_lift_area_window_frames <= 60
         and 0.05 <= args.post_grasp_lift_area_spread <= 5.0
-        and 2 <= args.post_grasp_lift_area_min_samples <= 60
         and 1 <= args.post_grasp_lift_area_confirmations <= 20
         and 0.10 <= args.post_grasp_target_lost_timeout_s <= 30.0
     ):
@@ -2848,6 +2882,7 @@ def run_left_cycle(*, services=None, argv=None) -> int:
                     shared=None if web_shared is None else web_shared.pane("head"),
                     head_camera=None if services is None else services.head_camera,
                     head_model=None if services is None else services.head_yolo,
+                    prelocalized_targets=None if services is None else services.get("head_targets"),
                 )
             except Exception as exc:
                 print(f"头部铰链定位/左手预移动失败：{exc}", file=sys.stderr)
@@ -3298,14 +3333,7 @@ def run_left_cycle(*, services=None, argv=None) -> int:
                             monitor["area_samples"].append(
                                 (observed_at, float(observation["area_px"]))
                             )
-                            history_limit_s = max(
-                                args.post_grasp_lift_area_window_s,
-                                args.post_grasp_lift_area_grace_s,
-                            )
-                            monitor["area_samples"][:] = [
-                                sample for sample in monitor["area_samples"]
-                                if observed_at - sample[0] <= history_limit_s
-                            ]
+                            monitor["area_samples"][:] = monitor["area_samples"][-args.post_grasp_lift_area_window_frames:]
                             # Diagnostic only: with a wrist camera a held part
                             # keeps its image centre while a part left behind
                             # slides away, so log the drift next to the area.
@@ -3315,10 +3343,8 @@ def run_left_cycle(*, services=None, argv=None) -> int:
                             ))
                             instability = held_part_area_instability(
                                 monitor["area_samples"],
-                                now=observed_at,
-                                window_s=args.post_grasp_lift_area_window_s,
                                 max_spread=args.post_grasp_lift_area_spread,
-                                min_samples=args.post_grasp_lift_area_min_samples,
+                                window_frames=args.post_grasp_lift_area_window_frames,
                             )
                             if instability is not None:
                                 monitor["max_area_spread_fraction"] = max(
@@ -3452,7 +3478,7 @@ def run_left_cycle(*, services=None, argv=None) -> int:
                             "area_monitor_samples": len(monitor["area_samples"]),
                             "area_monitor_max_spread_fraction": monitor["max_area_spread_fraction"],
                             "area_monitor_grace_s": args.post_grasp_lift_area_grace_s,
-                            "area_monitor_window_s": args.post_grasp_lift_area_window_s,
+                            "area_monitor_window_frames": args.post_grasp_lift_area_window_frames,
                             "area_monitor_max_spread": args.post_grasp_lift_area_spread,
                             "nonblocking": True,
                         })
@@ -3492,7 +3518,7 @@ def run_left_cycle(*, services=None, argv=None) -> int:
                                 "event": "post_grasp_hole_gate_wait",
                                 "utc": datetime.now(timezone.utc).isoformat(),
                                 "reason": "require_one_fresh_same_target_frame_after_lift",
-                                "hole_position_base_link_m": [float(value) for value in hole_base],
+                                "hole_position_base_link_m": optional_point(hole_base),
                                 "target_lost_timeout_s": args.post_grasp_target_lost_timeout_s,
                                 "action": "hold_position_keep_gripper_closed",
                                 "nonblocking": True,
@@ -5064,9 +5090,8 @@ def run_left_cycle(*, services=None, argv=None) -> int:
                                     "monitor_center_drift_px": args.post_grasp_verify_center_drift_px,
                                     "monitor_area_change_fraction": args.post_grasp_verify_area_change_fraction,
                                     "monitor_area_grace_s": args.post_grasp_lift_area_grace_s,
-                                    "monitor_area_window_s": args.post_grasp_lift_area_window_s,
+                                    "monitor_area_window_frames": args.post_grasp_lift_area_window_frames,
                                     "monitor_area_max_spread": args.post_grasp_lift_area_spread,
-                                    "monitor_area_min_samples": args.post_grasp_lift_area_min_samples,
                                     "monitor_area_confirmations": args.post_grasp_lift_area_confirmations,
                                     # Diagnostics for the next hardware run: a
                                     # close travel near the full stroke means
@@ -5152,7 +5177,7 @@ def run_left_cycle(*, services=None, argv=None) -> int:
         return 0
     except KeyboardInterrupt:
         print("收到 Ctrl-C；停止发送后续命令。")
-        return 0
+        return INTERRUPTED_EXIT_CODE
     except AdvanceRightRequested:
         return EXIT_ADVANCE_RIGHT
     except Exception as exc:

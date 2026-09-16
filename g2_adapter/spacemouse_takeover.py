@@ -16,10 +16,10 @@ import time
 from typing import Iterator
 
 try:
-    from .safety import SafetyError, AdvanceRightRequested
+    from .safety import SafetyError, AdvanceRightRequested, MotionWriteCancelled
     from .spacemouse_input import InputFrame
 except ImportError:
-    from safety import SafetyError, AdvanceRightRequested
+    from safety import SafetyError, AdvanceRightRequested, MotionWriteCancelled
     from spacemouse_input import InputFrame
 
 
@@ -218,6 +218,8 @@ class MotionPauseGate:
         self._paused = False
         self._advance_requested = False
         self._aborted: BaseException | None = None
+        self._cancelled_thread_ids: set[int] = set()
+        self._pause_generation = 0
         self._local = threading.local()
 
     def pause(self) -> None:
@@ -226,9 +228,12 @@ class MotionPauseGate:
                 raise SafetyError(f"motion gate aborted: {self._aborted}")
             self._paused = True
         # Do not let a manual command race an automatic command that passed
-        # the pause check immediately before this call.
+        # the pause check immediately before this call. Publish the new pause
+        # generation only after that in-flight writer has finished, so its
+        # refresh callback cannot establish a pre-takeover feedback baseline.
         with self._writer_lock:
-            return
+            with self._condition:
+                self._pause_generation += 1
 
     def resume(self) -> None:
         with self._condition:
@@ -275,12 +280,23 @@ class MotionPauseGate:
         with self._condition:
             return self._paused
 
+    @property
+    def pause_generation(self) -> int:
+        with self._condition:
+            return self._pause_generation
+
     def wait_for_auto(self) -> None:
         if getattr(self._local, "manual", False):
             return
         with self._condition:
-            while self._paused and not self._advance_requested and self._aborted is None:
+            thread_id = threading.get_ident()
+            while (
+                self._paused and not self._advance_requested and self._aborted is None
+                and thread_id not in self._cancelled_thread_ids
+            ):
                 self._condition.wait()
+            if thread_id in self._cancelled_thread_ids:
+                raise MotionWriteCancelled("automatic motion writer was stopped")
             if self._aborted is not None:
                 raise SafetyError(f"motion gate aborted: {self._aborted}")
             if self._advance_requested:
@@ -289,9 +305,37 @@ class MotionPauseGate:
     @contextmanager
     def automatic_motion(self) -> Iterator[None]:
         """Reserve the single robot writer for one automatic GDK request."""
-        self.wait_for_auto()
-        with self._writer_lock:
+        while True:
+            self.wait_for_auto()
+            self._writer_lock.acquire()
+            with self._condition:
+                thread_id = threading.get_ident()
+                manual = getattr(self._local, "manual", False)
+                blocked = not manual and (
+                    self._paused or self._advance_requested or self._aborted is not None
+                )
+                cancelled = thread_id in self._cancelled_thread_ids
+            if not blocked and not cancelled:
+                break
+            self._writer_lock.release()
+        try:
             yield
+        finally:
+            self._writer_lock.release()
+
+    def cancel_automatic_thread(self, thread: threading.Thread | None) -> None:
+        """Wake and cancel one stream writer without resuming other writers."""
+        if thread is None or thread.ident is None:
+            return
+        with self._condition:
+            self._cancelled_thread_ids.add(thread.ident)
+            self._condition.notify_all()
+
+    def clear_cancelled_thread(self, thread: threading.Thread | None) -> None:
+        if thread is None or thread.ident is None:
+            return
+        with self._condition:
+            self._cancelled_thread_ids.discard(thread.ident)
 
     @contextmanager
     def manual_motion(self) -> Iterator[None]:
@@ -509,8 +553,11 @@ class SpaceMouseTakeoverWorker:
             requested_side = "left"
         elif TakeoverEvent.TAKEOVER_RIGHT in result.events:
             requested_side = "right"
-        sanitized = self._without_consumed_buttons(frame, result.consumed_buttons)
+        chord_active = set(result.consumed_buttons) == {0, 1}
+        sanitized = self._neutral_frame(now) if chord_active else self._without_consumed_buttons(frame, result.consumed_buttons)
         if requested_side is not None:
+            if self._session is not None:
+                self._session.cancel_pending_gripper_click()
             if self._session is not None and self.active_side == requested_side:
                 # A second double-click on the active hand is the explicit
                 # takeover release gesture.  Stop with a measured hold and
@@ -560,13 +607,12 @@ class SpaceMouseTakeoverWorker:
                                     from spacemouse_teleop import TransientGDKReadTimeout
                                 if not isinstance(exc, TransientGDKReadTimeout):
                                     raise
-                                # No stale command was sent. Discard the
-                                # session target and let the interrupted
-                                # automatic stage continue from feedback.
-                                self._session = None
-                                self.active_side = None
+                                # Keep exclusive ownership. Rebuild the manual
+                                # target from feedback on a later healthy tick;
+                                # never resume automatic motion on a read stall.
+                                side = self.active_side
+                                self._session = None if side is None else self._new_session(side)
                                 self.gestures = SpaceMouseGestureState(deadzone=self.config.deadzone)
-                                self.gate.resume()
                             deadline += 0.02
                             self._stop.wait(max(0.0, deadline - self.clock()))
                 except (InputError, OSError) as exc:

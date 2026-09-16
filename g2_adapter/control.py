@@ -17,6 +17,7 @@ try:
         ARM_JOINT_NAMES,
         LEFT_ARM_JOINT_NAMES,
         RIGHT_ARM_JOINT_NAMES,
+        MotionWriteCancelled,
         SafetyError,
         clamp_omnipicker,
         reorder_arm_positions,
@@ -29,6 +30,7 @@ except ImportError:  # Direct script/module use from this directory.
         ARM_JOINT_NAMES,
         LEFT_ARM_JOINT_NAMES,
         RIGHT_ARM_JOINT_NAMES,
+        MotionWriteCancelled,
         SafetyError,
         clamp_omnipicker,
         reorder_arm_positions,
@@ -39,6 +41,10 @@ except ImportError:  # Direct script/module use from this directory.
 
 class MotionDisabledError(SafetyError):
     pass
+
+
+class MotionRebasePending(Exception):
+    """A resumed stream is waiting for post-pause measured feedback."""
 
 
 _FIXED_ORIENTATION_TOLERANCE_DEG = 0.01
@@ -261,6 +267,9 @@ class LeftEndEffectorPositionStream:
         self._actual_arrival_stable_samples = 0
         self._thread: threading.Thread | None = None
         self._feedback_thread: threading.Thread | None = None
+        self._gate_generation = 0
+        self._pending_rebase_generation: int | None = None
+        self._pending_rebase_feedback_sequence = 0
 
     def start(self, initial_target: CartesianPoseTarget) -> None:
         with self._lock:
@@ -284,6 +293,10 @@ class LeftEndEffectorPositionStream:
             self._at_target.clear()
             self._stop.clear()
             self._error = None
+            gate = self._controller.motion_gate
+            self._gate_generation = 0 if gate is None else gate.pause_generation
+            self._pending_rebase_generation = None
+            self._pending_rebase_feedback_sequence = 0
             self._feedback_thread = threading.Thread(
                 target=self._feedback_loop, name="g2-left-end-effector-feedback", daemon=True,
             )
@@ -326,6 +339,27 @@ class LeftEndEffectorPositionStream:
             if remaining <= 0.0:
                 return False
             self._at_target.wait(remaining)
+
+    def wait_until_commanded_target(self, target: CartesianPoseTarget, timeout_s: float,
+                                    *, tolerance_m: float = 0.0001) -> bool:
+        """Confirm the stream writer has transmitted a requested hold target."""
+        if not math.isfinite(timeout_s) or timeout_s <= 0.0:
+            raise ValueError("commanded-target timeout must be positive and finite")
+        if not math.isfinite(tolerance_m) or not 0.0 < tolerance_m <= 0.005:
+            raise ValueError("commanded-target tolerance must be in (0, 0.005]")
+        deadline = time.monotonic() + timeout_s
+        while True:
+            self.raise_if_failed()
+            with self._lock:
+                commanded = self._commanded
+            if commanded is not None:
+                position_error_m, orientation_error_deg = _pose_errors(commanded, target)
+                if position_error_m <= tolerance_m and orientation_error_deg <= 0.1:
+                    return True
+            remaining = deadline - time.monotonic()
+            if remaining <= 0.0:
+                return False
+            time.sleep(min(self._period_s, remaining))
 
     def is_target_reached(self) -> bool:
         """Return whether actual end-link feedback has reached the target.
@@ -426,8 +460,11 @@ class LeftEndEffectorPositionStream:
     def stop(self) -> None:
         self._stop.set()
         thread = self._thread
+        gate = self._controller.motion_gate
+        if gate is not None:
+            gate.cancel_automatic_thread(thread)
         if thread is not None and thread is not threading.current_thread():
-            thread.join(timeout=max(0.2, self._period_s * 4.0))
+            thread.join()
         feedback_thread = self._feedback_thread
         if feedback_thread is not None and feedback_thread is not threading.current_thread():
             feedback_thread.join(timeout=max(0.2, self._feedback_period_s * 4.0))
@@ -436,12 +473,48 @@ class LeftEndEffectorPositionStream:
                 self._thread = None
             if self._feedback_thread is None or not self._feedback_thread.is_alive():
                 self._feedback_thread = None
+        if gate is not None:
+            gate.clear_cancelled_thread(thread)
 
     def _set_error(self, error: Exception) -> None:
         with self._lock:
             if self._error is None:
                 self._error = error
         self._stop.set()
+
+    def _refresh_target_before_send(self, proposed: CartesianPoseTarget) -> CartesianPoseTarget:
+        """Replace a pre-pause proposal with a measured hold after manual motion."""
+        gate = self._controller.motion_gate
+        if gate is None:
+            return proposed
+        generation = gate.pause_generation
+        with self._lock:
+            if generation == self._gate_generation:
+                return proposed
+            if self._pending_rebase_generation != generation:
+                # Establish the feedback baseline only after this pause has
+                # completed and automatic motion has regained the writer lock.
+                # A sample received before takeover therefore cannot be used
+                # as the post-manual measured hold.
+                self._pending_rebase_generation = generation
+                self._pending_rebase_feedback_sequence = self._feedback_sequence
+                raise MotionRebasePending("waiting for fresh post-pause left feedback")
+            actual = self._actual
+            actual_at = self._actual_at
+            sequence = self._feedback_sequence
+            baseline_sequence = self._pending_rebase_feedback_sequence
+        if (
+            actual is None
+            or sequence <= baseline_sequence
+            or time.monotonic() - actual_at > self._feedback_stale_timeout_s
+        ):
+            raise MotionRebasePending("waiting for fresh post-pause left feedback")
+        with self._lock:
+            # Commit only the generation captured above. A concurrent pause
+            # increments the gate again and remains pending for the next send.
+            self._gate_generation = generation
+            self._pending_rebase_generation = None
+        return actual
 
     def _feedback_loop(self) -> None:
         deadline = time.monotonic()
@@ -516,9 +589,7 @@ class LeftEndEffectorPositionStream:
             )))
             orientation_angle = 2.0 * math.acos(min(1.0, max(-1.0, orientation_dot)))
             max_angle_step = self._max_angular_velocity_rad_s * self._period_s
-            can_advance = (
-                actual_follow_error_m <= self._soft_follow_error_m
-            )
+            can_advance = actual_follow_error_m <= self._soft_follow_error_m
             if not can_advance:
                 next_target = commanded
             else:
@@ -536,12 +607,18 @@ class LeftEndEffectorPositionStream:
                     )
                 next_target = CartesianPoseTarget(tuple(float(value) for value in next_position), next_orientation)
             try:
-                self._controller._send_left_cartesian_pose(
+                next_target = self._controller._send_left_cartesian_pose(
                     next_target,
                     self._life_time_s,
                     end_effector_joint_names=gripper_joint_names,
                     end_effector_joint_positions=gripper_joint_positions,
+                    refresh_target=self._refresh_target_before_send,
                 )
+            except MotionWriteCancelled:
+                return
+            except MotionRebasePending:
+                self._stop.wait(self._period_s)
+                continue
             except Exception as exc:
                 self._set_error(exc)
                 return
@@ -619,6 +696,9 @@ class RightEndEffectorPositionStream:
         self._actual_arrival_stable_samples = 0
         self._thread: threading.Thread | None = None
         self._feedback_thread: threading.Thread | None = None
+        self._gate_generation = 0
+        self._pending_rebase_generation: int | None = None
+        self._pending_rebase_feedback_sequence = 0
 
     def start(self, initial_target: CartesianPoseTarget) -> None:
         with self._lock:
@@ -642,6 +722,10 @@ class RightEndEffectorPositionStream:
             self._at_target.clear()
             self._stop.clear()
             self._error = None
+            gate = self._controller.motion_gate
+            self._gate_generation = 0 if gate is None else gate.pause_generation
+            self._pending_rebase_generation = None
+            self._pending_rebase_feedback_sequence = 0
             self._feedback_thread = threading.Thread(
                 target=self._feedback_loop, name="g2-right-end-effector-feedback", daemon=True,
             )
@@ -787,8 +871,11 @@ class RightEndEffectorPositionStream:
     def stop(self) -> None:
         self._stop.set()
         thread = self._thread
+        gate = self._controller.motion_gate
+        if gate is not None:
+            gate.cancel_automatic_thread(thread)
         if thread is not None and thread is not threading.current_thread():
-            thread.join(timeout=max(0.2, self._period_s * 4.0))
+            thread.join()
         feedback_thread = self._feedback_thread
         if feedback_thread is not None and feedback_thread is not threading.current_thread():
             feedback_thread.join(timeout=max(0.2, self._feedback_period_s * 4.0))
@@ -797,12 +884,42 @@ class RightEndEffectorPositionStream:
                 self._thread = None
             if self._feedback_thread is None or not self._feedback_thread.is_alive():
                 self._feedback_thread = None
+        if gate is not None:
+            gate.clear_cancelled_thread(thread)
 
     def _set_error(self, error: Exception) -> None:
         with self._lock:
             if self._error is None:
                 self._error = error
         self._stop.set()
+
+    def _refresh_target_before_send(self, proposed: CartesianPoseTarget) -> CartesianPoseTarget:
+        """Replace a pre-pause proposal with a measured hold after manual motion."""
+        gate = self._controller.motion_gate
+        if gate is None:
+            return proposed
+        generation = gate.pause_generation
+        with self._lock:
+            if generation == self._gate_generation:
+                return proposed
+            if self._pending_rebase_generation != generation:
+                self._pending_rebase_generation = generation
+                self._pending_rebase_feedback_sequence = self._feedback_sequence
+                raise MotionRebasePending("waiting for fresh post-pause right feedback")
+            actual = self._actual
+            actual_at = self._actual_at
+            sequence = self._feedback_sequence
+            baseline_sequence = self._pending_rebase_feedback_sequence
+        if (
+            actual is None
+            or sequence <= baseline_sequence
+            or time.monotonic() - actual_at > self._feedback_stale_timeout_s
+        ):
+            raise MotionRebasePending("waiting for fresh post-pause right feedback")
+        with self._lock:
+            self._gate_generation = generation
+            self._pending_rebase_generation = None
+        return actual
 
     def _feedback_loop(self) -> None:
         deadline = time.monotonic()
@@ -876,9 +993,7 @@ class RightEndEffectorPositionStream:
             )))
             orientation_angle_rad = 2.0 * math.acos(min(1.0, max(-1.0, orientation_dot)))
             max_angle_step_rad = self._max_angular_velocity_rad_s * self._period_s
-            can_advance = (
-                actual_follow_error_m <= self._soft_follow_error_m
-            )
+            can_advance = actual_follow_error_m <= self._soft_follow_error_m
             if not can_advance:
                 next_target = commanded
             else:
@@ -906,12 +1021,18 @@ class RightEndEffectorPositionStream:
                         "right end-effector position stream requires motion mode 0/1 and healthy control_mode=1; "
                         f"actual={status}"
                     )
-                self._controller._send_right_cartesian_pose(
+                next_target = self._controller._send_right_cartesian_pose(
                     next_target,
                     self._life_time_s,
                     end_effector_joint_names=gripper_joint_names,
                     end_effector_joint_positions=gripper_joint_positions,
+                    refresh_target=self._refresh_target_before_send,
                 )
+            except MotionWriteCancelled:
+                return
+            except MotionRebasePending:
+                self._stop.wait(self._period_s)
+                continue
             except Exception as exc:
                 self._set_error(exc)
                 return
@@ -1377,24 +1498,28 @@ class G2Controller:
         *,
         end_effector_joint_names: Sequence[str] = (),
         end_effector_joint_positions: Sequence[float] = (),
-    ) -> None:
+        refresh_target: Callable[[CartesianPoseTarget], CartesianPoseTarget] | None = None,
+    ) -> CartesianPoseTarget:
         """Internal 50-Hz sender; public callers use the gated stream above."""
         self._require_motion()
         if len(end_effector_joint_names) != len(end_effector_joint_positions):
             raise ValueError("end-effector joint names and positions must have the same length")
-        request = self.gdk.EndEffectorPose()
-        request.life_time = float(life_time_s)
-        request.group = self.gdk.EndEffectorControlGroup.kLeftArm
-        pose = request.left_end_effector_pose
-        pose.position.x, pose.position.y, pose.position.z = target.position_m
-        pose.orientation.x, pose.orientation.y, pose.orientation.z, pose.orientation.w = target.orientation_xyzw
-        if end_effector_joint_names:
-            request.end_effector_joint_names = list(end_effector_joint_names)
-            request.end_effector_joint_positions = [float(value) for value in end_effector_joint_positions]
         with self._motion_write():
+            if refresh_target is not None:
+                target = refresh_target(target)
+            request = self.gdk.EndEffectorPose()
+            request.life_time = float(life_time_s)
+            request.group = self.gdk.EndEffectorControlGroup.kLeftArm
+            pose = request.left_end_effector_pose
+            pose.position.x, pose.position.y, pose.position.z = target.position_m
+            pose.orientation.x, pose.orientation.y, pose.orientation.z, pose.orientation.w = target.orientation_xyzw
+            if end_effector_joint_names:
+                request.end_effector_joint_names = list(end_effector_joint_names)
+                request.end_effector_joint_positions = [float(value) for value in end_effector_joint_positions]
             result = self.robot.end_effector_pose_control(request)
         if result not in (None, 0):
             raise SafetyError(f"GDK end_effector_pose_control failed: {result}")
+        return target
 
     def _send_right_cartesian_pose(
         self,
@@ -1403,24 +1528,28 @@ class G2Controller:
         *,
         end_effector_joint_names: Sequence[str] = (),
         end_effector_joint_positions: Sequence[float] = (),
-    ) -> None:
+        refresh_target: Callable[[CartesianPoseTarget], CartesianPoseTarget] | None = None,
+    ) -> CartesianPoseTarget:
         """Internal sender for the right mode-1 stream; callers never bypass it."""
         self._require_motion()
         if len(end_effector_joint_names) != len(end_effector_joint_positions):
             raise ValueError("end-effector joint names and positions must have the same length")
-        request = self.gdk.EndEffectorPose()
-        request.life_time = float(life_time_s)
-        request.group = self.gdk.EndEffectorControlGroup.kRightArm
-        pose = request.right_end_effector_pose
-        pose.position.x, pose.position.y, pose.position.z = target.position_m
-        pose.orientation.x, pose.orientation.y, pose.orientation.z, pose.orientation.w = target.orientation_xyzw
-        if end_effector_joint_names:
-            request.end_effector_joint_names = list(end_effector_joint_names)
-            request.end_effector_joint_positions = [float(value) for value in end_effector_joint_positions]
         with self._motion_write():
+            if refresh_target is not None:
+                target = refresh_target(target)
+            request = self.gdk.EndEffectorPose()
+            request.life_time = float(life_time_s)
+            request.group = self.gdk.EndEffectorControlGroup.kRightArm
+            pose = request.right_end_effector_pose
+            pose.position.x, pose.position.y, pose.position.z = target.position_m
+            pose.orientation.x, pose.orientation.y, pose.orientation.z, pose.orientation.w = target.orientation_xyzw
+            if end_effector_joint_names:
+                request.end_effector_joint_names = list(end_effector_joint_names)
+                request.end_effector_joint_positions = [float(value) for value in end_effector_joint_positions]
             result = self.robot.end_effector_pose_control(request)
         if result not in (None, 0):
             raise SafetyError(f"GDK right end_effector_pose_control failed: {result}")
+        return target
 
     def read_gripper_state(self, side: str) -> tuple[tuple[str, ...], tuple[float, ...]]:
         """Read GDK's installed end-effector names and finite positions."""

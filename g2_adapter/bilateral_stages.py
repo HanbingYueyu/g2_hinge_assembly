@@ -13,9 +13,10 @@ Step mapping (operator spec):
 3. left arm above hinge (yaw 0 / pitch 42 / roll 180) -> visual grasp -> lift 150 mm
    -> above hole (yaw 20 / pitch 42 / roll 180)
 4. right arm to ``LR1``
-5. SpaceMouse gate 1 -> left arm to ``LL1`` then ``LL2``
+5. left arm to ``LL1`` -> force-guarded descent -> SpaceMouse gate 1 -> release
+   -> lift 100 mm -> ``LL2``
 6. right arm to ``RR1`` -> AprilTag grasp of the electric screwdriver
-7. lift 100 mm -> ``RR2``
+7. lift 100 mm -> fixed downward orientation above detected ``hole``
 8. SpaceMouse gate 2 -> right arm returns to the saved grasp pose
 9. open all grippers -> both arms to ``workflow_home``
 """
@@ -32,7 +33,8 @@ class Stage(str, Enum):
     LEFT_GRASP = "left_grasp"
     RIGHT_TO_LR1 = "right_to_lr1"
     GATE_LEFT = "gate_left"
-    LEFT_TO_LL = "left_to_ll"
+    LEFT_TO_LL1_AND_SEAT = "left_to_ll1_and_seat"
+    LEFT_RELEASE_LIFT_TO_LL2 = "left_release_lift_to_ll2"
     RIGHT_GRASP = "right_grasp"
     GATE_RIGHT = "gate_right"
     RIGHT_RETURN = "right_return"
@@ -51,13 +53,14 @@ class StageSpec:
 DEFAULT_PLAN: tuple[StageSpec, ...] = (
     StageSpec(Stage.HOME, "张开左右夹爪并回到 workflow_home", "1"),
     StageSpec(Stage.HEAD_LOCALIZE, "头部定位最左 hinge 与最高置信度 hole", "2", camera_pane="head"),
-    StageSpec(Stage.LEFT_GRASP, "左臂到铰链上方→视觉伺服抓取→上抬 150 mm→到 hole 上方 100 mm", "3", camera_pane="left"),
+    StageSpec(Stage.LEFT_GRASP, "左臂到铰链上方→视觉伺服抓取→上抬 150 mm→到 hole XYZ 偏移位置", "3", camera_pane="left"),
     StageSpec(Stage.RIGHT_TO_LR1, "右臂移动到 LR1", "4", camera_pane="right"),
+    StageSpec(Stage.LEFT_TO_LL1_AND_SEAT, "左臂移动到 LL1 并力保护下探", "5", camera_pane="left"),
     StageSpec(Stage.GATE_LEFT, "等待 SpaceMouse 下一阶段指令（门1）", "5", waits_for_advance=True),
-    StageSpec(Stage.LEFT_TO_LL, "左臂依次移动到 LL1、LL2", "5", camera_pane="left"),
+    StageSpec(Stage.LEFT_RELEASE_LIFT_TO_LL2, "张开左爪、上抬 100 mm 并移动到 LL2", "5", camera_pane="left"),
     StageSpec(
         Stage.RIGHT_GRASP,
-        "右臂移动到 RR1、AprilTag 抓取电批、上抬 100 mm 并移动到 RR2",
+        "右臂移动到 RR1、AprilTag 抓取电批、上抬 100 mm 并移动到 hole XYZ 偏移位置",
         "6-7", camera_pane="right",
     ),
     StageSpec(Stage.GATE_RIGHT, "等待 SpaceMouse 下一阶段指令（门2）", "8", waits_for_advance=True),

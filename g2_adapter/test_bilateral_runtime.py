@@ -1,4 +1,6 @@
 import json
+import contextlib
+import io
 import tempfile
 import unittest
 from argparse import Namespace
@@ -9,6 +11,7 @@ from bilateral_runtime import (
     OPEN_GRIPPER_RAD,
     STAGED_PRESETS,
     BilateralRuntime,
+    console_event_summary,
 )
 from safety import SafetyError
 
@@ -111,6 +114,34 @@ class RuntimeFixture(unittest.TestCase):
 
     def tearDown(self) -> None:
         self._temp.cleanup()
+
+
+class ConsoleSummaryTests(unittest.TestCase):
+    def test_stage_and_force_events_have_short_operator_messages(self):
+        self.assertEqual(
+            console_event_summary({"event": "stage_start", "stage": "left", "title": "左臂下探"}),
+            "[阶段开始] 左臂下探 (left)",
+        )
+        self.assertEqual(
+            console_event_summary({
+                "event": "left_seat_descent_complete", "stop_reason": "force_threshold",
+                "descent_mm": 3.2, "delta_force_n": 3.1,
+            }),
+            "[下探完成] 原因=力阈值 距离=3.2 mm 力变化=3.1 N",
+        )
+        self.assertIsNone(console_event_summary({"event": "verbose_internal", "value": [1, 2, 3]}))
+
+    def test_emit_writes_full_json_but_prints_only_summary(self):
+        with tempfile.TemporaryDirectory() as directory:
+            log = Path(directory) / "flow.jsonl"
+            runtime = BilateralRuntime(args=Namespace(poses="unused"), controller=None, journal_path=log)
+            output = io.StringIO()
+            with contextlib.redirect_stdout(output):
+                runtime.emit("stage_complete", stage="right_to_lr1", preset="LR1")
+            self.assertEqual(output.getvalue().strip(), "[阶段完成] right_to_lr1")
+            stored = json.loads(log.read_text(encoding="utf-8"))
+            self.assertEqual(stored["preset"], "LR1")
+            self.assertIn("utc", stored)
 
 
 class GripperAndHomeTests(RuntimeFixture):

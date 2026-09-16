@@ -123,6 +123,8 @@ class TeleopTests(unittest.TestCase):
         self.tick(pressed=(1,), buttons=(False, True))
         self.assertEqual(self.robot.requests[-1].end_effector_joint_names, [])
         self.tick()
+        for _ in range(28):
+            self.tick()
         request = self.robot.requests[-1]
         self.assertEqual(request.end_effector_joint_names, ['right_omnipicker'])
         self.assertEqual(request.end_effector_joint_positions, [0.0])
@@ -133,6 +135,8 @@ class TeleopTests(unittest.TestCase):
         for _ in range(15):
             self.tick()
         self.tick(pressed=(1,))
+        for _ in range(28):
+            self.tick()
         self.assertEqual(self.robot.requests[-1].end_effector_joint_positions, [-.785])
         self.assertEqual(self.robot.gripper_requests, [])
 
@@ -257,7 +261,7 @@ class TeleopTests(unittest.TestCase):
         self.session.stop()
         request = self.robot.requests[-1]
         self.assertEqual(request.right_end_effector_pose.position.x, 0)
-        self.assertEqual(request.end_effector_joint_positions, [-.785])
+        self.assertEqual(request.end_effector_joint_positions, [])
         count = len(self.robot.requests)
         self.session.stop()
         with self.assertRaises(SafetyError):
@@ -327,7 +331,7 @@ class TeleopTests(unittest.TestCase):
     def test_cancelled_gripper_is_resynced_when_switching_back(self):
         self.robot.follow_right_gripper = False
         self.tick(pressed=(1,))  # Closing target, but physical gripper remains open.
-        for _ in range(15):
+        for _ in range(29):
             self.tick()
         self.left_double_click()
         for _ in range(15):
@@ -338,6 +342,8 @@ class TeleopTests(unittest.TestCase):
             self.tick()
         self.assertEqual(self.session.side, 'right')
         self.tick(pressed=(1,))
+        for _ in range(28):
+            self.tick()
         self.assertEqual(self.robot.requests[-1].end_effector_joint_positions, [0.0])
 
 

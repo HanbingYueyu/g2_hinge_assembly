@@ -3,7 +3,15 @@ import threading
 import time
 import unittest
 
-from control import CartesianPoseTarget, G2Controller, MotionDisabledError, quaternion_angle_deg, quaternion_slerp
+from control import (
+    CartesianPoseTarget,
+    G2Controller,
+    MotionDisabledError,
+    MotionRebasePending,
+    RightEndEffectorPositionStream,
+    quaternion_angle_deg,
+    quaternion_slerp,
+)
 from safety import ARM_JOINT_NAMES, SafetyError
 from spacemouse_takeover import MotionPauseGate
 
@@ -306,6 +314,148 @@ class ControlTests(unittest.TestCase):
         self.assertTrue(finished.wait(1.0))
         thread.join(1.0)
 
+    def test_paused_position_stream_stop_returns_only_after_writer_exits(self):
+        robot = FakeRobot()
+        gate = MotionPauseGate()
+        controller = G2Controller(FakeGdk, robot, allow_motion=True, motion_gate=gate)
+        initial = CartesianPoseTarget((0.0, 0.0, 0.0), (0.0, 0.0, 0.0, 1.0))
+        stream = controller.start_right_end_effector_position_stream(initial)
+        gate.pause()
+        robot.requests.clear()
+        worker = stream._thread
+        time.sleep(0.12)
+        stream.stop()
+        self.assertFalse(worker.is_alive())
+        before = len(robot.requests)
+        gate.resume()
+        time.sleep(0.05)
+        self.assertEqual(len(robot.requests), before)
+
+    def test_right_stream_rebases_on_feedback_after_manual_takeover(self):
+        robot = FakeRobot()
+        robot.follow_right_pose = False
+        gate = MotionPauseGate()
+        controller = G2Controller(FakeGdk, robot, allow_motion=True, motion_gate=gate)
+        initial = CartesianPoseTarget((0.0, 0.0, 0.0), (0.0, 0.0, 0.0, 1.0))
+        stream = controller.start_right_end_effector_position_stream(
+            initial, max_translation_velocity_mps=0.01,
+        )
+        try:
+            stream.update_target(CartesianPoseTarget((0.2, 0.0, 0.0), initial.orientation_xyzw))
+            time.sleep(0.12)
+            gate.pause()
+            robot.right_end_pose.position.x = 0.1
+            time.sleep(0.12)
+            request_count = len(robot.requests)
+            gate.resume()
+            deadline = time.monotonic() + 1.0
+            while len(robot.requests) == request_count and time.monotonic() < deadline:
+                time.sleep(0.01)
+            resumed_x = robot.requests[request_count].right_end_effector_pose.position.x
+            self.assertGreaterEqual(resumed_x, 0.1)
+            self.assertLessEqual(resumed_x, 0.10021)
+        finally:
+            gate.resume()
+            stream.stop()
+
+    def test_resume_waits_for_fresh_feedback_before_any_automatic_write(self):
+        robot = FakeRobot()
+        robot.follow_right_pose = False
+        gate = MotionPauseGate()
+        controller = G2Controller(FakeGdk, robot, allow_motion=True, motion_gate=gate)
+        feedback_allowed = threading.Event()
+        feedback_allowed.set()
+        original_read = controller.read_end_effector_pose
+
+        def controlled_read(frame_name):
+            feedback_allowed.wait()
+            return original_read(frame_name)
+
+        controller.read_end_effector_pose = controlled_read
+        initial = CartesianPoseTarget((0.0, 0.0, 0.0), (0.0, 0.0, 0.0, 1.0))
+        stream = controller.start_right_end_effector_position_stream(
+            initial, max_translation_velocity_mps=0.01,
+        )
+        try:
+            stream.update_target(CartesianPoseTarget((0.2, 0.0, 0.0), initial.orientation_xyzw))
+            time.sleep(0.12)
+            feedback_allowed.clear()
+            gate.pause()
+            robot.right_end_pose.position.x = 0.1
+            request_count = len(robot.requests)
+            gate.resume()
+            time.sleep(0.08)
+            self.assertEqual(len(robot.requests), request_count)
+            feedback_allowed.set()
+            deadline = time.monotonic() + 1.0
+            while len(robot.requests) == request_count and time.monotonic() < deadline:
+                time.sleep(0.01)
+            self.assertAlmostEqual(robot.requests[request_count].right_end_effector_pose.position.x, 0.1)
+        finally:
+            feedback_allowed.set()
+            gate.resume()
+            stream.stop()
+
+    def test_new_pause_generation_cannot_be_consumed_by_previous_rebase(self):
+        robot = FakeRobot()
+        gate = MotionPauseGate()
+        controller = G2Controller(FakeGdk, robot, allow_motion=True, motion_gate=gate)
+        stream = RightEndEffectorPositionStream(
+            controller,
+            rate_hz=50.0,
+            life_time_s=0.1,
+            max_translation_velocity_mps=0.01,
+        )
+        target = CartesianPoseTarget((0.0, 0.0, 0.0), (0.0, 0.0, 0.0, 1.0))
+        stream._actual = target
+        stream._actual_at = time.monotonic()
+        stream._feedback_sequence = 1
+
+        gate.pause()
+        gate.resume()
+        with self.assertRaises(MotionRebasePending):
+            stream._refresh_target_before_send(target)
+
+        # Feedback for generation 1 arrives, but a second takeover begins
+        # before that generation can be committed by an automatic send.
+        stream._feedback_sequence = 2
+        stream._actual_at = time.monotonic()
+        gate.pause()
+        gate.resume()
+        with self.assertRaises(MotionRebasePending):
+            stream._refresh_target_before_send(target)
+        self.assertEqual(stream._pending_rebase_generation, 2)
+
+        stream._feedback_sequence = 3
+        stream._actual_at = time.monotonic()
+        self.assertIs(stream._refresh_target_before_send(target), target)
+        self.assertEqual(stream._gate_generation, 2)
+
+    def test_stop_waits_for_an_inflight_native_write_to_finish(self):
+        robot = FakeRobot()
+        gate = MotionPauseGate()
+        controller = G2Controller(FakeGdk, robot, allow_motion=True, motion_gate=gate)
+        entered = threading.Event()
+        release = threading.Event()
+        original_send = robot.end_effector_pose_control
+
+        def blocking_send(request):
+            entered.set()
+            release.wait()
+            return original_send(request)
+
+        robot.end_effector_pose_control = blocking_send
+        initial = CartesianPoseTarget((0.0, 0.0, 0.0), (0.0, 0.0, 0.0, 1.0))
+        stream = controller.start_right_end_effector_position_stream(initial)
+        self.assertTrue(entered.wait(1.0))
+        stopped = threading.Event()
+        stopper = threading.Thread(target=lambda: (stream.stop(), stopped.set()))
+        stopper.start()
+        self.assertFalse(stopped.wait(1.1))
+        release.set()
+        self.assertTrue(stopped.wait(1.0))
+        stopper.join(1.0)
+
     def test_planning_request_uses_g2_names(self):
         robot = FakeRobot()
         controller = G2Controller(FakeGdk, robot, allow_motion=True)
@@ -551,6 +701,21 @@ class ControlTests(unittest.TestCase):
         x_positions = [request.left_end_effector_pose.position.x for request in robot.requests]
         self.assertAlmostEqual(x_positions[-1], 0.101)
         self.assertTrue(all(abs(second - first) <= 0.0002001 for first, second in zip(x_positions, x_positions[1:])))
+
+    def test_left_stream_can_confirm_a_hold_target_was_commanded_before_stop(self):
+        robot = FakeRobot()
+        controller = G2Controller(FakeGdk, robot, allow_motion=True)
+        initial = CartesianPoseTarget((0.1, 0.2, 0.3), (0.0, 0.0, 0.0, 1.0))
+        hold = CartesianPoseTarget((0.101, 0.2, 0.3), initial.orientation_xyzw)
+        stream = controller.start_left_end_effector_position_stream(
+            initial, max_translation_velocity_mps=0.01,
+        )
+        try:
+            stream.update_target(hold)
+            self.assertTrue(stream.wait_until_commanded_target(hold, 0.5))
+        finally:
+            stream.stop()
+        self.assertAlmostEqual(robot.requests[-1].left_end_effector_pose.position.x, 0.101)
 
     def test_left_stream_pauses_command_progress_when_actual_pose_lags(self):
         robot = FakeRobot()

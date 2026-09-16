@@ -47,6 +47,10 @@ class AdvanceRightRequested(SafetyError):
     """Cancel automatic motion for an operator-requested stage transition."""
 
 
+class MotionWriteCancelled(SafetyError):
+    """Stop one blocked automatic writer without reopening the shared gate."""
+
+
 def finite_vector(values: Iterable[float], size: int, label: str) -> tuple[float, ...]:
     result = tuple(float(value) for value in values)
     if len(result) != size:

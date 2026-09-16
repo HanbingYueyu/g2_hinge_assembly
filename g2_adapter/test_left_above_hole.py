@@ -85,7 +85,9 @@ def make_args(**overrides) -> Namespace:
     base = dict(
         step_tcp_end_mm="0,0,145",
         hole_speed_mm_s=10.0,
-        hole_above_mm=100.0,
+        hole_x_mm=0.0,
+        hole_y_mm=0.0,
+        hole_z_mm=100.0,
         hole_forward_yaw_deg=20.0,
         hole_gripper_pitch_deg=42.0,
         hole_gripper_roll_deg=180.0,
@@ -108,8 +110,13 @@ class LeftAboveHoleTests(unittest.TestCase):
         self.stream.wait_until_target.return_value = True
 
     def _run(self, actual=None, args=None):
-        actual = actual or CartesianPoseTarget((0.5, 0.1, 1.0), (0, 0, 0, 1))
-        with patch.object(left_grasp_gdk, "wait_actual_left_target", return_value=actual) as waiter:
+        if actual is None:
+            def reached_target(_controller, _stream, target, **_kwargs):
+                return target
+            wait_patch = patch.object(left_grasp_gdk, "wait_actual_left_target", side_effect=reached_target)
+        else:
+            wait_patch = patch.object(left_grasp_gdk, "wait_actual_left_target", return_value=actual)
+        with wait_patch as waiter:
             record = left_grasp_gdk.move_left_above_hole(
                 controller=self.controller, hole_base_m=self.hole,
                 args=args or make_args(), log=self.log,
@@ -126,6 +133,20 @@ class LeftAboveHoleTests(unittest.TestCase):
         self.assertAlmostEqual(kwargs["max_translation_velocity_mps"], 0.010)
         self.stream.stop.assert_called_once()
         self.assertIn("left_above_hole_motion_start", self.log.getvalue())
+
+    def test_xyz_offsets_shift_the_target_in_base_link(self):
+        actual = CartesianPoseTarget((0.52, 0.07, 0.92), (0, 0, 0, 1))
+        self._run(
+            actual=actual,
+            args=make_args(
+                step_tcp_end_mm="0,0,0",
+                hole_x_mm=20.0,
+                hole_y_mm=-30.0,
+                hole_z_mm=120.0,
+            ),
+        )
+        target = self.stream.update_target.call_args.args[0]
+        self.assertEqual(target.position_m, (0.52, 0.07, 0.92))
 
     def test_horizontal_error_beyond_tolerance_is_rejected(self):
         actual = CartesianPoseTarget((0.6, 0.1, 1.0), (0, 0, 0, 1))
@@ -148,7 +169,7 @@ class LeftAboveHoleTests(unittest.TestCase):
         with self.assertRaises(SafetyError):
             left_grasp_gdk.move_left_above_hole(
                 controller=self.controller, hole_base_m=self.hole,
-                args=make_args(hole_above_mm=0.0), log=self.log,
+                args=make_args(hole_z_mm=0.0), log=self.log,
             )
 
     def test_invalid_tcp_definition_is_rejected(self):
@@ -172,6 +193,54 @@ class HoleTargetFromContextTests(unittest.TestCase):
         for context in (None, {}, {"hole_position_base_link_m": None}):
             with self.subTest(context=context):
                 self.assertIsNone(left_grasp_gdk.hole_target_from_context(context))
+
+    def test_orchestrator_targets_become_coarse_context_without_relocalizing(self):
+        targets = {
+            "hinge": {"position_base_link_m": [0.4, 0.2, 0.7], "samples": 5},
+            "hole": {"position_base_link_m": [0.5, 0.1, 0.6], "samples": 4},
+        }
+        self.assertEqual(
+            left_grasp_gdk.head_context_from_targets(targets),
+            {
+                "hinge_position_base_link_m": [0.4, 0.2, 0.7],
+                "hole_position_base_link_m": [0.5, 0.1, 0.6],
+            },
+        )
+
+    def test_missing_hole_is_a_json_null_log_value(self):
+        self.assertIsNone(left_grasp_gdk.optional_point(None))
+
+    def test_prelocalized_path_needs_no_camera_model_or_sensor_tf(self):
+        class ForbiddenGdk:
+            class Camera:
+                def __init__(self, *_args):
+                    raise AssertionError("camera must not be opened")
+
+        class ForbiddenTf:
+            def get_tf_from_sensor(self, *_args):
+                raise AssertionError("sensor TF must not be read")
+
+        class Controller:
+            def set_control_mode(self, _mode):
+                pass
+
+            def read_end_effector_pose(self, _frame):
+                raise RuntimeError("motion boundary reached")
+
+        args = Namespace(
+            step_tcp_end_mm="0,0,0", head_forward_yaw_deg=0.0,
+            head_gripper_pitch_deg=42.0, head_gripper_roll_deg=180.0,
+            yolo_device="cuda:0", head_samples=3, hole_sample_timeout_s=1.0,
+            head_max_sample_spread_mm=20.0, head_min_inlier_samples=2,
+            head_yolo_confidence=0.8,
+        )
+        targets = {"hinge": {"position_base_link_m": [0.4, 0.2, 0.7]}}
+        with self.assertRaisesRegex(RuntimeError, "motion boundary reached"):
+            left_grasp_gdk.run_head_coarse_approach_in_process(
+                gdk=ForbiddenGdk, controller=Controller(), tf=ForbiddenTf(), args=args,
+                head_model_path=pathlib.Path("unused.pt"), log=io.StringIO(),
+                prelocalized_targets=targets,
+            )
 
 
 class HoleFinalizePlanTests(unittest.TestCase):

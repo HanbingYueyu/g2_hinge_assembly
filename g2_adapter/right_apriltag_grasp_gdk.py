@@ -66,6 +66,7 @@ except ImportError:
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
+INTERRUPTED_EXIT_CODE = 130
 DEFAULT_CONFIG = PROJECT_ROOT / "g2_adapter" / "right_apriltag_grasp.example.json"
 
 
@@ -157,6 +158,10 @@ def parse_args(argv=None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="G2 右手 AprilTag 41h12 工件定位与局部抓取（仅 GDK）")
     parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG)
     parser.add_argument("--face-distance-mm", type=float, default=None, help="仅持续正对伺服，距标定抓取点 10–300 mm，不操作夹爪")
+    parser.add_argument(
+        "--grasp-distance-mm", type=float, default=None,
+        help="覆盖配置中的 grasp_distance_mm；右手末端原点到红色抓取中心，范围 10–300 mm。",
+    )
     parser.add_argument(
         "--tag-geometry-profile", type=Path,
         help="覆盖配置中的独立 AprilTag 几何 profile；默认使用电批 Tag 几何",
@@ -1957,7 +1962,11 @@ def run_right_grasp_stage(*, services=None, argv=None) -> int:
                     lock["targets"] = facing_distance_targets(lock["targets"], args.face_distance_mm)
                 return lock
 
-            grasp_distance_mm = config.get("grasp_distance_mm") if args.face_distance_mm is None else None
+            grasp_distance_mm = (
+                args.grasp_distance_mm
+                if args.grasp_distance_mm is not None
+                else config.get("grasp_distance_mm")
+            ) if args.face_distance_mm is None else None
             if grasp_distance_mm is not None:
                 grasp_distance_mm = float(grasp_distance_mm)
                 if not math.isfinite(grasp_distance_mm) or not 10 <= grasp_distance_mm <= 300:
@@ -2324,6 +2333,10 @@ def run_right_grasp_stage(*, services=None, argv=None) -> int:
                             # The staged flow returns to this pose in a later
                             # stage, so keep it on the shared services object.
                             services.put("right_saved_grasp_pose", saved_grasp_pose)
+                            services.put(
+                                "right_saved_workpiece_pose",
+                                np.asarray(execute_targets.base_from_workpiece, dtype=np.float64).copy(),
+                            )
                             services.put("right_config", config)
                         def emit_return_event(event):
                             event = {"utc": datetime.now(timezone.utc).isoformat(), **event}
@@ -2394,7 +2407,8 @@ def run_right_grasp_stage(*, services=None, argv=None) -> int:
                     continue
         return 0 if latest is not None or right_end_from_tcp is None else 1
     except KeyboardInterrupt:
-        return 0
+        print("收到 Ctrl-C；停止发送后续命令。", file=sys.stderr)
+        return INTERRUPTED_EXIT_CODE
     except Exception as exc:
         print(f"右手 AprilTag 流程失败：{exc}", file=sys.stderr)
         return 1

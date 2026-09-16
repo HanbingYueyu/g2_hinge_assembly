@@ -19,17 +19,17 @@ class HeldPartAreaInstabilityTests(unittest.TestCase):
     def test_stable_area_after_the_close_passes(self):
         samples = [(index * 0.2, area) for index, area in enumerate((1000, 1010, 990, 1005, 1000))]
         decision = held_part_area_instability(
-            samples, now=samples[-1][0], window_s=3.0, max_spread=0.5, min_samples=4,
+            samples, max_spread=0.20, window_frames=5,
         )
         self.assertIsNotNone(decision)
         self.assertFalse(decision["unstable"])
-        self.assertLess(decision["spread_fraction"], 0.5)
+        self.assertLess(decision["spread_fraction"], 0.20)
         self.assertEqual(decision["samples"], 5)
 
     def test_area_that_keeps_changing_is_reported_as_an_empty_grasp(self):
         samples = [(index * 0.2, area) for index, area in enumerate((1000, 700, 1200, 400, 900))]
         decision = held_part_area_instability(
-            samples, now=samples[-1][0], window_s=3.0, max_spread=0.5, min_samples=4,
+            samples, max_spread=0.20, window_frames=5,
         )
         self.assertIsNotNone(decision)
         self.assertTrue(decision["unstable"])
@@ -37,21 +37,22 @@ class HeldPartAreaInstabilityTests(unittest.TestCase):
         self.assertEqual(decision["min_area_px"], 400.0)
         self.assertEqual(decision["max_area_px"], 1200.0)
 
-    def test_too_few_samples_or_stale_ones_cannot_judge_the_hold(self):
+    def test_exactly_five_valid_frames_are_required(self):
         samples = [(0.0, 1000), (0.2, 2000)]
         self.assertIsNone(held_part_area_instability(
-            samples, now=0.2, window_s=3.0, max_spread=0.5, min_samples=4,
+            samples, max_spread=0.20, window_frames=5,
         ))
-        # Old samples leave the trailing window, so a burst followed by silence
-        # (perception stall) must not fail the hold.
-        self.assertIsNone(held_part_area_instability(
-            samples, now=10.0, window_s=3.0, max_spread=0.5, min_samples=2,
-        ))
+
+    def test_only_the_latest_five_valid_frames_are_judged(self):
+        samples = [(0.0, 100), (0.1, 1000), (0.2, 1010), (0.3, 990), (0.4, 1005), (0.5, 1000)]
+        decision = held_part_area_instability(samples, max_spread=0.20, window_frames=5)
+        self.assertFalse(decision["unstable"])
+        self.assertEqual(decision["samples"], 5)
 
     def test_non_positive_or_non_finite_areas_are_ignored(self):
         samples = [(0.0, 1000), (0.2, float("nan")), (0.4, 0), (0.6, 1005), (0.8, 995)]
         decision = held_part_area_instability(
-            samples, now=0.8, window_s=3.0, max_spread=0.5, min_samples=3,
+            samples, max_spread=0.20, window_frames=3,
         )
         self.assertIsNotNone(decision)
         self.assertEqual(decision["samples"], 3)

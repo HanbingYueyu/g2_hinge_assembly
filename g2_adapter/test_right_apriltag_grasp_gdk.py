@@ -107,6 +107,8 @@ class ManualFinishTests(unittest.TestCase):
         self.assertEqual(args.post_grasp_pose, "RR2")
         default = parse_args([])
         self.assertFalse(default.stop_after_transport)
+        self.assertIsNone(default.grasp_distance_mm)
+        self.assertEqual(parse_args(["--grasp-distance-mm", "165"]).grasp_distance_mm, 165.0)
 
     def test_standalone_main_delegates_to_the_injectable_stage(self):
         import right_apriltag_grasp_gdk as module

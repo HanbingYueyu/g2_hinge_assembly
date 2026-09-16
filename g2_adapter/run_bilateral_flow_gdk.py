@@ -14,6 +14,7 @@ validates every recorded preset without touching the robot.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import math
 import sys
@@ -23,13 +24,13 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 try:
-    from .bilateral_runtime import BilateralRuntime, PreloadedModels
+    from .bilateral_runtime import BilateralRuntime, PreloadedModels, append_jsonl_record, console_event_summary
     from .bilateral_services import StageServices
     from .bilateral_stages import DEFAULT_PLAN, Stage, StageSequencer, stage_names
     from .bilateral_web import BilateralWeb, RawPaneFeed
     from .safety import SafetyError
 except ImportError:
-    from bilateral_runtime import BilateralRuntime, PreloadedModels
+    from bilateral_runtime import BilateralRuntime, PreloadedModels, append_jsonl_record, console_event_summary
     from bilateral_services import StageServices
     from bilateral_stages import DEFAULT_PLAN, Stage, StageSequencer, stage_names
     from bilateral_web import BilateralWeb, RawPaneFeed
@@ -37,6 +38,38 @@ except ImportError:
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
+
+
+class JsonLineSuppressingStream:
+    """Pass human-readable child output through while hiding JSON event lines."""
+
+    def __init__(self, destination) -> None:
+        self.destination = destination
+        self._buffer = ""
+
+    def write(self, text: str) -> int:
+        self._buffer += str(text)
+        while "\n" in self._buffer:
+            line, self._buffer = self._buffer.split("\n", 1)
+            if not line.lstrip().startswith("{"):
+                self.destination.write(line + "\n")
+        return len(text)
+
+    def flush(self) -> None:
+        if self._buffer and not self._buffer.lstrip().startswith("{"):
+            self.destination.write(self._buffer)
+        self._buffer = ""
+        self.destination.flush()
+
+
+@contextlib.contextmanager
+def concise_child_stdout():
+    stream = JsonLineSuppressingStream(sys.stdout)
+    try:
+        with contextlib.redirect_stdout(stream):
+            yield
+    finally:
+        stream.flush()
 
 
 @dataclass
@@ -72,10 +105,12 @@ class StageSettings:
             "--yolo-center-fraction", str(args.yolo_center_fraction),
             "--post-grasp-target-lost-timeout-s", str(args.post_grasp_target_lost_timeout_s),
             "--move-above-hole",
-            "--hole-above-mm", str(args.hole_above_mm),
-            "--hole-forward-yaw-deg", str(args.hole_yaw_deg),
-            "--hole-gripper-pitch-deg", str(args.hole_pitch_deg),
-            "--hole-gripper-roll-deg", str(args.hole_roll_deg),
+            "--hole-x-mm", str(args.left_hole_x_mm),
+            "--hole-y-mm", str(args.left_hole_y_mm),
+            "--hole-z-mm", str(args.left_hole_z_mm),
+            "--hole-forward-yaw-deg", str(args.left_hole_yaw_deg),
+            "--hole-gripper-pitch-deg", str(args.left_hole_pitch_deg),
+            "--hole-gripper-roll-deg", str(args.left_hole_roll_deg),
             "--hole-speed-mm-s", str(args.auto_speed_mm_s),
             "--hole-sample-timeout-s", str(args.hole_sample_timeout_s),
             "--home-pose-name", args.home_pose_name,
@@ -92,24 +127,29 @@ class StageSettings:
         ]
         if args.left_height_reference is not None:
             argv.extend(("--height-reference", str(Path(args.left_height_reference).expanduser())))
+        if args.log is not None:
+            argv.extend(("--log", str(Path(args.log).expanduser())))
         return argv
 
     # ------------------------------------------------------------ right stage
     def right_argv(self) -> list[str]:
         args = self.args
-        return [
+        argv = [
             "--config", str(Path(args.right_config).expanduser()),
             "--tag-geometry-profile", str(Path(args.tag_geometry_profile).expanduser()),
             "--poses", str(Path(args.poses).expanduser()),
             "--web-port", "0",
             "--execute", "--autonomous-approach", "--allow-motion",
-            "--premove-pr1", "--post-grasp-pr2",
+            "--premove-pr1",
             "--premove-pose", args.right_premove_pose,
-            "--post-grasp-pose", args.right_post_grasp_pose,
+            "--grasp-distance-mm", str(args.right_grasp_distance_mm),
             "--stop-after-transport",
             "--auto-speed-mm-s", str(args.auto_speed_mm_s),
             "--auto-preset-velocity-rad-s", str(args.auto_preset_velocity_rad_s),
         ]
+        if args.log is not None:
+            argv.extend(("--log", str(Path(args.log).expanduser())))
+        return argv
 
 
 class FlowContext:
@@ -157,16 +197,24 @@ def parse_args(argv=None) -> argparse.Namespace:
                         help="左手 D405 YOLO 全图推理时中央有效目标区域宽高比例，默认 0.70。")
     parser.add_argument("--final-descent-visual-tolerance-mm", type=float, default=5.0,
                         help="下探视觉伺服的估计水平误差死区，默认 5 mm。")
-    parser.add_argument("--post-grasp-target-lost-timeout-s", type=float, default=3.0,
-                        help="抓取后同一目标连续不可见多久才重新抓取，默认 3 秒。")
+    parser.add_argument("--post-grasp-target-lost-timeout-s", type=float, default=1.0,
+                        help="抓取后同一目标连续不可见多久才重新抓取，默认 1 秒。")
     parser.add_argument("--approach-yaw-deg", type=float, default=0.0, help="到铰链上方时的偏航角，默认 0（正对前方）。")
     parser.add_argument("--approach-pitch-deg", type=float, default=42.0, help="到铰链上方时的下俯角，默认 42。")
     parser.add_argument("--approach-roll-deg", type=float, default=180.0, help="到铰链上方时的滚转角，默认 180。")
     parser.add_argument("--approach-above-mm", type=float, default=100.0, help="铰链上方距离，默认 100 mm。")
-    parser.add_argument("--hole-above-mm", type=float, default=100.0, help="hole 上方距离，默认 100 mm。")
-    parser.add_argument("--hole-yaw-deg", type=float, default=20.0, help="到 hole 上方时的偏航角，默认 20（待实机确认）。")
-    parser.add_argument("--hole-pitch-deg", type=float, default=42.0)
-    parser.add_argument("--hole-roll-deg", type=float, default=180.0)
+    parser.add_argument("--left-hole-x-mm", type=float, default=0.0, help="左手相对 hole 的 base_link X 偏移，默认 0 mm。")
+    parser.add_argument("--left-hole-y-mm", type=float, default=0.0, help="左手相对 hole 的 base_link Y 偏移，默认 0 mm。")
+    parser.add_argument("--left-hole-z-mm", type=float, default=100.0, help="左手相对 hole 的 base_link Z 偏移，默认 100 mm。")
+    parser.add_argument("--left-hole-yaw-deg", type=float, default=20.0)
+    parser.add_argument("--left-hole-pitch-deg", type=float, default=42.0)
+    parser.add_argument("--left-hole-roll-deg", type=float, default=180.0)
+    parser.add_argument("--right-hole-x-mm", type=float, default=0.0, help="右手批头相对 hole 的 base_link X 偏移，默认 0 mm。")
+    parser.add_argument("--right-hole-y-mm", type=float, default=20.0, help="右手批头相对 hole 的 base_link Y 偏移，默认 20 mm。")
+    parser.add_argument("--right-hole-z-mm", type=float, default=200.0, help="右手批头相对 hole 的 base_link Z 偏移，默认 200 mm。")
+    parser.add_argument("--right-hole-yaw-deg", type=float, default=20.0)
+    parser.add_argument("--right-hole-pitch-deg", type=float, default=0.0)
+    parser.add_argument("--right-hole-roll-deg", type=float, default=180.0)
     parser.add_argument("--hole-sample-timeout-s", type=float, default=20.0)
     parser.add_argument("--web-host", default="127.0.0.1")
     parser.add_argument("--web-port", type=int, default=8767, help="三相机合并页面端口；0 表示关闭。")
@@ -176,14 +224,24 @@ def parse_args(argv=None) -> argparse.Namespace:
                         help="阶段叠加图停推多久后恢复原画面，默认 1 秒。")
     parser.add_argument("--right-premove-pose", default="RR1")
     parser.add_argument("--right-post-grasp-pose", default="RR2")
+    parser.add_argument(
+        "--right-grasp-distance-mm", type=float, default=152.0,
+        help="右手末端原点到电批红色抓取中心的距离，默认 152 mm。",
+    )
     parser.add_argument("--auto-speed-mm-s", type=float, default=10.0)
     parser.add_argument("--auto-preset-velocity-rad-s", type=float, default=0.08)
+    parser.add_argument("--left-seat-max-descent-mm", type=float, default=10.0,
+                        help="左臂从 LL1 向 base_link -Z 力保护下探的最大距离，默认 10 mm。")
+    parser.add_argument("--left-seat-force-threshold-n", type=float, default=3.0,
+                        help="左臂 LL1 下探相对基线三轴合力阈值，默认 3 N。")
     parser.add_argument("--preset-arrival-tolerance-rad", type=float, default=0.03)
     parser.add_argument("--preset-timeout-s", type=float, default=25.0)
     parser.add_argument("--spacemouse-speed-mm-s", type=float, default=30.0)
     parser.add_argument("--spacemouse-rotation-deg-s", type=float, default=20.0)
     parser.add_argument("--spacemouse-deadzone", type=float, default=0.12)
     parser.add_argument("--from-stage", choices=stage_names(), default=None, help="从指定阶段开始（调试用）。")
+    parser.add_argument("--through-stage", choices=stage_names(), default=None,
+                        help="执行完指定阶段后正常结束（调试用，包含该阶段）。")
     parser.add_argument("--list-stages", action="store_true", help="只打印阶段计划后退出。")
     parser.add_argument("--dry-run", action="store_true", help="只读：校验姿态文件与阶段计划，不初始化 GDK。")
     parser.add_argument("--log", type=Path, default=None)
@@ -227,13 +285,26 @@ def validate_args(args: argparse.Namespace) -> int | None:
     if args.device is None or not str(args.device).startswith("/dev/"):
         print("--device 必须是 /dev/hidrawN 路径或 udev 固定别名。", file=sys.stderr)
         return 2
+    if args.from_stage is not None and args.through_stage is not None:
+        order = stage_names()
+        if order.index(args.through_stage) < order.index(args.from_stage):
+            print("--through-stage 不能位于 --from-stage 之前。", file=sys.stderr)
+            return 2
     checks = (
         math.isfinite(args.head_samples) and 1 <= args.head_samples <= 30,
         1 <= args.head_min_inlier_samples <= args.head_samples,
         math.isfinite(args.head_max_sample_spread_mm) and 0 < args.head_max_sample_spread_mm <= 200,
         math.isfinite(args.auto_speed_mm_s) and 0 < args.auto_speed_mm_s <= 50,
         math.isfinite(args.auto_preset_velocity_rad_s) and 0 < args.auto_preset_velocity_rad_s <= 0.5,
-        math.isfinite(args.hole_above_mm) and 0 < args.hole_above_mm <= 500,
+        math.isfinite(args.left_seat_max_descent_mm) and 0 < args.left_seat_max_descent_mm <= 100,
+        math.isfinite(args.left_seat_force_threshold_n) and 0 < args.left_seat_force_threshold_n <= 50,
+        math.isfinite(args.left_hole_x_mm) and abs(args.left_hole_x_mm) <= 500,
+        math.isfinite(args.left_hole_y_mm) and abs(args.left_hole_y_mm) <= 500,
+        math.isfinite(args.left_hole_z_mm) and 0 < args.left_hole_z_mm <= 500,
+        math.isfinite(args.right_hole_x_mm) and abs(args.right_hole_x_mm) <= 500,
+        math.isfinite(args.right_hole_y_mm) and abs(args.right_hole_y_mm) <= 500,
+        math.isfinite(args.right_hole_z_mm) and 0 < args.right_hole_z_mm <= 500,
+        math.isfinite(args.right_grasp_distance_mm) and 10 <= args.right_grasp_distance_mm <= 300,
         math.isfinite(args.approach_above_mm) and 0 < args.approach_above_mm <= 500,
         1.0 <= args.spacemouse_speed_mm_s <= 30.0,
         1.0 <= args.spacemouse_rotation_deg_s <= 28.6,
@@ -439,20 +510,54 @@ def stage_left_grasp(ctx: FlowContext) -> dict:
     # A missing hole is handled inside the left stage: warn, grasp, lift, then
     # hold and wait for the next stage command instead of moving to the hole.
     targets = ctx.services.get("head_targets") or {}
-    code = run_left_cycle(services=ctx.services, argv=ctx.settings.left_argv())
+    with concise_child_stdout():
+        code = run_left_cycle(services=ctx.services, argv=ctx.settings.left_argv())
     if code != 0:
         raise SafetyError(f"左手抓取阶段返回 {code}")
     return {"returncode": code, "hole_detected": "hole" in targets}
 
 
-def stage_left_to_ll(ctx: FlowContext) -> dict:
+def stage_left_to_ll1_and_seat(ctx: FlowContext) -> dict:
+    try:
+        from .left_seat_motion import force_guarded_left_descent
+    except ImportError:
+        from left_seat_motion import force_guarded_left_descent
     records = ctx.runtime.move_left_presets(
-        ("LL1", "LL2"),
+        ("LL1",),
         velocity_rad_s=ctx.args.auto_preset_velocity_rad_s,
         arrival_tolerance_rad=ctx.args.preset_arrival_tolerance_rad,
         timeout_s=ctx.args.preset_timeout_s,
     )
-    return {"presets": [record["preset"] for record in records]}
+    descent = force_guarded_left_descent(
+        ctx.services.controller, ctx.services.robot,
+        max_distance_mm=ctx.args.left_seat_max_descent_mm,
+        force_threshold_n=ctx.args.left_seat_force_threshold_n,
+        speed_mm_s=ctx.args.auto_speed_mm_s,
+    )
+    ctx.runtime.emit_event(descent)
+    return {"presets": [record["preset"] for record in records], "descent": descent}
+
+
+def stage_left_release_lift_to_ll2(ctx: FlowContext) -> dict:
+    try:
+        from .left_seat_motion import move_left_vertical
+    except ImportError:
+        from left_seat_motion import move_left_vertical
+    released = ctx.runtime.open_left_gripper()
+    lift = move_left_vertical(
+        ctx.services.controller, distance_mm=100.0, speed_mm_s=ctx.args.auto_speed_mm_s,
+    )
+    ctx.runtime.emit_event(lift)
+    records = ctx.runtime.move_left_presets(
+        ("LL2",),
+        velocity_rad_s=ctx.args.auto_preset_velocity_rad_s,
+        arrival_tolerance_rad=ctx.args.preset_arrival_tolerance_rad,
+        timeout_s=ctx.args.preset_timeout_s,
+    )
+    return {
+        "release": released["event"], "lift": lift,
+        "presets": [record["preset"] for record in records],
+    }
 
 
 def stage_right_to_lr1(ctx: FlowContext) -> dict:
@@ -470,12 +575,37 @@ def stage_right_grasp(ctx: FlowContext) -> dict:
         from .right_apriltag_grasp_gdk import run_right_grasp_stage
     except ImportError:
         from right_apriltag_grasp_gdk import run_right_grasp_stage
-    code = run_right_grasp_stage(services=ctx.services, argv=ctx.settings.right_argv())
+    with concise_child_stdout():
+        code = run_right_grasp_stage(services=ctx.services, argv=ctx.settings.right_argv())
     if code != 0:
         raise SafetyError(f"右手抓取阶段返回 {code}")
     if ctx.services.get("right_saved_grasp_pose") is None:
         raise SafetyError("右手抓取阶段没有保存抓取位姿；无法在门2后回位")
-    return {"returncode": code}
+    workpiece = ctx.services.get("right_saved_workpiece_pose")
+    if workpiece is None:
+        raise SafetyError("右手抓取阶段没有保存电批工件位姿；无法定位批头轴线")
+    hole = (ctx.services.get("head_targets") or {}).get("hole")
+    if hole is None:
+        raise SafetyError("头部没有可用的 hole 位置；停止右手运输")
+    try:
+        from .right_hole_motion import move_right_tool_above_hole
+    except ImportError:
+        from right_hole_motion import move_right_tool_above_hole
+    transport = move_right_tool_above_hole(
+        ctx.services.controller,
+        ctx.services.get("right_saved_grasp_pose"),
+        workpiece,
+        hole["position_base_link_m"],
+        x_mm=ctx.args.right_hole_x_mm,
+        y_mm=ctx.args.right_hole_y_mm,
+        z_mm=ctx.args.right_hole_z_mm,
+        yaw_deg=ctx.args.right_hole_yaw_deg,
+        pitch_deg=ctx.args.right_hole_pitch_deg,
+        roll_deg=ctx.args.right_hole_roll_deg,
+        speed_mm_s=ctx.args.auto_speed_mm_s,
+    )
+    ctx.runtime.emit_event(transport)
+    return {"returncode": code, "transport": transport["event"]}
 
 
 def stage_right_return(ctx: FlowContext) -> dict:
@@ -514,7 +644,8 @@ STAGE_HANDLERS = {
     Stage.HEAD_LOCALIZE: stage_head_localize,
     Stage.LEFT_GRASP: stage_left_grasp,
     Stage.RIGHT_TO_LR1: stage_right_to_lr1,
-    Stage.LEFT_TO_LL: stage_left_to_ll,
+    Stage.LEFT_TO_LL1_AND_SEAT: stage_left_to_ll1_and_seat,
+    Stage.LEFT_RELEASE_LIFT_TO_LL2: stage_left_release_lift_to_ll2,
     Stage.RIGHT_GRASP: stage_right_grasp,
     Stage.RIGHT_RETURN: stage_right_return,
     Stage.FINISH: stage_finish,
@@ -549,6 +680,7 @@ def run_flow(args: argparse.Namespace) -> int:
         Path(args.log).expanduser() if args.log is not None
         else PROJECT_ROOT / "logs" / f"bilateral_flow_{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}.jsonl"
     )
+    args.log = log_path
     cameras: list = []
     worker = None
     dianpi = None
@@ -565,7 +697,11 @@ def run_flow(args: argparse.Namespace) -> int:
         controller = G2Controller(agibot_gdk, robot, allow_motion=True, motion_gate=gate)
         controller.checked_arm_state()
         def flow_event_sink(event: dict) -> None:
-            print(json.dumps(event, ensure_ascii=False), flush=True)
+            record = {"utc": datetime.now(timezone.utc).isoformat(), **event}
+            append_jsonl_record(log_path, record)
+            summary = console_event_summary(record)
+            if summary is not None:
+                print(summary, flush=True)
 
         dianpi = DianpiCycleRunner(event_sink=flow_event_sink)
         dianpi.start_p10_monitor()
@@ -590,13 +726,13 @@ def run_flow(args: argparse.Namespace) -> int:
         cameras = [head_camera, left_camera, right_camera]
         tf = agibot_gdk.TF()
 
-        print(json.dumps({"event": "bilateral_models_preload_start"}, ensure_ascii=False), flush=True)
+        flow_event_sink({"event": "bilateral_models_preload_start"})
         models = PreloadedModels(
             head_yolo=load_yolo_segmentation_model(Path(args.head_yolo_model), device=args.yolo_device),
             left_yolo=load_yolo_segmentation_model(Path(args.left_yolo_model), device=args.yolo_device),
             apriltag_detector=detector_for_41h12(),
         )
-        print(json.dumps({"event": "bilateral_models_preloaded", "sam3": "not_loaded"}, ensure_ascii=False), flush=True)
+        flow_event_sink({"event": "bilateral_models_preloaded", "sam3": "not_loaded"})
 
         if args.web_port:
             web = BilateralWeb(host=args.web_host, port=args.web_port)
@@ -613,7 +749,7 @@ def run_flow(args: argparse.Namespace) -> int:
             )
             for label, pane_camera, color_type in camera_sources:
                 report = warmup_camera(agibot_gdk, pane_camera, color_type, label)
-                print(json.dumps({"event": "camera_warmup", **report}, ensure_ascii=False), flush=True)
+                flow_event_sink({"event": "camera_warmup", **report})
                 if not report["ok"]:
                     print(
                         f"警告：{label} 相机预热失败，页面该格会显示错误信息并持续重试：{report['error']}",
@@ -702,6 +838,34 @@ def run_flow(args: argparse.Namespace) -> int:
 
 
 def _drive(ctx: FlowContext, args: argparse.Namespace) -> int:
+    if args.from_stage is not None:
+        order = stage_names()
+        if order.index(args.from_stage) > order.index(Stage.HEAD_LOCALIZE.value):
+            ctx.runtime.emit(
+                "stage_prerequisite_start",
+                stage=Stage.HEAD_LOCALIZE.value,
+                reason=f"--from-stage {args.from_stage} 仍依赖本次运行的 hole 定位",
+            )
+            print("[前置定位] 正在重新定位 head hinge / hole…", flush=True)
+            feed = ctx.feeds.get("head")
+            if feed is not None:
+                feed.pause()
+            try:
+                payload = STAGE_HANDLERS[Stage.HEAD_LOCALIZE](ctx)
+            except Exception as exc:  # noqa: BLE001 - prerequisite failure stops all later motion
+                ctx.runtime.emit("stage_failed", stage=Stage.HEAD_LOCALIZE.value, error=str(exc))
+                print(f"前置阶段 {Stage.HEAD_LOCALIZE.value} 失败：{exc}", file=sys.stderr)
+                return 1
+            finally:
+                if feed is not None:
+                    feed.resume()
+            ctx.runtime.emit(
+                "stage_prerequisite_complete",
+                stage=Stage.HEAD_LOCALIZE.value,
+                for_stage=args.from_stage,
+                **(payload or {}),
+            )
+            print("[前置定位完成] 已取得本次运行的 hole 位置。", flush=True)
     sequencer = StageSequencer(start_at=args.from_stage)
     while not sequencer.is_done:
         spec = sequencer.current
@@ -717,14 +881,6 @@ def _drive(ctx: FlowContext, args: argparse.Namespace) -> int:
             if spec.waits_for_advance:
                 ctx.runtime.wait_for_advance(spec)
                 payload = {"gate": spec.stage.value}
-                if spec.stage is Stage.GATE_LEFT:
-                    # The first long press also releases the left jaw.  With a
-                    # hole the hold step is skipped, so gate 1 is where the
-                    # operator asks the hand to let go of the part.
-                    released = ctx.runtime.open_left_gripper()
-                    payload["left_gripper_position_rad"] = released["actual_position_rad"].get("left")
-                    payload["left_gripper_attempts"] = released["command_attempts"].get("left")
-                    print("门1 长按后已张开左爪。", flush=True)
             else:
                 payload = STAGE_HANDLERS[spec.stage](ctx)
         except Exception as exc:  # noqa: BLE001 - reported and stops the sequence
@@ -739,8 +895,14 @@ def _drive(ctx: FlowContext, args: argparse.Namespace) -> int:
         stage_fields = dict(payload or {})
         stage_fields["stage"] = spec.stage.value
         ctx.runtime.emit("stage_complete", **stage_fields)
+        if args.through_stage == spec.stage.value:
+            ctx.runtime.emit(
+                "bilateral_flow_stopped_at_stage",
+                stage=spec.stage.value,
+                completed=sequencer.results,
+            )
+            return 0
     ctx.runtime.emit("bilateral_flow_complete", **sequencer.summary())
-    print("左右手分阶段流程全部完成。", flush=True)
     return 0
 
 

@@ -28,11 +28,57 @@ except ImportError:
 OPEN_GRIPPER_RAD = -0.785
 GRIPPER_OPEN_TOLERANCE_RAD = 0.035
 
+
+def console_event_summary(record: dict) -> str | None:
+    """Return one short operator-facing line; full records stay in JSONL."""
+    event = record.get("event")
+    if event == "stage_start":
+        return f"[阶段开始] {record.get('title', record.get('stage'))} ({record.get('stage')})"
+    if event == "stage_complete":
+        return f"[阶段完成] {record.get('stage')}"
+    if event == "stage_failed":
+        return None  # The sequencer writes the same concise failure to stderr.
+    if event == "left_preset_arrived":
+        return f"[到位] {record.get('preset')}"
+    if event == "right_preset_arrived":
+        return f"[到位] {record.get('preset')}"
+    if event == "left_seat_descent_complete":
+        reason = {"force_threshold": "力阈值", "max_distance": "最大距离"}.get(
+            record.get("stop_reason"), record.get("stop_reason"),
+        )
+        return (
+            f"[下探完成] 原因={reason} 距离={record.get('descent_mm')} mm "
+            f"力变化={record.get('delta_force_n')} N"
+        )
+    if event == "left_release_lift_complete":
+        return f"[上抬完成] {record.get('distance_mm')} mm"
+    if event == "stage_waiting_for_advance":
+        return f"[等待确认] {record.get('stage')}：SpaceMouse 右按钮长按2秒"
+    if event == "stage_advance_received":
+        return f"[确认收到] {record.get('stage')}"
+    if event == "bilateral_flow_stopped_at_stage":
+        return f"[调试结束] 已完成 {record.get('stage')}"
+    if event == "bilateral_flow_complete":
+        return "[流程完成] 双臂流程全部完成"
+    if event == "bilateral_models_preload_start":
+        return "[初始化] 正在加载视觉模型…"
+    if event == "bilateral_models_preloaded":
+        return "[初始化] 视觉模型加载完成"
+    if record.get("level") == "warning":
+        return f"[警告] {record.get('reason', event)}"
+    return None
+
+
+def append_jsonl_record(path: Path, record: dict) -> None:
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as stream:
+        stream.write(json.dumps(record, ensure_ascii=False) + "\n")
+
 # Presets owned by the staged flow, with the arm each one must be recorded for.
 STAGED_PRESETS: dict[str, str] = {
     "LR1": "right",
     "RR1": "right",
-    "RR2": "right",
     "LL1": "left",
     "LL2": "left",
 }
@@ -81,11 +127,11 @@ class BilateralRuntime:
     def emit_event(self, event: dict) -> dict:
         record = {"utc": datetime.now(timezone.utc).isoformat(), **event}
         self.events.append(record)
-        print(json.dumps(record, ensure_ascii=False), flush=True)
         if self.journal_path is not None:
-            self.journal_path.parent.mkdir(parents=True, exist_ok=True)
-            with self.journal_path.open("a", encoding="utf-8") as stream:
-                stream.write(json.dumps(record, ensure_ascii=False) + "\n")
+            append_jsonl_record(self.journal_path, record)
+        summary = console_event_summary(record)
+        if summary is not None:
+            print(summary, flush=True)
         return record
 
     def emit(self, event: str, **fields: Any) -> dict:

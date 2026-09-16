@@ -108,6 +108,7 @@ class TeleopSession:
         self._last_click = [-math.inf, -math.inf]
         self._right_down_since: float | None = None
         self._right_was_down = False
+        self._right_pending_click: float | None = None
         self._left_down_since: float | None = None
         self._left_was_down = False
         self._left_long = False
@@ -204,6 +205,20 @@ class TeleopSession:
         self._gripper_open[self.side] = positions[0] < OPEN_RAD / 2
         self._gripper_goal = None
 
+    def cancel_pending_gripper_click(self) -> None:
+        """Cancel a first right click after the owner recognizes a double click."""
+        self._right_pending_click = None
+
+    def _apply_pending_gripper_click(self, now: float) -> None:
+        pending = self._right_pending_click
+        if pending is None or now - pending <= DOUBLE_CLICK_WINDOW_S:
+            return
+        self._right_pending_click = None
+        self._last_click[1] = now
+        self._gripper_open[self.side] = not self._gripper_open[self.side]
+        self._gripper_goal = OPEN_RAD if self._gripper_open[self.side] else CLOSE_RAD
+        self.event = 'gripper_open' if self._gripper_open[self.side] else 'gripper_close'
+
     def tick(self, frame: InputFrame, now: float) -> str:
         if self._stopped or self._failed:
             raise SafetyError('遥操作已停止；需要重新启动')
@@ -264,6 +279,7 @@ class TeleopSession:
             return self.event
 
         self._healthy()
+        self._apply_pending_gripper_click(now)
         if self._switch_at is not None:
             if now < self._switch_at or not batch_centered or any(frame.buttons):
                 self.event = 'switch_wait_neutral'
@@ -323,10 +339,11 @@ class TeleopSession:
         self._right_was_down = right_down
         right_click = right_click and now - self._last_click[1] >= .25
         if right_click:
-            self._last_click[1] = now
-            self._gripper_open[self.side] = not self._gripper_open[self.side]
-            self._gripper_goal = OPEN_RAD if self._gripper_open[self.side] else CLOSE_RAD
-            self.event = 'gripper_open' if self._gripper_open[self.side] else 'gripper_close'
+            pending = self._right_pending_click
+            if pending is not None and now - pending <= DOUBLE_CLICK_WINDOW_S:
+                self._right_pending_click = None
+            else:
+                self._right_pending_click = now
 
         # Integrate one velocity step from the latest measured pose. Using
         # the previous command as the base lets normal servo latency compound
