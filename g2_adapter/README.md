@@ -46,7 +46,7 @@ shaft 关联和坐标方向稳定后，再讨论 direct 真实运动。原有 `-
 
 如果需要直接采集实时数据，使用 `capture_right_hole_target_yolo_dataset.py`。它只打开右手彩色相机，网页持续刷新实时画面；冻结时运行一次 YOLO 预标，修正后保存为 `hole/target` 框。空画面也可以保存，作为负样本。
 
-更推荐先用 `record_right_camera_video.py` 录制右手彩色视频，再用 `annotate_hole_target_video.py` 离线抽帧和修框。这样可以重复回放、补标困难帧，并按场景分组划分训练/测试集。
+更推荐先用 `record_camera_video.py --streams right_color` 录制右手彩色视频，再用 `annotate_hole_target_video.py` 离线抽帧和修框。脚本也支持单进程同时录制六路 RGB-D；深度流同时保存伪彩 MP4 和无损 Z16 PNG。这样可以重复回放、补标困难帧，并按场景分组划分训练/测试集。
 
 多台电脑完成标注后，使用 `merge_hole_target_annotations.py` 合并各目录的 `images/` 和 `labels/`，生成可直接训练的 `data.yaml`。
 
