@@ -53,7 +53,7 @@ def console_event_summary(record: dict) -> str | None:
     if event == "left_release_lift_complete":
         return f"[上抬完成] {record.get('distance_mm')} mm"
     if event == "stage_waiting_for_advance":
-        return f"[等待确认] {record.get('stage')}：SpaceMouse 右按钮长按2秒"
+        return f"[等待确认] {record.get('stage')}：SpaceMouse 右按钮长按2秒或键盘 Enter"
     if event == "stage_advance_received":
         return f"[确认收到] {record.get('stage')}"
     if event == "bilateral_flow_stopped_at_stage":
@@ -169,6 +169,8 @@ class BilateralRuntime:
         report: dict[str, Any] = {}
         missing: list[str] = []
         for name, side in STAGED_PRESETS.items():
+            if name == "LL1" and getattr(self.args, "left_placement_method", "original") == "teach":
+                continue
             try:
                 self.load_preset(name)
                 report[name] = {"side": side, "ok": True}
@@ -333,7 +335,7 @@ class BilateralRuntime:
         stage_name = getattr(stage, "value", str(stage))
         self.emit(
             "stage_waiting_for_advance", stage=stage_name,
-            source="spacemouse_right_long_press_2s", takeover_available=True,
+            source="spacemouse_right_long_press_2s_or_enter", takeover_available=True,
         )
         previous = self.worker.allow_advance_right
         self.worker.allow_advance_right = True

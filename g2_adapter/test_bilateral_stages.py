@@ -27,8 +27,8 @@ class BilateralStagePlanTests(unittest.TestCase):
         expected = {
             Stage.HEAD_LOCALIZE: "head",
             Stage.LEFT_GRASP: "left",
-            Stage.LEFT_TO_LL1_AND_SEAT: "left",
-            Stage.LEFT_RELEASE_LIFT_TO_LL2: "left",
+            Stage.LEFT_TO_LL1_AND_SEAT: None,
+            Stage.LEFT_RELEASE_LIFT_TO_LL2: None,
             Stage.RIGHT_TO_LR1: "right",
             Stage.RIGHT_GRASP: "right",
             Stage.RIGHT_RETURN: "right",

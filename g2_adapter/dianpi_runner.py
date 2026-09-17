@@ -202,10 +202,22 @@ class DianpiCycleRunner:
                     })
                     return
                 self._emit({"event": "dianpi_error", "source": "p10_monitor", "error": str(exc)})
-                # A missed read must not suppress a real low edge on the
-                # next successful read.
-                previous_start = 1
-                self._monitor_stop.wait(max(0.5, poll_period_s))
+                # Reconnection establishes a baseline, not a falling edge.
+                # A held-low start must never replay a failed cycle.
+                previous_start = None
+                # Drop a broken idle connection so the next attempt really
+                # reopens USB. Never close a controller owned by a cycle.
+                with self._open_lock:
+                    with self._lock:
+                        broken = self._controller if not self._running else None
+                        if broken is not None:
+                            self._controller = None
+                    if broken is not None:
+                        try:
+                            broken.close()
+                        except Exception:
+                            pass
+                self._monitor_stop.wait(5.0)
                 continue
             self._monitor_stop.wait(poll_period_s)
 

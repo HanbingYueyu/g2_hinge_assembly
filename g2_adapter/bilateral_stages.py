@@ -58,9 +58,10 @@ DEFAULT_PLAN: tuple[StageSpec, ...] = (
     StageSpec(Stage.LEFT_GRASP, "左臂到铰链上方→视觉伺服抓取→上抬 150 mm→到 hole XYZ 偏移位置", "3", camera_pane="left"),
     StageSpec(Stage.VLM_GRIPPER_CHECK, "VLM 只读检查左夹爪是否仍夹持铰链", "3"),
     StageSpec(Stage.RIGHT_TO_LR1, "右臂移动到 LR1", "4", camera_pane="right"),
-    StageSpec(Stage.LEFT_TO_LL1_AND_SEAT, "左臂移动到 LL1 并力保护下探", "5", camera_pane="left"),
+    # Motion-only handlers do not publish frames: keep the raw camera feed live.
+    StageSpec(Stage.LEFT_TO_LL1_AND_SEAT, "左臂移动到 LL1 并力保护下探", "5"),
     StageSpec(Stage.GATE_LEFT, "等待 SpaceMouse 下一阶段指令（门1）", "5", waits_for_advance=True),
-    StageSpec(Stage.LEFT_RELEASE_LIFT_TO_LL2, "张开左爪、上抬 100 mm 并移动到 LL2", "5", camera_pane="left"),
+    StageSpec(Stage.LEFT_RELEASE_LIFT_TO_LL2, "张开左爪、上抬 100 mm 并移动到 LL2", "5"),
     StageSpec(Stage.VLM_ASSEMBLY_CHECK, "VLM 只读检查凸轴 B 与明显 C 孔外漏", "5"),
     StageSpec(
         Stage.RIGHT_GRASP,

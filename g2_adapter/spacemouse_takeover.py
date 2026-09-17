@@ -32,6 +32,10 @@ RIGHT_LONG_PRESS_S = 2.0
 INACTIVITY_TIMEOUT_S = 3.0
 
 
+class TeachReplayTakenOver(RuntimeError):
+    """A taught replay was ended by manual takeover, not temporarily paused."""
+
+
 class TakeoverEvent(str, Enum):
     NONE = "none"
     TAKEOVER_LEFT = "takeover_left"
@@ -303,6 +307,23 @@ class MotionPauseGate:
                 raise AdvanceRightRequested("SpaceMouse 请求从左手阶段进入右手阶段")
 
     @contextmanager
+    def automatic_teach_motion(self, generation: int) -> Iterator[None]:
+        """Keep normal writer ownership, but never wait/resume a taken-over replay."""
+        with self._writer_lock:
+            with self._condition:
+                if self._advance_requested:
+                    raise AdvanceRightRequested("确认进入下一阶段")
+                if self._paused or self._pause_generation != generation:
+                    raise TeachReplayTakenOver("SpaceMouse 接管，结束示教回放")
+                self.wait_for_auto()
+            yield
+            with self._condition:
+                if self._advance_requested:
+                    raise AdvanceRightRequested("确认进入下一阶段")
+                if self._paused or self._pause_generation != generation:
+                    raise TeachReplayTakenOver("SpaceMouse 接管，结束示教回放")
+
+    @contextmanager
     def automatic_motion(self) -> Iterator[None]:
         """Reserve the single robot writer for one automatic GDK request."""
         while True:
@@ -379,6 +400,7 @@ class SpaceMouseTakeoverWorker:
         self.active_side: str | None = None
         self._session = None
         self._advance_requested = False
+        self._keyboard_advance = threading.Event()
         self._failed: BaseException | None = None
         self._connected = False
         self._last_disconnect: str | None = None
@@ -390,6 +412,23 @@ class SpaceMouseTakeoverWorker:
     @property
     def advance_requested(self) -> bool:
         return self._advance_requested
+
+    def request_keyboard_advance(self) -> None:
+        # Only the HID worker may release a manual session or write to GDK.
+        if self.allow_advance_right:
+            self._keyboard_advance.set()
+
+    def _process_keyboard_advance(self) -> bool:
+        if not self._keyboard_advance.is_set():
+            return False
+        self._keyboard_advance.clear()
+        if not self.allow_advance_right:
+            return False
+        if self._session is not None:
+            self._deactivate(resume=False)
+        self.gate.request_advance()
+        self._advance_requested = True
+        return True
 
     def consume_advance(self) -> None:
         """Consume one pending advance request and let automatic motion resume."""
@@ -497,6 +536,8 @@ class SpaceMouseTakeoverWorker:
 
     def step(self, frame: InputFrame, now: float) -> GestureResult:
         result = self.gestures.update(frame, now)
+        if self._process_keyboard_advance():
+            return result
         if TakeoverEvent.START_DIANPI in result.events:
             if self.dianpi_runner is None:
                 self._emit_dianpi({
@@ -586,6 +627,7 @@ class SpaceMouseTakeoverWorker:
                 except ImportError:
                     from spacemouse_input import InputError
             while not self._stop.is_set():
+                self._process_keyboard_advance()
                 try:
                     with hid_factory(self.device) as source:
                         self.gestures = SpaceMouseGestureState(deadzone=self.config.deadzone)

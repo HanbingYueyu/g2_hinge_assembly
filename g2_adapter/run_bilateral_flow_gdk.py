@@ -29,12 +29,14 @@ try:
     from .bilateral_stages import DEFAULT_PLAN, Stage, StageSequencer, stage_names
     from .bilateral_web import BilateralWeb, RawPaneFeed
     from .safety import SafetyError
+    from .keyboard_stage_advance import KeyboardStageAdvance
 except ImportError:
     from bilateral_runtime import BilateralRuntime, PreloadedModels, append_jsonl_record, console_event_summary
     from bilateral_services import StageServices
     from bilateral_stages import DEFAULT_PLAN, Stage, StageSequencer, stage_names
     from bilateral_web import BilateralWeb, RawPaneFeed
     from safety import SafetyError
+    from keyboard_stage_advance import KeyboardStageAdvance
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -204,12 +206,22 @@ def parse_args(argv=None) -> argparse.Namespace:
     parser.add_argument("--approach-roll-deg", type=float, default=180.0, help="到铰链上方时的滚转角，默认 180。")
     parser.add_argument("--approach-above-mm", type=float, default=100.0, help="铰链上方距离，默认 100 mm。")
     parser.add_argument("--left-hole-x-mm", type=float, default=0.0, help="左手相对 hole 的 base_link X 偏移，默认 0 mm。")
+    parser.add_argument("--left-placement-method", choices=("original", "teach"), default="original", help="到达左手 hole 偏移点后，使用原 LL1/下压方法或示教轨迹。")
+    parser.add_argument("--left-teach-trajectory", type=Path, help="从左手 hole 偏移点之后开始、不含松爪的左臂示教 JSON。")
+    parser.add_argument("--left-teach-speed-scale", type=float, default=0.2)
+    parser.add_argument("--left-teach-start-velocity-rad-s", type=float, default=0.05)
     parser.add_argument("--left-hole-y-mm", type=float, default=0.0, help="左手相对 hole 的 base_link Y 偏移，默认 0 mm。")
     parser.add_argument("--left-hole-z-mm", type=float, default=100.0, help="左手相对 hole 的 base_link Z 偏移，默认 100 mm。")
     parser.add_argument("--left-hole-yaw-deg", type=float, default=20.0)
     parser.add_argument("--left-hole-pitch-deg", type=float, default=42.0)
     parser.add_argument("--left-hole-roll-deg", type=float, default=180.0)
     parser.add_argument("--right-hole-x-mm", type=float, default=0.0, help="右手批头相对 hole 的 base_link X 偏移，默认 0 mm。")
+    parser.add_argument("--right-placement-method", choices=("original", "teach"), default="original", help="到右手 hole 偏移点后，保持原流程或执行示教轨迹。")
+    right_teach_files = parser.add_mutually_exclusive_group()
+    right_teach_files.add_argument("--right-teach-trajectory", type=Path, help="单段右臂示教 JSON（保留原用法）。")
+    right_teach_files.add_argument("--right-teach-trajectories", type=Path, nargs=4, metavar="JSON", help="按顺序指定4段右臂轨迹，第一段自动开始，后续右键长按2秒开始。")
+    parser.add_argument("--right-teach-speed-scale", type=float, default=0.2)
+    parser.add_argument("--right-teach-start-velocity-rad-s", type=float, default=0.05)
     parser.add_argument("--right-hole-y-mm", type=float, default=20.0, help="右手批头相对 hole 的 base_link Y 偏移，默认 20 mm。")
     parser.add_argument("--right-hole-z-mm", type=float, default=200.0, help="右手批头相对 hole 的 base_link Z 偏移，默认 200 mm。")
     parser.add_argument("--right-hole-yaw-deg", type=float, default=20.0)
@@ -263,6 +275,26 @@ def print_stage_plan() -> None:
 
 
 def run_dry_run(args: argparse.Namespace) -> int:
+    if args.right_placement_method == "teach":
+        try:
+            try:
+                from .right_teach_placement import validate_right_teach_args
+            except ImportError:
+                from right_teach_placement import validate_right_teach_args
+            validate_right_teach_args(args)
+        except (ValueError, OSError) as exc:
+            print(f"右手示教参数错误：{exc}", file=sys.stderr)
+            return 2
+    if args.left_placement_method == "teach":
+        try:
+            try:
+                from .left_teach_placement import validate_teach_args
+            except ImportError:
+                from left_teach_placement import validate_teach_args
+            validate_teach_args(args)
+        except (ValueError, OSError) as exc:
+            print(f"左手示教参数错误：{exc}", file=sys.stderr)
+            return 2
     runtime = BilateralRuntime(args=args, controller=None)
     report = runtime.validate_plan_assets()
     home_ok, home_error = True, None
@@ -288,6 +320,26 @@ def run_dry_run(args: argparse.Namespace) -> int:
 
 
 def validate_args(args: argparse.Namespace) -> int | None:
+    if args.right_placement_method == "teach":
+        try:
+            try:
+                from .right_teach_placement import validate_right_teach_args
+            except ImportError:
+                from right_teach_placement import validate_right_teach_args
+            validate_right_teach_args(args)
+        except (ValueError, OSError) as exc:
+            print(f"右手示教参数错误：{exc}", file=sys.stderr)
+            return 2
+    if args.left_placement_method == "teach":
+        try:
+            try:
+                from .left_teach_placement import validate_teach_args
+            except ImportError:
+                from left_teach_placement import validate_teach_args
+            validate_teach_args(args)
+        except (ValueError, OSError) as exc:
+            print(f"左手示教参数错误：{exc}", file=sys.stderr)
+            return 2
     if args.device is None or not str(args.device).startswith("/dev/"):
         print("--device 必须是 /dev/hidrawN 路径或 udev 固定别名。", file=sys.stderr)
         return 2
@@ -534,6 +586,12 @@ def stage_left_grasp(ctx: FlowContext) -> dict:
 
 
 def stage_left_to_ll1_and_seat(ctx: FlowContext) -> dict:
+    if ctx.args.left_placement_method == "teach":
+        try:
+            from .left_teach_placement import replay_left_placement
+        except ImportError:
+            from left_teach_placement import replay_left_placement
+        return replay_left_placement(ctx.services, ctx.args)
     try:
         from .left_seat_motion import force_guarded_left_descent
     except ImportError:
@@ -618,6 +676,11 @@ def stage_right_grasp(ctx: FlowContext) -> dict:
         from right_apriltag_grasp_gdk import run_right_grasp_stage
     with concise_child_stdout():
         code = run_right_grasp_stage(services=ctx.services, argv=ctx.settings.right_argv())
+    # The child no longer reads/publishes camera frames after returning.
+    # Restore the raw feed now, not after the subsequent transport and replay.
+    feed = ctx.feeds.get("right")
+    if feed is not None:
+        feed.resume()
     if code != 0:
         raise SafetyError(f"右手抓取阶段返回 {code}")
     if ctx.services.get("right_saved_grasp_pose") is None:
@@ -646,7 +709,15 @@ def stage_right_grasp(ctx: FlowContext) -> dict:
         speed_mm_s=ctx.args.auto_speed_mm_s,
     )
     ctx.runtime.emit_event(transport)
-    return {"returncode": code, "transport": transport["event"]}
+    result = {"returncode": code, "transport": transport["event"]}
+    if ctx.args.right_placement_method == "teach":
+        try:
+            from .right_teach_placement import run_right_teach_sequence
+        except ImportError:
+            from right_teach_placement import run_right_teach_sequence
+        print("右手已到 hole 偏移点；开始示教回放。", flush=True)
+        result["placement"] = run_right_teach_sequence(ctx.services, ctx.args, ctx.runtime)
+    return result
 
 
 def stage_right_return(ctx: FlowContext) -> dict:
@@ -664,6 +735,15 @@ def stage_right_return(ctx: FlowContext) -> dict:
             json.loads(Path(ctx.args.right_config).expanduser().read_text(encoding="utf-8")), "config",
         )
     events: list[dict] = []
+    if getattr(ctx.args, "right_placement_method", "original") == "teach":
+        try:
+            from .right_hole_motion import lift_right_before_return
+        except ImportError:
+            from right_hole_motion import lift_right_before_return
+        print("右手归位前先上抬 20 mm…", flush=True)
+        ctx.runtime.emit_event(lift_right_before_return(
+            ctx.services.controller, speed_mm_s=ctx.args.auto_speed_mm_s,
+        ))
     return_screwdriver(
         ctx.services.controller, saved, config, events.append, release=False,
     )
@@ -726,6 +806,7 @@ def run_flow(args: argparse.Namespace) -> int:
     args.log = log_path
     cameras: list = []
     worker = None
+    keyboard = None
     dianpi = None
     web: BilateralWeb | None = None
     runtime: BilateralRuntime | None = None
@@ -762,6 +843,8 @@ def run_flow(args: argparse.Namespace) -> int:
             event_sink=flow_event_sink,
         )
         worker.start()
+        keyboard = KeyboardStageAdvance(worker)
+        keyboard.start()
 
         head_camera = agibot_gdk.Camera([agibot_gdk.CameraType.kHeadColor, agibot_gdk.CameraType.kHeadDepth])
         left_camera = agibot_gdk.Camera([agibot_gdk.CameraType.kHandLeftColor, agibot_gdk.CameraType.kHandLeftDepth])
@@ -851,6 +934,8 @@ def run_flow(args: argparse.Namespace) -> int:
                 feed.stop()
             except Exception:
                 pass
+        if keyboard is not None:
+            keyboard.stop()
         if worker is not None:
             try:
                 worker.stop()
