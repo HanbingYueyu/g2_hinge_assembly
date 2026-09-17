@@ -4,6 +4,7 @@ import json
 import urllib.error
 import urllib.request
 import unittest
+import threading
 
 from bilateral_web import PANE_NAMES, BilateralWeb, RawPaneFeed, _Pane
 
@@ -128,6 +129,29 @@ class RawFallbackTests(unittest.TestCase):
 
 
 class RawPaneFeedTests(unittest.TestCase):
+    def test_pause_drains_inflight_read_before_stage_can_own_camera(self):
+        reading = threading.Event()
+        release = threading.Event()
+        paused = threading.Event()
+        def read():
+            reading.set()
+            release.wait(1)
+            return b'raw'
+        feed = self.make_feed(read)
+        reader = threading.Thread(target=feed.step)
+        reader.start()
+        self.assertTrue(reading.wait(1))
+        pauser = threading.Thread(target=lambda: (feed.pause(), paused.set()))
+        pauser.start()
+        try:
+            self.assertFalse(paused.wait(.05), 'pause returned with camera read still active')
+        finally:
+            release.set()
+            reader.join(1)
+            pauser.join(1)
+        self.assertTrue(paused.is_set())
+        self.assertEqual(feed.step(), 'paused')
+
     def setUp(self) -> None:
         self.web = BilateralWeb(host="127.0.0.1", port=0)
         self.addCleanup(self.web.stop)
@@ -144,12 +168,14 @@ class RawPaneFeedTests(unittest.TestCase):
         self.assertEqual(self.web.snapshot_pane("head")[0], b"raw")
         self.assertEqual(feed.published, 1)
 
-    def test_feed_backs_off_while_an_overlay_is_fresh(self):
+    def test_feed_caches_original_without_replacing_fresh_overlay(self):
         self.web.pane("head").update(b"overlay", {"state": "head_yolo"})
         called = []
         feed = self.make_feed(lambda: called.append(True) or b"raw")
         self.assertEqual(feed.step(), "overlay")
-        self.assertEqual(called, [])
+        self.assertEqual(called, [True])
+        self.assertEqual(self.web.snapshot_raw_pane('head')[0], b'raw')
+        self.assertEqual(self.web.snapshot_pane('head')[0], b'overlay')
         self.assertEqual(feed.skipped, 1)
 
     def test_feed_does_not_touch_a_camera_that_a_stage_owns(self):

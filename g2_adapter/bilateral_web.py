@@ -112,6 +112,9 @@ class BilateralWeb:
         self.title = str(title)
         self._lock = threading.Lock()
         self._frames: dict[str, bytes | None] = {name: None for name in PANE_NAMES}
+        self._raw_frames = {name: None for name in PANE_NAMES}
+        self._raw_status = {name: {} for name in PANE_NAMES}
+        self._raw_at = {name: float('-inf') for name in PANE_NAMES}
         self._status: dict[str, dict] = {name: {"state": f"{name}_waiting"} for name in PANE_NAMES}
         self._sequence: dict[str, int] = {name: 0 for name in PANE_NAMES}
         # Last time a stage pushed an annotated frame into this pane.  The raw
@@ -158,11 +161,14 @@ class BilateralWeb:
         """
         if name not in self._frames:
             raise ValueError(f"unknown camera pane: {name}")
-        if self.overlay_age(name) < float(hold_s):
-            return False
         if jpeg is None:
             return False
         with self._lock:
+            self._raw_frames[name] = bytes(jpeg)
+            self._raw_status[name] = dict(status)
+            self._raw_at[name] = time.monotonic()
+            if time.monotonic() - self._overlay_at[name] < float(hold_s):
+                return False
             self._frames[name] = jpeg
             self._status[name] = dict(status)
             self._sequence[name] += 1
@@ -200,6 +206,14 @@ class BilateralWeb:
     def snapshot_pane(self, name: str) -> tuple[bytes | None, dict]:
         with self._lock:
             return self._frames[name], dict(self._status[name])
+
+    def snapshot_raw_pane(self, name: str) -> tuple[bytes | None, dict]:
+        """Original camera JPEG only; never fall back to an annotated frame."""
+        with self._lock:
+            return self._raw_frames[name], {
+                **self._raw_status[name],
+                'raw_age_s': max(0.0, time.monotonic() - self._raw_at[name]),
+            }
 
     def snapshot(self) -> tuple[bytes | None, dict]:
         return self.snapshot_pane("left")
@@ -246,15 +260,16 @@ class BilateralWeb:
                         "application/json; charset=utf-8",
                     )
                     return
-                if path.startswith("/frame/"):
-                    name = path[len("/frame/"):]
+                if path.startswith(("/frame/", "/raw/")):
+                    raw = path.startswith("/raw/")
+                    name = path[len("/raw/") if raw else len("/frame/"):]
                     if name.endswith(".jpg"):
                         name = name[: -len(".jpg")]
                     if name not in PANE_NAMES:
                         self.send_error(HTTPStatus.NOT_FOUND, "unknown pane")
                         return
-                    image, _status = owner.snapshot_pane(name)
-                    if image is None:
+                    image, _status = owner.snapshot_raw_pane(name) if raw else owner.snapshot_pane(name)
+                    if image is None or (raw and _status.get('raw_age_s', float('inf')) > 1.0):
                         self.send_error(HTTPStatus.SERVICE_UNAVAILABLE, "waiting for first frame")
                         return
                     self._bytes(image, "image/jpeg")
@@ -298,8 +313,8 @@ class RawPaneFeed:
 
     The staged flow only annotates one camera at a time.  This feed publishes
     the raw frame for its pane whenever the stages are not publishing an
-    overlay there, and stays completely off the camera while an overlay is
-    fresh, so it never competes with a running perception worker.
+    overlay there. Camera ownership is handed off by pause/resume; the
+    original-image cache also refreshes while a recent overlay remains visible.
     """
 
     def __init__(self, pane_name: str, read_jpeg, web: BilateralWeb, *, hold_s: float = 1.0,
@@ -321,22 +336,29 @@ class RawPaneFeed:
         self.last_error: BaseException | None = None
         self._stop = threading.Event()
         self._paused = threading.Event()
+        self._read_lock = threading.Lock()
         self._thread: threading.Thread | None = None
 
     def pause(self) -> None:
         """Stop touching this camera while a stage owns it."""
         self._paused.set()
+        with self._read_lock:
+            pass  # Drain a read already in flight before a stage takes ownership.
 
     def resume(self) -> None:
         self._paused.clear()
 
     def step(self) -> str:
         """Run one iteration; returns paused/overlay/published/empty/error."""
+        with self._read_lock:
+            return self._step()
+
+    def _step(self) -> str:
         if self._paused.is_set():
             return "paused"
-        if self.web.overlay_age(self.pane_name, now=self.clock()) < self.hold_s:
-            self.skipped += 1
-            return "overlay"
+        # When no stage owns the camera, keep the original-image cache fresh
+        # even while an overlay remains on the page. Paused feeds still never
+        # compete with a stage's camera reader.
         try:
             jpeg = self.read_jpeg()
         except BaseException as exc:  # noqa: BLE001 - reported, never raised

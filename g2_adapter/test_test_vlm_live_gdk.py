@@ -15,7 +15,18 @@ class LiveVlmTests(unittest.TestCase):
             frames, source = acquire_frames(("left",), "http://localhost:8767")
         self.assertEqual(frames, {"left": b"frame"})
         self.assertEqual(source, "web")
-        self.assertEqual(reads, ["http://localhost:8767/frame/left.jpg"])
+        self.assertEqual(reads, ["http://localhost:8767/raw/left.jpg"])
+
+    def test_gripper_live_sends_one_original_without_crop(self):
+        sent = []
+        class Client:
+            def run_bytes(self, task, images):
+                sent.extend(images)
+                return {'state': 'attached'}
+        with patch('test_vlm_live_gdk._save_inputs'):
+            record = run_task('gripper', {'left': b'original'}, 'web', Client(), None)
+        self.assertTrue(record['ok'])
+        self.assertEqual(sent, [b'original'])
 
     def test_unavailable_web_falls_back_to_required_cameras(self):
         with patch("test_vlm_live_gdk.read_http_jpeg", side_effect=URLError("refused")), patch("test_vlm_live_gdk.capture_gdk", return_value={"left": b"live"}) as capture:

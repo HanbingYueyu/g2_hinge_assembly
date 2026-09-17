@@ -13,10 +13,10 @@ import cv2
 
 try:
     from .camera import decode_color_rgb
-    from .vlm_flow_checks import _safe_check, _save_inputs, crop_jpeg, parse_crop_xyxy
+    from .vlm_flow_checks import _safe_check, _save_inputs
 except ImportError:
     from camera import decode_color_rgb
-    from vlm_flow_checks import _safe_check, _save_inputs, crop_jpeg, parse_crop_xyxy
+    from vlm_flow_checks import _safe_check, _save_inputs
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -63,7 +63,7 @@ def capture_gdk(names):
 def acquire_frames(names, web_url):
     if web_url:
         try:
-            frames = {name: read_http_jpeg(f"{web_url.rstrip('/')}/frame/{name}.jpg") for name in names}
+            frames = {name: read_http_jpeg(f"{web_url.rstrip('/')}/raw/{name}.jpg") for name in names}
             return frames, "web"
         except HTTPError:
             # A running server with unavailable images must not trigger competing camera reads.
@@ -76,9 +76,8 @@ def acquire_frames(names, web_url):
 def run_task(task, frames, source, client, crop):
     statuses = {name: {"state": f"live_{source}"} for name in frames}
     if task == "gripper":
-        crop_image = crop_jpeg(frames["left"], crop)
-        _save_inputs("vlm_gripper_check", {"left": frames["left"], "left_crop": crop_image}, statuses)
-        images = [frames["left"], crop_image]
+        _save_inputs("vlm_gripper_check", {"left": frames["left"]}, statuses)
+        images = [frames["left"]]
     else:
         _save_inputs("vlm_assembly_check", frames, statuses)
         order = ("right", "left", "head") if task == "pin" else ("left", "right")
@@ -93,7 +92,7 @@ def main():
     parser.add_argument("--env-file", type=Path, default=ROOT / "vlm_checks/config/vlm.env")
     parser.add_argument("--model", default="qwen3.8-flash")
     parser.add_argument("--timeout", type=float, default=60)
-    parser.add_argument("--gripper-crop", type=parse_crop_xyxy, default=(80, 120, 560, 480))
+    parser.add_argument("--gripper-crop", default=None, help="旧参数兼容；不再裁剪")
     args = parser.parse_args()
     sys.path.insert(0, str(ROOT))
     from vlm_checks.src.vlm_three_checks import VlmClient, DEFAULT_API_URL

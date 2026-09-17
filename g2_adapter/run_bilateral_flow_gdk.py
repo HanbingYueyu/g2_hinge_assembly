@@ -245,7 +245,7 @@ def parse_args(argv=None) -> argparse.Namespace:
     parser.add_argument("--vlm-model", default="qwen3.8-flash")
     parser.add_argument("--vlm-api-url", default="https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions")
     parser.add_argument("--vlm-timeout-s", type=float, default=60.0)
-    parser.add_argument("--vlm-gripper-crop", default="80,120,560,480")
+    parser.add_argument("--vlm-gripper-crop", default=None, help="旧参数兼容；已停用裁剪，始终发送完整原图")
     parser.add_argument("--auto-speed-mm-s", type=float, default=10.0)
     parser.add_argument("--auto-preset-velocity-rad-s", type=float, default=0.08)
     parser.add_argument("--left-seat-max-descent-mm", type=float, default=10.0,
@@ -348,15 +348,6 @@ def validate_args(args: argparse.Namespace) -> int | None:
         if order.index(args.through_stage) < order.index(args.from_stage):
             print("--through-stage 不能位于 --from-stage 之前。", file=sys.stderr)
             return 2
-    try:
-        try:
-            from .vlm_flow_checks import parse_crop_xyxy
-        except ImportError:
-            from vlm_flow_checks import parse_crop_xyxy
-        parse_crop_xyxy(args.vlm_gripper_crop)
-    except ValueError as exc:
-        print(f"VLM 参数错误：{exc}", file=sys.stderr)
-        return 2
     checks = (
         math.isfinite(args.head_samples) and 1 <= args.head_samples <= 30,
         1 <= args.head_min_inlier_samples <= args.head_samples,
@@ -648,10 +639,10 @@ def stage_vlm_gripper_check(ctx: FlowContext) -> dict:
     if ctx.args.disable_vlm_checks:
         return {"skipped": True, "reason": "disabled"}
     try:
-        from .vlm_flow_checks import parse_crop_xyxy, run_gripper_check
+        from .vlm_flow_checks import run_gripper_check
     except ImportError:
-        from vlm_flow_checks import parse_crop_xyxy, run_gripper_check
-    record = run_gripper_check(ctx.services.web, ctx.services.get("vlm_client"), parse_crop_xyxy(ctx.args.vlm_gripper_crop))
+        from vlm_flow_checks import run_gripper_check
+    record = run_gripper_check(ctx.services.web, ctx.services.get("vlm_client"))
     ctx.runtime.emit_event(record)
     return {"task": "gripper", "ok": record["ok"]}
 

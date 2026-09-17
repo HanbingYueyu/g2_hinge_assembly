@@ -1,5 +1,9 @@
 # G2 纯 GDK 适配层
 
+旧双相机 XY 对孔流程 `run_bilateral_alignment_gdk.py` 及其专属模块、测试已于 2026-09-17 归档，不再用于当前流程。下文相关段落为历史参考，执行前须按归档说明恢复；现用入口为 `run_bilateral_flow_gdk.py`。
+
+归档提示（2026-09-17）：本文提及的 `live_left_d405_yolo_sam_review_web.py`、`right_hole_target_sam3_preview.py` 已移到仓库外归档。相关历史命令须先恢复脚本；[归档及恢复说明](../docs/cleanup-archive-2026-09-17.md)。当前全流程及共用模块不受影响。
+
 这里是当前 `G2_t2v2_crsB + Omnipicker + GDK 4.1.5` 的传统视觉流程控制边界。
 
 当前已经落实：
@@ -210,7 +214,7 @@ cd /home/flyfuture/traditional_auto_flow_g2_migration
 过于严格、可能返回零掩膜；如需现场对比，可用 `--prompt "..."` 覆盖它。
 若需要按托盘左右位置取件，可用像素检测区域和选择策略过滤夹爪，例如
 `--roi 330,430,1000,760 --selection leftmost`。仅会改变离线定位的候选选择，不会发送运动。
-`kinematics.py` 直接解析 G2 URDF，提供 FK、Jacobian 和带步长限制的阻尼最小二乘视觉修正。
+旧实验模块 `kinematics.py` 及其测试已归档；当前流程没有调用该 FK/Jacobian 实现。需要复用时见 [恢复说明](../docs/cleanup-archive-2026-09-17.md)。
 
 `workcell.example.json` 中的左手 P1/P2/P3/P4 故意为空。请使用 `record_pose.py`
 在实际工位逐点读取；启动完整流程前还要同时记录双臂归位点：

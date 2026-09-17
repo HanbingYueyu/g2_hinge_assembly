@@ -81,27 +81,33 @@ def _safe_check(client, task: str, images: list[bytes], statuses: dict, clock=ti
 
 
 def _snapshots(web, names: tuple[str, ...]):
-    frames, statuses = {}, {}
     if web is None:
         raise RuntimeError("Web JPEG cache is disabled")
-    for name in names:
-        frame, status = web.snapshot_pane(name)
-        statuses[name] = status
-        if not frame:
-            raise RuntimeError(f"Web pane {name} has no cached JPEG")
-        frames[name] = bytes(frame)
-    return frames, statuses
+    deadline = time.monotonic() + 2.0
+    while True:
+        frames, statuses = {}, {}
+        for name in names:
+            frame, status = web.snapshot_raw_pane(name)
+            statuses[name] = status
+            if frame and status.get('raw_age_s', 0.0) <= 1.0:
+                frames[name] = bytes(frame)
+        if len(frames) == len(names):
+            return frames, statuses
+        if time.monotonic() >= deadline:
+            missing = ', '.join(name for name in names if name not in frames)
+            raise RuntimeError(f"Camera {missing} has no fresh original JPEG")
+        time.sleep(.05)
 
 
-def run_gripper_check(web, client, crop_xyxy, clock=time.monotonic) -> dict:
+def run_gripper_check(web, client, crop_xyxy=None, clock=time.monotonic) -> dict:
     try:
         frames, statuses = _snapshots(web, ("left",))
         if client is None:
             raise RuntimeError("VLM client is unavailable")
-        images = [frames["left"], crop_jpeg(frames["left"], crop_xyxy)]
+        images = [frames["left"]]
     except Exception as exc:
         return _warning("gripper", exc, locals().get("statuses", {}))
-    _save_inputs("vlm_gripper_check", {"left": images[0], "left_crop": images[1]}, statuses)
+    _save_inputs("vlm_gripper_check", {"left": images[0]}, statuses)
     return _safe_check(client, "gripper", images, statuses, clock)
 
 

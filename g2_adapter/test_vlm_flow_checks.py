@@ -20,7 +20,7 @@ class FakeWeb:
     def __init__(self, frames):
         self.frames = frames
 
-    def snapshot_pane(self, name):
+    def snapshot_raw_pane(self, name):
         return self.frames.get(name), {"state": f"{name}_raw_camera"}
 
 
@@ -41,12 +41,11 @@ class VlmFlowChecksTests(unittest.TestCase):
                 return {"state": "attached"}
         run_gripper_check(FakeWeb({"left": jpeg()}), Client(), (80, 120, 560, 480))
         files = sorted(self.output.glob("*.jpg"))
-        self.assertEqual(len(files), 2)
+        self.assertEqual(len(files), 1)
         for file in files:
             self.assertRegex(file.name, r"^\d{8}_\d{6}_\d{6}_left_vlm_gripper_check(?:_crop)?\.jpg$")
         full = next(file for file in files if not file.stem.endswith("_crop"))
-        crop = next(file for file in files if file.stem.endswith("_crop"))
-        self.assertEqual([full.read_bytes(), crop.read_bytes()], sent)
+        self.assertEqual([full.read_bytes()], sent)
 
     def test_assembly_saves_shared_frames_once_even_on_api_failure(self):
         class Client:
@@ -76,13 +75,65 @@ class VlmFlowChecksTests(unittest.TestCase):
         output = cv2.imdecode(np.frombuffer(crop_jpeg(jpeg(), crop), np.uint8), cv2.IMREAD_COLOR)
         self.assertEqual(output.shape[:2], (360, 480))
 
-    def test_gripper_uses_left_full_then_crop(self):
+    def test_gripper_uses_only_left_full_original(self):
         calls = []
         client = type("Client", (), {"run_bytes": lambda _s, task, images: calls.append((task, images)) or {"state": "attached", "confidence": .9}})()
         record = run_gripper_check(FakeWeb({"left": jpeg()}), client, (80, 120, 560, 480))
         self.assertTrue(record["ok"])
         self.assertEqual(calls[0][0], "gripper")
-        self.assertEqual(len(calls[0][1]), 2)
+        self.assertEqual(calls[0][1], [jpeg()])
+
+    def test_overlay_never_replaces_original_vlm_input(self):
+        from bilateral_web import BilateralWeb
+        web = BilateralWeb()
+        web.publish_raw_pane('left', b'original', {})
+        web.update_pane('left', b'annotated', {})
+        sent = []
+        class Client:
+            def run_bytes(self, task, images):
+                sent.extend(images)
+                return {'state': 'attached'}
+        record = run_gripper_check(web, Client(), None)
+        self.assertTrue(record['ok'])
+        self.assertEqual(sent, [b'original'])
+        self.assertEqual(web.snapshot_pane('left')[0], b'annotated')
+        self.assertEqual(next(self.output.glob('*.jpg')).read_bytes(), b'original')
+
+    def test_raw_http_handler_serves_original_and_rejects_stale_frame(self):
+        from bilateral_web import BilateralWeb
+        web = BilateralWeb()
+        web.publish_raw_pane('left', b'original', {})
+        web.update_pane('left', b'annotated', {})
+        handler_type = web.handler()
+        handler = handler_type.__new__(handler_type)
+        handler.path = '/raw/left.jpg'
+        replies = []
+        handler._bytes = lambda data, kind: replies.append(data)
+        handler.send_error = lambda code, msg: replies.append(int(code))
+        handler.do_GET()
+        self.assertEqual(replies, [b'original'])
+        web._raw_at['left'] -= 10
+        handler.do_GET()
+        self.assertEqual(replies, [b'original', 503])
+
+    def test_assembly_refreshes_whole_batch_when_one_camera_is_stale(self):
+        calls = {}
+        class Web:
+            left_reads = 0
+            def snapshot_raw_pane(self, name):
+                if name == 'left':
+                    self.left_reads += 1
+                    return b'left', {'raw_age_s': 10 if self.left_reads == 1 else 0}
+                if name == 'head':
+                    return (b'head-new' if self.left_reads else b'head-old'), {'raw_age_s': 0}
+                return b'right', {'raw_age_s': 0}
+        class Client:
+            def run_bytes(self, task, images):
+                calls[task] = images
+                return {'state': 'inserted'} if task == 'pin' else {'obvious_c_leak': False}
+        with patch('vlm_flow_checks.time.sleep'):
+            run_assembly_checks(Web(), Client())
+        self.assertEqual(calls['pin'], [b'right', b'left', b'head-new'])
 
     def test_assembly_orders_images_and_runs_concurrently(self):
         started = {name: threading.Event() for name in ("pin", "c-hole")}

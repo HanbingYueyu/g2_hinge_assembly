@@ -2,8 +2,8 @@
 任务：判断左夹爪当前是否真正夹住银色顶铰链，或已掉落。
 真实顶铰链是带多个圆孔和C形缺口的宽银色金属板；不是夹爪固定件、手指、线缆、桌面或背景。
 
-输入图片顺序：当前全图、当前夹爪近景，以及可选的抓取成功后参考近景。当前夹爪近景是主要证据；参考图不是当前图。
-若当前近景为空夹爪而参考图中有铰链，判 dropped；若铰链仍明确位于两指之间并随夹爪移动，判 attached；抓取前目标在桌面上判 not_attached；证据不足判 unknown，绝不猜测。
+输入图片：左手相机当前完整原图，无检测标注、无裁剪。直接观察原图中的夹爪及铰链，不假设存在近景或历史参考图。
+若铰链明确已从夹爪掉落，判 dropped；若铰链仍明确位于两指之间，判 attached；目标在桌面上且未被夹持，判 not_attached；空夹爪不能单独证明发生了掉落，证据不足判 unknown，绝不猜测。
 
 只返回一行JSON，禁止Markdown和额外字段：
 {"state":"attached|not_attached|dropped|unknown","grasped":true|false|null,"dropped":true|false|null,"visibility":"visible|occluded|unknown","confidence":0.00,"reason":"不超过16个汉字"}

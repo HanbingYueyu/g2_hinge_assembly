@@ -33,24 +33,13 @@ class RightStageExtractionTests(unittest.TestCase):
 
 
 class LeftModelSelectionTests(unittest.TestCase):
-    """The grasp chain is hinge-only; the shaft model stays for alignment."""
+    """The active grasp chain selects the hinge-only runtime model."""
 
     def test_left_grasp_prefers_the_one_class_hinge_weight(self):
         self.assertTrue(
             str(left_grasp_gdk.DEFAULT_G2_NATIVE_YOLO).endswith("models/left_d405_hinge_yolo/best.pt"),
             left_grasp_gdk.DEFAULT_G2_NATIVE_YOLO,
         )
-
-    def test_the_two_class_hinge_shaft_weight_stays_available_for_alignment(self):
-        import run_bilateral_alignment_gdk
-
-        self.assertTrue(
-            str(run_bilateral_alignment_gdk.DEFAULT_LEFT_TARGET_MODEL).endswith(
-                "models/left_d405_hinge_shaft_yolo/best.pt"
-            ),
-            run_bilateral_alignment_gdk.DEFAULT_LEFT_TARGET_MODEL,
-        )
-
 
 class ServicesContractTests(unittest.TestCase):
     """Injected stages must only touch attributes StageServices actually has."""
