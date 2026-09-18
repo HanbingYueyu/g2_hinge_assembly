@@ -97,7 +97,7 @@
     }
   ],
   "optimization": {
-    "source": "/home/flyfuture/traditional_auto_flow_g2_migration/trajectories/right_placement_4.json",
+    "source": "/home/flyfuture/g2_hinge_assembly/trajectories/right_placement_4.json",
     "original_samples": 761,
     "keyframes": 7,
     "key_indices": [

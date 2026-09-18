@@ -1,7 +1,7 @@
 # Repository cleanup archive — 2026-09-17
 
 Archive destination: `/home/flyfuture/traditional_auto_flow_g2_archive/2026-09-17/`.
-Repository source: `/home/flyfuture/traditional_auto_flow_g2_migration/`.
+Repository source: `/home/flyfuture/g2_hinge_assembly/`.
 
 ## Archived content
 

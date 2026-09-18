@@ -85,7 +85,7 @@
     }
   ],
   "optimization": {
-    "source": "/home/flyfuture/traditional_auto_flow_g2_migration/trajectories/left_placement.json",
+    "source": "/home/flyfuture/g2_hinge_assembly/trajectories/left_placement.json",
     "original_samples": 1471,
     "keyframes": 6,
     "key_indices": [

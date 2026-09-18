@@ -64,7 +64,7 @@ shaft 关联和坐标方向稳定后，再讨论 direct 真实运动。原有 `-
 和三张深度伪彩图，不保存图像。默认只监听本机回环地址：
 
 ```bash
-/home/flyfuture/traditional_auto_flow_g2_migration/scripts/run_gdk_python.sh \
+/home/flyfuture/g2_hinge_assembly/scripts/run_gdk_python.sh \
   g2_adapter/camera_web_viewer.py
 ```
 
@@ -91,7 +91,7 @@ shaft 关联和坐标方向稳定后，再讨论 direct 真实运动。原有 `-
 使用单进程实时检测网页（默认最左候选、托盘 ROI、1 FPS 推理）：
 
 ```bash
-/home/flyfuture/traditional_auto_flow_g2_migration/scripts/run_gdk_sam3_python.sh \
+/home/flyfuture/g2_hinge_assembly/scripts/run_gdk_sam3_python.sh \
   g2_adapter/live_left_d405_sam3_web.py
 ```
 
@@ -148,7 +148,7 @@ YOLO 掩膜及各自的有效深度点数。只有同时具有有效深度的候
 轻微姿态变化、亮暗变化、夹爪遮挡和空托盘。不要为采集脚本移动机器人，机器人位置由操作员用平板调整。
 
 ```bash
-cd /home/flyfuture/traditional_auto_flow_g2_migration
+cd /home/flyfuture/g2_hinge_assembly
 
 ./scripts/run_gdk_sam3_python.sh \
   g2_adapter/capture_left_d405_hinge_yolo_dataset.py \
@@ -193,7 +193,7 @@ cd /home/flyfuture/traditional_auto_flow_g2_migration
 检测位后，再采集一组可供视觉定位复现的 GDK RGB-D 数据：
 
 ```bash
-/home/flyfuture/traditional_auto_flow_g2_migration/scripts/run_gdk_python.sh \
+/home/flyfuture/g2_hinge_assembly/scripts/run_gdk_python.sh \
   g2_adapter/capture_left_d405_gdk.py --scene left_final_detection
 ```
 
@@ -203,7 +203,7 @@ cd /home/flyfuture/traditional_auto_flow_g2_migration
 任何机器人命令）：
 
 ```bash
-/home/flyfuture/traditional_auto_flow_g2_migration/scripts/run_sam3_python.sh \
+/home/flyfuture/g2_hinge_assembly/scripts/run_sam3_python.sh \
   g2_adapter/localize_left_d405_sam3.py --scene left_final_detection
 ```
 
@@ -220,7 +220,7 @@ cd /home/flyfuture/traditional_auto_flow_g2_migration
 在实际工位逐点读取；启动完整流程前还要同时记录双臂归位点：
 
 ```bash
-/home/flyfuture/traditional_auto_flow_g2_migration/scripts/run_gdk_python.sh \
+/home/flyfuture/g2_hinge_assembly/scripts/run_gdk_python.sh \
   g2_adapter/record_pose.py --name workflow_home --both-arms --save
 ```
 
@@ -229,7 +229,7 @@ cd /home/flyfuture/traditional_auto_flow_g2_migration
 只读预检命令（由操作员执行，Codex 不启动机器人）：
 
 ```bash
-/home/flyfuture/traditional_auto_flow_g2_migration/scripts/run_gdk_python.sh g2_adapter/preflight.py
+/home/flyfuture/g2_hinge_assembly/scripts/run_gdk_python.sh g2_adapter/preflight.py
 ```
 
 运行 `run_preset.py` 时，`--allow-motion` 是唯一运动确认参数。未指定时只读取并
@@ -247,7 +247,7 @@ cd /home/flyfuture/traditional_auto_flow_g2_migration
 如状态显示为 3，可由操作员执行以下命令切换到 1；它只调用 `set_control_mode(1)`，不发送任何运动目标：
 
 ```bash
-/home/flyfuture/traditional_auto_flow_g2_migration/scripts/run_gdk_sam3_python.sh \
+/home/flyfuture/g2_hinge_assembly/scripts/run_gdk_sam3_python.sh \
   g2_adapter/set_left_position_control_mode.py --allow-motion
 ```
 

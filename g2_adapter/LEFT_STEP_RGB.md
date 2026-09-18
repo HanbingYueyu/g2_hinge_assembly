@@ -17,7 +17,7 @@ STEP 模式的粗对准和精对准现使用连续 XY 伺服：每帧目标从�
 `--step-tcp-end-mm` 是夹持中心相对 `arm_l_end_link` 的 XYZ 估计，默认 `0,0,145` mm 为可调初值，并非从精确闭环求得。`--step-compensation-xy-mm` 是 base_link 下附加到抓取目标的 X/Y 补偿；正 X 向前，正 Y 向左。视觉仅观察工件，TCP 固定误差需要用这些参数调整。
 
 ```bash
-cd /home/flyfuture/traditional_auto_flow_g2_migration && \
+cd /home/flyfuture/g2_hinge_assembly && \
 ./scripts/run_gdk_sam3_python.sh g2_adapter/left_grasp_gdk.py \
   --step-profile g2_adapter/left_step_profile.json \
   --step-metric-xy \
@@ -49,7 +49,7 @@ cd /home/flyfuture/traditional_auto_flow_g2_migration && \
 新文件中红色面 `#14000`、`#14073` 对应两侧夹持区域。取每个面顶点范围的中心，再取两中心的中点作为对称抓取基准：`(-264.678065, 1323.880548, 18.774347) mm`。这是模型坐标，不是机器人坐标，也不是曲面面积重心。配置已生成，可直接运行预览；重新导出模型后可运行下面的提取命令更新。
 
 ```bash
-cd /home/flyfuture/traditional_auto_flow_g2_migration
+cd /home/flyfuture/g2_hinge_assembly
 ./scripts/run_gdk_sam3_python.sh g2_adapter/extract_left_step_profile.py \
   --step models/顶铰链.stp \
   --output g2_adapter/left_step_profile.json

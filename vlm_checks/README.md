@@ -19,7 +19,7 @@
 北京 DashScope Chat Completions，默认 `qwen3.8-flash`；`temperature=0`、`seed=42`、`enable_thinking=false`、`max_tokens=256`。图片以 Base64 Data URL 上传，解析 `choices[0].message.content` 的 JSON。随机种子不保证绝对可复现，远程请求也不是实时安全控制。
 
 ```bash
-cd /home/flyfuture/traditional_auto_flow_g2_migration
+cd /home/flyfuture/g2_hinge_assembly
 bash vlm_checks/run.sh pin \
   --image /path/to/right_final.jpg \
   --image /path/to/left_final.jpg \

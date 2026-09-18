@@ -65,7 +65,7 @@
     "pre_descent_depth_m": 0.14200000000000002,
     "selection": "leftmost",
     "detector": "yolo",
-    "yolo_model": "/home/flyfuture/traditional_auto_flow_g2_migration/models/left_d405_hinge_shaft_yolo/best.pt",
+    "yolo_model": "/home/flyfuture/g2_hinge_assembly/models/left_d405_hinge_shaft_yolo/best.pt",
     "selected_mask_index": 0,
     "selected": {
       "area_px": 56990,
@@ -109,6 +109,6 @@
     ],
     "sam_center_crop_fraction": 0.7,
     "captured_at_utc": "2026-09-02T07:10:17.339230+00:00",
-    "overlay_image": "/home/flyfuture/traditional_auto_flow_g2_migration/outputs/left_grasp_calibration/left_grasp_reference.jpg"
+    "overlay_image": "/home/flyfuture/g2_hinge_assembly/outputs/left_grasp_calibration/left_grasp_reference.jpg"
   }
 }
