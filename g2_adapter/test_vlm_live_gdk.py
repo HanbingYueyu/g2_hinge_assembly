@@ -13,10 +13,10 @@ import cv2
 
 try:
     from .camera import decode_color_rgb
-    from .vlm_flow_checks import _safe_check, _save_inputs
+    from .vlm_flow_checks import _safe_check, _save_inputs, crop_jpeg, parse_crop_xyxy, start_vlm_run
 except ImportError:
     from camera import decode_color_rgb
-    from vlm_flow_checks import _safe_check, _save_inputs
+    from vlm_flow_checks import _safe_check, _save_inputs, crop_jpeg, parse_crop_xyxy, start_vlm_run
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -76,8 +76,9 @@ def acquire_frames(names, web_url):
 def run_task(task, frames, source, client, crop):
     statuses = {name: {"state": f"live_{source}"} for name in frames}
     if task == "gripper":
-        _save_inputs("vlm_gripper_check", {"left": frames["left"]}, statuses)
-        images = [frames["left"]]
+        crop_box = parse_crop_xyxy(crop) if isinstance(crop, str) else crop
+        images = [frames['left'], crop_jpeg(frames['left'], crop_box)]
+        _save_inputs("vlm_gripper_check", {'left': images[0], 'left_crop': images[1]}, statuses)
     else:
         _save_inputs("vlm_assembly_check", frames, statuses)
         order = ("right", "left", "head") if task == "pin" else ("left", "right")
@@ -92,8 +93,9 @@ def main():
     parser.add_argument("--env-file", type=Path, default=ROOT / "vlm_checks/config/vlm.env")
     parser.add_argument("--model", default="qwen3.8-flash")
     parser.add_argument("--timeout", type=float, default=60)
-    parser.add_argument("--gripper-crop", default=None, help="旧参数兼容；不再裁剪")
+    parser.add_argument("--gripper-crop", default=None, help="可选像素框；默认居中保留高度60%、宽度40%")
     args = parser.parse_args()
+    start_vlm_run()
     sys.path.insert(0, str(ROOT))
     from vlm_checks.src.vlm_three_checks import VlmClient, DEFAULT_API_URL
     try:

@@ -90,6 +90,9 @@ class _Pane:
     def update(self, overlay_jpeg: bytes | None, status: dict) -> None:
         self._owner.update_pane(self._name, overlay_jpeg, status)
 
+    def publish_raw(self, jpeg: bytes, status: dict) -> None:
+        self._owner.publish_raw_pane(self._name, jpeg, status)
+
     def update_status(self, status: dict) -> None:
         """Publish a status heartbeat while keeping the last image.
 

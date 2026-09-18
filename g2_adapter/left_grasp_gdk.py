@@ -728,8 +728,8 @@ def parse_args(argv=None) -> argparse.Namespace:
     parser.add_argument(
         "--regrasp-retract-m",
         type=float,
-        default=0.0,
-        help="目标丢失或空夹时，重新张爪/对准前的 base_link +Z 撤回量，默认 0 mm（保持当前位置）。",
+        default=0.03,
+        help="视觉失败重新张爪/对准前的 base_link +Z 撤回量，默认且至少 30 mm。",
     )
     parser.add_argument(
         "--post-grasp-verify-lift-m",
@@ -1256,6 +1256,26 @@ def open_left_gripper_with_feedback(
         stream.stop()
 
 
+def lift_before_visual_reacquire(controller, *, speed_mm_s):
+    """Dedicated retry retreat; no gripper command or XY translation."""
+    current = measured_left_end_link_pose(controller)
+    target = CartesianPoseTarget(
+        (current.position_m[0], current.position_m[1], current.position_m[2] + .03),
+        current.orientation_xyzw,
+    )
+    stream = controller.start_left_end_effector_position_stream(
+        current, rate_hz=50., life_time_s=.10,
+        max_translation_velocity_mps=speed_mm_s / 1000.,
+    )
+    try:
+        stream.update_target(target)
+        wait_actual_left_target(controller, stream, target, timeout_s=30. / speed_mm_s + 5.,
+                               tolerance_m=.002, orientation_tolerance_deg=2.)
+    finally:
+        stream.stop()
+    print('[视觉重抓] 已竖直上抬 30 mm，继续重新定位夹取。', flush=True)
+
+
 def recover_for_visual_regrasp(
     controller: G2Controller,
     position_stream: LeftEndEffectorPositionStream,
@@ -1267,14 +1287,8 @@ def recover_for_visual_regrasp(
     gripper_tolerance_rad: float,
     gripper_timeout_s: float,
 ) -> tuple[LeftEndEffectorPositionStream, CartesianPoseTarget, dict]:
-    """Cancel descent, optionally retract, open, then reacquire tracking.
-
-    Recovery first replaces any queued descent by a measured-pose hold. With
-    the default ``retract_m=0`` it keeps the camera at that pose so a nearby
-    temporarily lost hinge remains visible; a positive value is an
-    operator-selected base ``+Z`` retreat. The tracker resets after open
-    feedback is confirmed.
-    """
+    """Cancel descent, retreat at least 30 mm in base +Z, then open/reacquire."""
+    retract_m = max(.03, retract_m)
     position_stream.raise_if_failed()
     current = measured_left_end_link_pose(controller)
     # GDK status pose quaternions vary at floating-point precision between
@@ -1289,12 +1303,12 @@ def recover_for_visual_regrasp(
     )
     position_stream.update_target(retract_target)
     timeout_s = max(2.0, retract_m / translation_speed_mps + 1.0)
-    if not position_stream.wait_until_target(timeout_s):
-        raise SafetyError(
-            "重新抓取撤回目标未在安全时间内发布完成；停止且不再尝试重新对准："
-            f"retract={retract_m:.3f}m, waited={timeout_s:.1f}s"
-        )
-    position_stream.stop()
+    try:
+        wait_actual_left_target(controller, position_stream, retract_target,
+                               timeout_s=timeout_s + 3., tolerance_m=.002,
+                               orientation_tolerance_deg=2.)
+    finally:
+        position_stream.stop()
     # GDK's direct Omnipicker command is the same confirmed-open operation
     # used before the first visual-servo pass.  Stop the pose stream first so
     # its old close-joint request cannot race the open request.
@@ -1448,6 +1462,10 @@ class PersistentPerception:
                 started = time.monotonic()
                 color = self.camera.get_latest_image(self.color_type, 1000.0)
                 color_rgb = decode_color_rgb(color, self.gdk)
+                if self.shared is not None and hasattr(self.shared, 'publish_raw'):
+                    raw_ok, raw_jpeg = cv2.imencode('.jpg', cv2.cvtColor(color_rgb, cv2.COLOR_RGB2BGR))
+                    if raw_ok:
+                        self.shared.publish_raw(raw_jpeg.tobytes(), {'frame_read_started_s': started, 'state': 'left_raw_camera'})
                 use_step = getattr(self.args, "step_profile", None) is not None
                 if use_step:
                     if color.timestamp_ns == previous_step_timestamp:
@@ -1905,8 +1923,12 @@ def start_force_descent_sam_preview(
             try:
                 started = time.monotonic()
                 image = camera.get_latest_image(color_type, 1000.0)
-                depth = camera.get_nearest_image(depth_type, int(image.timestamp_ns), 1000.0)
                 rgb = decode_color_rgb(image, gdk)
+                if shared is not None and hasattr(shared, 'publish_raw'):
+                    raw_ok, raw_jpeg = cv2.imencode('.jpg', cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR))
+                    if raw_ok:
+                        shared.publish_raw(raw_jpeg.tobytes(), {'frame_read_started_s': started, 'state': 'left_raw_camera'})
+                depth = camera.get_nearest_image(depth_type, int(image.timestamp_ns), 1000.0)
                 depth_u16 = decode_depth_u16(depth, gdk)
                 aligned_depth = align_depth_to_color(
                     depth_u16,
@@ -2933,6 +2955,10 @@ def run_left_cycle(*, services=None, argv=None) -> int:
             print(f"加载 G2 原生 YOLO 主检测器：{yolo_model_path}", flush=True)
             yolo_model = load_yolo_segmentation_model(yolo_model_path, device=args.yolo_device)
         # The left worker remains the sole owner of the hand camera/model.
+        if services is not None:
+            raw_feed = services.get('left_raw_feed')
+            if raw_feed is not None:
+                raw_feed.pause()
         perception = PersistentPerception(
             camera=camera, color_type=camera_type, depth_type=depth_type,
             gdk=agibot_gdk, tf=tf, processor=processor, yolo_model=yolo_model,
@@ -3150,6 +3176,7 @@ def run_left_cycle(*, services=None, argv=None) -> int:
                 return target.copy(), detail
 
             while args.max_frames == 0 or frame < args.max_frames:
+                controller.check_automatic_guard()
                 if takeover_worker is not None:
                     takeover_worker.raise_if_failed()
                     if takeover_worker.advance_requested:
@@ -3184,6 +3211,8 @@ def run_left_cycle(*, services=None, argv=None) -> int:
                         position_stream.stop()
                         position_stream = None
                         assert gripper_open is not None and gripper_close_timeout is not None
+                        if services is not None and services.get('vlm_gripper_monitor') is not None:
+                            services.get('vlm_gripper_monitor').set_phase('pre_grasp')
                         post_grasp_regrasp_open_stream = controller.start_left_gripper_position_stream(gripper_open)
                         post_grasp_regrasp_open = {
                             "reason": "post_grasp_verify_lift_target_not_reached",
@@ -3436,6 +3465,9 @@ def run_left_cycle(*, services=None, argv=None) -> int:
                         position_stream.stop()
                         position_stream = None
                         assert gripper_open is not None and gripper_tolerance is not None and gripper_close_timeout is not None
+                        if services is not None and services.get('vlm_gripper_monitor') is not None:
+                            services.get('vlm_gripper_monitor').set_phase('pre_grasp')
+                        lift_before_visual_reacquire(controller, speed_mm_s=args.xy_speed_mm_s)
                         post_grasp_regrasp_open_stream = controller.start_left_gripper_position_stream(gripper_open)
                         post_grasp_regrasp_open = {
                             "reason": (
@@ -3595,6 +3627,12 @@ def run_left_cycle(*, services=None, argv=None) -> int:
                         force_preview_stop = force_preview_thread = None
                         force_preview_phase = None
                         assert gripper_open is not None and gripper_close_timeout is not None
+                        if services is not None and services.get('vlm_gripper_monitor') is not None:
+                            services.get('vlm_gripper_monitor').set_phase('pre_grasp')
+                        if position_stream is not None:
+                            position_stream.stop()
+                            position_stream = None
+                        lift_before_visual_reacquire(controller, speed_mm_s=args.xy_speed_mm_s)
                         post_grasp_regrasp_open_stream = controller.start_left_gripper_position_stream(gripper_open)
                         post_grasp_regrasp_open = {
                             "reason": "held_target_lost_after_timeout_before_hole_move",
@@ -3724,6 +3762,12 @@ def run_left_cycle(*, services=None, argv=None) -> int:
                             force_preview_stop = force_preview_thread = None
                             force_preview_phase = None
                             assert gripper_open is not None and gripper_close_timeout is not None
+                            if services is not None and services.get('vlm_gripper_monitor') is not None:
+                                services.get('vlm_gripper_monitor').set_phase('pre_grasp')
+                            if position_stream is not None:
+                                position_stream.stop()
+                                position_stream = None
+                            lift_before_visual_reacquire(controller, speed_mm_s=args.xy_speed_mm_s)
                             post_grasp_regrasp_open_stream = controller.start_left_gripper_position_stream(gripper_open)
                             post_grasp_regrasp_open = {
                                 "reason": "held_target_lost_after_timeout_before_p4",
@@ -3958,6 +4002,8 @@ def run_left_cycle(*, services=None, argv=None) -> int:
                                 force_preview_stop = force_preview_thread = None
                                 force_preview_phase = None
                                 lost_duration_s = loss_now - post_grasp_target_lost_since
+                                if services is not None and services.get('vlm_gripper_monitor') is not None:
+                                    services.get('vlm_gripper_monitor').set_phase('pre_grasp')
                                 position_stream, last_end_link_target, recovery = recover_for_visual_regrasp(
                                     controller,
                                     position_stream,
@@ -4653,6 +4699,8 @@ def run_left_cycle(*, services=None, argv=None) -> int:
                                         stop_force_descent_sam_preview(force_preview_stop, force_preview_thread)
                                         force_preview_stop = force_preview_thread = None
                                         force_preview_phase = None
+                                        if services is not None and services.get('vlm_gripper_monitor') is not None:
+                                            services.get('vlm_gripper_monitor').set_phase('pre_grasp')
                                         position_stream, last_end_link_target, recovery = recover_for_visual_regrasp(
                                             controller,
                                             position_stream,
@@ -4925,6 +4973,8 @@ def run_left_cycle(*, services=None, argv=None) -> int:
                                     stop_force_descent_sam_preview(force_preview_stop, force_preview_thread)
                                     force_preview_stop = force_preview_thread = None
                                     force_preview_phase = None
+                                    if services is not None and services.get('vlm_gripper_monitor') is not None:
+                                        services.get('vlm_gripper_monitor').set_phase('pre_grasp')
                                     position_stream, last_end_link_target, recovery = recover_for_visual_regrasp(
                                         controller,
                                         position_stream,
@@ -4996,6 +5046,10 @@ def run_left_cycle(*, services=None, argv=None) -> int:
                             and abs(position - adaptive_hold_target_rad) <= gripper_tolerance
                         ):
                             record["grasp_confirmed"] = True
+                            if services is not None:
+                                vlm_monitor = services.get('vlm_gripper_monitor')
+                                if vlm_monitor is not None:
+                                    vlm_monitor.set_phase('post_grasp')
                             record["adaptive_gripper_hold_target_rad"] = adaptive_hold_target_rad
                             if not post_grasp_verified:
                                 assert position_stream is not None
@@ -5139,6 +5193,8 @@ def run_left_cycle(*, services=None, argv=None) -> int:
                             stop_force_descent_sam_preview(force_preview_stop, force_preview_thread)
                             force_preview_stop = force_preview_thread = None
                             force_preview_phase = None
+                            if services is not None and services.get('vlm_gripper_monitor') is not None:
+                                services.get('vlm_gripper_monitor').set_phase('pre_grasp')
                             position_stream, last_end_link_target, recovery = recover_for_visual_regrasp(
                                 controller,
                                 position_stream,

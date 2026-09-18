@@ -170,6 +170,9 @@ class LeftCartesianImpedanceStream:
             self._target = target
 
     def raise_if_failed(self) -> None:
+        guard = getattr(self._controller, 'check_automatic_guard', None)
+        if guard is not None:
+            guard()
         with self._lock:
             error = self._error
         if error is not None:
@@ -450,6 +453,9 @@ class LeftEndEffectorPositionStream:
             self._gripper_joint_positions = (clipped,)
 
     def raise_if_failed(self) -> None:
+        guard = getattr(self._controller, 'check_automatic_guard', None)
+        if guard is not None:
+            guard()
         with self._lock:
             error = self._error
         if error is not None:
@@ -861,6 +867,9 @@ class RightEndEffectorPositionStream:
         return None
 
     def raise_if_failed(self) -> None:
+        guard = getattr(self._controller, 'check_automatic_guard', None)
+        if guard is not None:
+            guard()
         with self._lock:
             error = self._error
         if error is not None:
@@ -1070,6 +1079,7 @@ class G2Controller:
         self.motion_gate = motion_gate
 
     def checked_arm_state(self) -> tuple[float, ...]:
+        self.check_automatic_guard()
         whole = dict(self.robot.get_whole_body_status())
         motion = self.robot.get_motion_control_status()
         validate_robot_status(whole, motion)
@@ -1119,9 +1129,18 @@ class G2Controller:
 
     def _motion_write(self):
         """Reserve the single GDK motion writer for one robot request."""
+        self.check_automatic_guard()
         if self.motion_gate is None:
             return nullcontext()
         return self.motion_gate.automatic_motion()
+
+    def check_automatic_guard(self):
+        # Background servo/feedback threads must not consume a recovery
+        # request. The owning main thread unwinds and stops their streams.
+        guard = getattr(self, 'automatic_guard', None)
+        if guard is not None and threading.current_thread() is threading.main_thread():
+            if self.motion_gate is None or not self.motion_gate.is_paused():
+                guard()
 
     def move_preset(
         self,

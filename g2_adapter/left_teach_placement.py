@@ -36,8 +36,9 @@ def validate_teach_args(args):
 
 
 class _GatedRobot:
-    def __init__(self, robot, gate, *, stop_on_takeover=False):
+    def __init__(self, robot, gate, *, stop_on_takeover=False, automatic_guard=None):
         self.robot = robot
+        self.automatic_guard = automatic_guard
         self.gate = gate
         self.paused_s = 0.0
         self.stop_on_takeover = stop_on_takeover
@@ -50,6 +51,8 @@ class _GatedRobot:
             return function
 
         def write(*args, **kwargs):
+            if self.automatic_guard is not None:
+                self.automatic_guard()
             started = time.monotonic()
             reserve = self.gate.automatic_teach_motion(self.generation) if self.stop_on_takeover and hasattr(self.gate, "automatic_teach_motion") else self.gate.automatic_motion()
             with reserve:
@@ -84,7 +87,8 @@ def end_on_takeover(result, robot, label, worker=None):
 
 def replay_left_placement(services, args):
     trajectory = validate_teach_args(args)
-    robot = _GatedRobot(services.robot, services.gate, stop_on_takeover=True)
+    robot = _GatedRobot(services.robot, services.gate, stop_on_takeover=True,
+                        automatic_guard=getattr(getattr(services, 'controller', None), 'check_automatic_guard', None))
     session = G2TrajectorySession(services.gdk, robot, "left", monotonic_fn=robot.clock, event_sink=print)
     result = {"method": "teach", "trajectory": str(Path(args.left_teach_trajectory).expanduser().resolve()), "speed_scale": args.left_teach_speed_scale}
     with end_on_takeover(result, robot, "左手", getattr(services, "worker", None)):

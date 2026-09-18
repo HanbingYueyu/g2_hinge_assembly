@@ -4,7 +4,8 @@ from __future__ import annotations
 
 import time
 import warnings
-from datetime import datetime
+import threading
+from datetime import datetime, timedelta
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor
 
@@ -14,17 +15,36 @@ import numpy as np
 
 RESULT_EVENTS = {"gripper": "vlm_gripper_result", "pin": "vlm_pin_result", "c-hole": "vlm_c_hole_result"}
 OUTPUT_DIR = Path(__file__).resolve().parents[1] / "outputs" / "vlm"
+_RUN_NAME = None
+_RUN_LOCK = threading.RLock()
+
+
+def start_vlm_run() -> Path:
+    """Select one timestamp directory before any producers start saving."""
+    global _RUN_NAME
+    with _RUN_LOCK:
+        now = datetime.now()
+        name = now.strftime('%Y%m%d_%H%M%S_%f')
+        while name == _RUN_NAME or (OUTPUT_DIR / name).exists():
+            now += timedelta(microseconds=1)
+            name = now.strftime('%Y%m%d_%H%M%S_%f')
+        _RUN_NAME = name
+        return OUTPUT_DIR / name
 
 
 def _save_inputs(stage: str, images: dict[str, bytes], statuses: dict) -> None:
+    with _RUN_LOCK:
+        if _RUN_NAME is None:
+            start_vlm_run()
+        directory = OUTPUT_DIR / _RUN_NAME
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
     paths = []
     try:
-        OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+        directory.mkdir(parents=True, exist_ok=True)
         for camera, data in images.items():
             name, _, variant = camera.partition("_")
             suffix = f"_{variant}" if variant else ""
-            path = OUTPUT_DIR / f"{timestamp}_{name}_{stage}{suffix}.jpg"
+            path = directory / f"{timestamp}_{name}_{stage}{suffix}.jpg"
             with path.open("xb") as output:
                 output.write(data)
             paths.append(str(path))
@@ -32,6 +52,7 @@ def _save_inputs(stage: str, images: dict[str, bytes], statuses: dict) -> None:
         statuses["image_save_error"] = str(exc)
         warnings.warn(f"[VLM 警告] 图片保存失败：{exc}", RuntimeWarning, stacklevel=2)
     statuses["saved_images"] = paths
+    statuses["image_directory"] = str(directory)
 
 
 def parse_crop_xyxy(value: str) -> tuple[int, int, int, int]:
@@ -44,12 +65,21 @@ def parse_crop_xyxy(value: str) -> tuple[int, int, int, int]:
     return result
 
 
-def crop_jpeg(jpeg: bytes, crop_xyxy: tuple[int, int, int, int]) -> bytes:
+def central_gripper_crop(jpeg: bytes) -> bytes:
+    return crop_jpeg(jpeg, None)
+
+
+def crop_jpeg(jpeg: bytes, crop_xyxy: tuple[int, int, int, int] | None = None) -> bytes:
     image = cv2.imdecode(np.frombuffer(jpeg, np.uint8), cv2.IMREAD_COLOR)
     if image is None:
         raise ValueError("VLM input is not a decodable JPEG")
     height, width = image.shape[:2]
-    x0, y0, x1, y1 = crop_xyxy
+    if crop_xyxy is None:
+        crop_width, crop_height = max(1, round(width * .4)), max(1, round(height * .6))
+        x0, y0 = (width - crop_width) // 2, (height - crop_height) // 2
+        x1, y1 = x0 + crop_width, y0 + crop_height
+    else:
+        x0, y0, x1, y1 = crop_xyxy
     x0, y0, x1, y1 = max(0, x0), max(0, y0), min(width, x1), min(height, y1)
     if x1 <= x0 or y1 <= y0:
         raise ValueError("VLM crop is outside the cached frame")
@@ -99,15 +129,22 @@ def _snapshots(web, names: tuple[str, ...]):
         time.sleep(.05)
 
 
-def run_gripper_check(web, client, crop_xyxy=None, clock=time.monotonic) -> dict:
+def run_gripper_check(web, client, crop_xyxy=None, clock=time.monotonic, *, reference=None, frames_override=None) -> dict:
     try:
-        frames, statuses = _snapshots(web, ("left",))
+        frames, statuses = frames_override if frames_override is not None else _snapshots(web, ("left",))
         if client is None:
             raise RuntimeError("VLM client is unavailable")
-        images = [frames["left"]]
+        images = [frames["left"], crop_jpeg(frames['left'], crop_xyxy)]
+        age = statuses.get('left', {}).get('raw_age_s', 0.)
+        statuses['image_time'] = datetime.fromtimestamp(time.time() - age).astimezone().isoformat(timespec='milliseconds')
+        if reference is not None:
+            images.append(reference)
     except Exception as exc:
         return _warning("gripper", exc, locals().get("statuses", {}))
-    _save_inputs("vlm_gripper_check", {"left": images[0]}, statuses)
+    saved = {'left': images[0], 'left_crop': images[1]}
+    if reference is not None:
+        saved['left_reference'] = reference
+    _save_inputs("vlm_gripper_check", saved, statuses)
     return _safe_check(client, "gripper", images, statuses, clock)
 
 
@@ -123,3 +160,16 @@ def run_assembly_checks(web, client, clock=time.monotonic) -> list[dict]:
         pin = pool.submit(_safe_check, client, "pin", [frames["right"], frames["left"], frames["head"]], statuses, clock)
         c_hole = pool.submit(_safe_check, client, "c-hole", [frames["left"], frames["right"]], statuses, clock)
         return [pin.result(), c_hole.result()]
+
+
+def run_assembly_review(web, client, emit, *, sleep=time.sleep):
+    records = []
+    for round_index in range(1,4):
+        if round_index > 1:
+            sleep(1.)
+        for record in run_assembly_checks(web, client):
+            record = dict(record)
+            record['review_round'] = round_index
+            records.append(record)
+            emit(record)
+    return records

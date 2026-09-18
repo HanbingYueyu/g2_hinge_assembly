@@ -7,7 +7,7 @@ from unittest.mock import patch
 import cv2
 import numpy as np
 
-from vlm_flow_checks import crop_jpeg, parse_crop_xyxy, run_assembly_checks, run_gripper_check
+from vlm_flow_checks import crop_jpeg, parse_crop_xyxy, run_assembly_checks, run_gripper_check, start_vlm_run, _save_inputs, run_assembly_review
 
 
 def jpeg(width=640, height=480):
@@ -25,6 +25,14 @@ class FakeWeb:
 
 
 class VlmFlowChecksTests(unittest.TestCase):
+    def test_assembly_review_refreshes_images_three_rounds_without_motion(self):
+        from unittest.mock import Mock
+        emit = Mock()
+        with patch('vlm_flow_checks.run_assembly_checks', return_value=[{'task': 'pin', 'ok': True}, {'task': 'c-hole', 'ok': True}]) as check:
+            records = run_assembly_review(None, None, emit, sleep=lambda _: None)
+        self.assertEqual(check.call_count, 3)
+        self.assertEqual(emit.call_count, 6)
+        self.assertEqual([r['review_round'] for r in records], [1,1,2,2,3,3])
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
@@ -32,6 +40,20 @@ class VlmFlowChecksTests(unittest.TestCase):
         self.directory_patch = patch("vlm_flow_checks.OUTPUT_DIR", self.output, create=True)
         self.directory_patch.start()
         self.addCleanup(self.directory_patch.stop)
+        self.run_directory = start_vlm_run()
+
+    def test_images_share_run_directory_and_new_run_gets_new_directory(self):
+        first, second = {}, {}
+        _save_inputs('stage_a', {'left': b'a'}, first)
+        _save_inputs('stage_b', {'right': b'b'}, second)
+        first_dir = Path(first['saved_images'][0]).parent
+        self.assertEqual(first_dir, Path(second['saved_images'][0]).parent)
+        self.assertEqual(first_dir.parent, self.output)
+        self.assertRegex(first_dir.name, r'^\d{8}_\d{6}_\d{6}$')
+        start_vlm_run()
+        third = {}
+        _save_inputs('stage_c', {'left': b'c'}, third)
+        self.assertNotEqual(first_dir, Path(third['saved_images'][0]).parent)
 
     def test_gripper_saves_exact_sent_bytes_with_stage_and_camera(self):
         sent = []
@@ -40,12 +62,13 @@ class VlmFlowChecksTests(unittest.TestCase):
                 sent.extend(images)
                 return {"state": "attached"}
         run_gripper_check(FakeWeb({"left": jpeg()}), Client(), (80, 120, 560, 480))
-        files = sorted(self.output.glob("*.jpg"))
-        self.assertEqual(len(files), 1)
+        files = sorted(self.output.rglob("*.jpg"))
+        self.assertEqual(len(files), 2)
         for file in files:
             self.assertRegex(file.name, r"^\d{8}_\d{6}_\d{6}_left_vlm_gripper_check(?:_crop)?\.jpg$")
         full = next(file for file in files if not file.stem.endswith("_crop"))
-        self.assertEqual([full.read_bytes()], sent)
+        crop = next(file for file in files if file.stem.endswith('_crop'))
+        self.assertEqual([full.read_bytes(), crop.read_bytes()], sent)
 
     def test_assembly_saves_shared_frames_once_even_on_api_failure(self):
         class Client:
@@ -53,10 +76,10 @@ class VlmFlowChecksTests(unittest.TestCase):
                 raise RuntimeError("timeout")
         frames = {"head": b"head", "left": b"left", "right": b"right"}
         run_assembly_checks(FakeWeb(frames), Client())
-        files = list(self.output.glob("*.jpg"))
+        files = list(self.output.rglob("*.jpg"))
         self.assertEqual(len(files), 3)
         for camera, data in frames.items():
-            file = next(self.output.glob(f"*_{camera}_vlm_assembly_check.jpg"))
+            file = next(self.output.rglob(f"*_{camera}_vlm_assembly_check.jpg"))
             self.assertEqual(file.read_bytes(), data)
 
     def test_save_failure_warns_but_still_calls_vlm(self):
@@ -75,18 +98,34 @@ class VlmFlowChecksTests(unittest.TestCase):
         output = cv2.imdecode(np.frombuffer(crop_jpeg(jpeg(), crop), np.uint8), cv2.IMREAD_COLOR)
         self.assertEqual(output.shape[:2], (360, 480))
 
-    def test_gripper_uses_only_left_full_original(self):
+    def test_default_crop_is_center_60_percent_height_40_percent_width(self):
+        from vlm_flow_checks import central_gripper_crop
+        for width, height, expected in ((1280,1056,(634,512)), (640,480,(288,256))):
+            with self.subTest(width=width, height=height):
+                result = central_gripper_crop(jpeg(width,height))
+                decoded = cv2.imdecode(np.frombuffer(result, np.uint8), cv2.IMREAD_COLOR)
+                self.assertEqual(decoded.shape[:2], expected)
+
+    def test_default_crop_samples_center_not_top_left_background(self):
+        image = np.zeros((480,640,3), dtype=np.uint8)
+        image[96:384,192:448] = 255
+        ok, encoded = cv2.imencode('.jpg', image)
+        self.assertTrue(ok)
+        result = cv2.imdecode(np.frombuffer(crop_jpeg(encoded.tobytes()), np.uint8), cv2.IMREAD_COLOR)
+        self.assertGreater(float(result[10:-10,10:-10].mean()), 250.)
+
+    def test_gripper_uses_original_full_then_crop_then_historical_reference(self):
         calls = []
         client = type("Client", (), {"run_bytes": lambda _s, task, images: calls.append((task, images)) or {"state": "attached", "confidence": .9}})()
-        record = run_gripper_check(FakeWeb({"left": jpeg()}), client, (80, 120, 560, 480))
+        record = run_gripper_check(FakeWeb({"left": jpeg()}), client, (80, 120, 560, 480), reference=b'historical')
         self.assertTrue(record["ok"])
         self.assertEqual(calls[0][0], "gripper")
-        self.assertEqual(calls[0][1], [jpeg()])
+        self.assertEqual(calls[0][1], [jpeg(), crop_jpeg(jpeg(), (80,120,560,480)), b'historical'])
 
     def test_overlay_never_replaces_original_vlm_input(self):
         from bilateral_web import BilateralWeb
         web = BilateralWeb()
-        web.publish_raw_pane('left', b'original', {})
+        web.publish_raw_pane('left', jpeg(), {})
         web.update_pane('left', b'annotated', {})
         sent = []
         class Client:
@@ -95,9 +134,9 @@ class VlmFlowChecksTests(unittest.TestCase):
                 return {'state': 'attached'}
         record = run_gripper_check(web, Client(), None)
         self.assertTrue(record['ok'])
-        self.assertEqual(sent, [b'original'])
+        self.assertEqual(sent, [jpeg(), crop_jpeg(jpeg(), None)])
         self.assertEqual(web.snapshot_pane('left')[0], b'annotated')
-        self.assertEqual(next(self.output.glob('*.jpg')).read_bytes(), b'original')
+        self.assertEqual(next(self.output.rglob('*_check.jpg')).read_bytes(), jpeg())
 
     def test_raw_http_handler_serves_original_and_rejects_stale_frame(self):
         from bilateral_web import BilateralWeb

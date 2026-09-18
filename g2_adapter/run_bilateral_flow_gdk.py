@@ -245,7 +245,7 @@ def parse_args(argv=None) -> argparse.Namespace:
     parser.add_argument("--vlm-model", default="qwen3.8-flash")
     parser.add_argument("--vlm-api-url", default="https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions")
     parser.add_argument("--vlm-timeout-s", type=float, default=60.0)
-    parser.add_argument("--vlm-gripper-crop", default=None, help="旧参数兼容；已停用裁剪，始终发送完整原图")
+    parser.add_argument("--vlm-gripper-crop", default=None, help="可选像素框 x0,y0,x1,y1；默认居中保留高度60%、宽度40%")
     parser.add_argument("--auto-speed-mm-s", type=float, default=10.0)
     parser.add_argument("--auto-preset-velocity-rad-s", type=float, default=0.08)
     parser.add_argument("--left-seat-max-descent-mm", type=float, default=10.0,
@@ -562,6 +562,10 @@ def _publish_head_overlay(ctx: FlowContext, overlay, localization: dict) -> None
 
 
 def stage_left_grasp(ctx: FlowContext) -> dict:
+    ctx.services.put('left_raw_feed', ctx.feeds.get('left'))
+    monitor = ctx.services.get('vlm_gripper_monitor')
+    if monitor is not None:
+        monitor.set_phase('pre_grasp')
     try:
         from .left_grasp_gdk import run_left_cycle
     except ImportError:
@@ -571,6 +575,8 @@ def stage_left_grasp(ctx: FlowContext) -> dict:
     targets = ctx.services.get("head_targets") or {}
     with concise_child_stdout():
         code = run_left_cycle(services=ctx.services, argv=ctx.settings.left_argv())
+    if monitor is not None:
+        monitor.raise_if_regrasp_requested()
     if code != 0:
         raise SafetyError(f"左手抓取阶段返回 {code}")
     return {"returncode": code, "hole_detected": "hole" in targets}
@@ -604,6 +610,9 @@ def stage_left_to_ll1_and_seat(ctx: FlowContext) -> dict:
 
 
 def stage_left_release_lift_to_ll2(ctx: FlowContext) -> dict:
+    monitor = ctx.services.get('vlm_gripper_monitor')
+    if monitor is not None:
+        monitor.finish_before_release()
     try:
         from .left_seat_motion import move_left_vertical
     except ImportError:
@@ -638,6 +647,12 @@ def stage_right_to_lr1(ctx: FlowContext) -> dict:
 def stage_vlm_gripper_check(ctx: FlowContext) -> dict:
     if ctx.args.disable_vlm_checks:
         return {"skipped": True, "reason": "disabled"}
+    monitor = ctx.services.get('vlm_gripper_monitor')
+    if monitor is not None:
+        # Background serial requests continue through transport/placement.
+        # Do not wait for a remote response or declare this stage grasp success.
+        monitor.set_phase('post_grasp')
+        return {'task': 'gripper', 'monitoring': True}
     try:
         from .vlm_flow_checks import run_gripper_check
     except ImportError:
@@ -651,12 +666,10 @@ def stage_vlm_assembly_check(ctx: FlowContext) -> dict:
     if ctx.args.disable_vlm_checks:
         return {"skipped": True, "reason": "disabled"}
     try:
-        from .vlm_flow_checks import run_assembly_checks
+        from .vlm_flow_checks import run_assembly_review
     except ImportError:
-        from vlm_flow_checks import run_assembly_checks
-    records = run_assembly_checks(ctx.services.web, ctx.services.get("vlm_client"))
-    for record in records:
-        ctx.runtime.emit_event(record)
+        from vlm_flow_checks import run_assembly_review
+    records = run_assembly_review(ctx.services.web, ctx.services.get("vlm_client"), ctx.runtime.emit_event)
     return {"tasks": [record["task"] for record in records], "ok": all(record["ok"] for record in records)}
 
 
@@ -767,6 +780,11 @@ STAGE_HANDLERS = {
 
 
 def run_flow(args: argparse.Namespace) -> int:
+    try:
+        from .vlm_flow_checks import start_vlm_run
+    except ImportError:
+        from vlm_flow_checks import start_vlm_run
+    start_vlm_run()
     try:
         import agibot_gdk
     except ImportError:
@@ -914,8 +932,24 @@ def run_flow(args: argparse.Namespace) -> int:
         ctx = FlowContext(
             gdk=agibot_gdk, services=services, runtime=runtime, settings=settings, feeds=feeds,
         )
+        if not args.disable_vlm_checks and services.get('vlm_client') is not None:
+            try:
+                from .vlm_gripper_monitor import GripperMonitor
+                from .vlm_flow_checks import parse_crop_xyxy
+            except ImportError:
+                from vlm_gripper_monitor import GripperMonitor
+                from vlm_flow_checks import parse_crop_xyxy
+            monitor = GripperMonitor(web, services.get('vlm_client'), flow_event_sink,
+                                     parse_crop_xyxy(args.vlm_gripper_crop) if args.vlm_gripper_crop else None)
+            services.put('vlm_gripper_monitor', monitor)
+            controller.automatic_guard = monitor.raise_if_regrasp_requested
+            monitor.start()
         return _drive(ctx, args)
     finally:
+        if services is not None:
+            monitor = services.get('vlm_gripper_monitor')
+            if monitor is not None:
+                monitor.stop()
         # Deterministic teardown: stop every producer thread first, then drop
         # the vision assets, and only then release the GDK session.  Closing
         # cameras or releasing GDK while a worker is still ticking has been
@@ -966,6 +1000,10 @@ def run_flow(args: argparse.Namespace) -> int:
 
 
 def _drive(ctx: FlowContext, args: argparse.Namespace) -> int:
+    try:
+        from .vlm_gripper_monitor import VlmRegraspRequested
+    except ImportError:
+        from vlm_gripper_monitor import VlmRegraspRequested
     if args.from_stage is not None:
         order = stage_names()
         if order.index(args.from_stage) > order.index(Stage.HEAD_LOCALIZE.value):
@@ -1003,7 +1041,7 @@ def _drive(ctx: FlowContext, args: argparse.Namespace) -> int:
         # A stage that uses a camera owns that pane and pushes its own overlay;
         # pause the raw fallback for it so the two never read the same camera.
         feed = ctx.feeds.get(spec.camera_pane) if spec.camera_pane else None
-        if feed is not None:
+        if feed is not None and spec.stage is not Stage.LEFT_GRASP:
             feed.pause()
         try:
             if spec.waits_for_advance:
@@ -1011,6 +1049,38 @@ def _drive(ctx: FlowContext, args: argparse.Namespace) -> int:
                 payload = {"gate": spec.stage.value}
             else:
                 payload = STAGE_HANDLERS[spec.stage](ctx)
+        except VlmRegraspRequested as exc:
+            monitor = ctx.services.get('vlm_gripper_monitor')
+            if monitor is None or not (ctx.services.get('head_targets') or {}).get('hinge'):
+                ctx.runtime.emit('stage_failed', stage=spec.stage.value, error='VLM 重抓缺少本次头部铰链定位')
+                return 1
+            monitor.set_phase('pre_grasp')
+            ctx.runtime.emit('vlm_regrasp_requested', stage=spec.stage.value, reason=str(exc))
+            print('[VLM 重抓] 停止当前动作，先竖直上抬 50 mm，再返回铰链预接近点重新夹取。', flush=True)
+            try:
+                controller = ctx.services.controller
+                # All left stage streams have unwound/stopped before here.
+                # Replace the previous destination with measured joints;
+                # do not open the gripper while returning to the tray.
+                current = list(controller.checked_arm_state()[:7])
+                for _ in range(20):
+                    with controller._motion_write():
+                        ctx.services.robot.move_arm_joint_servo(current, .01, 0, False)
+                    time.sleep(.01)
+                try:
+                    from .left_seat_motion import move_left_vertical
+                except ImportError:
+                    from left_seat_motion import move_left_vertical
+                lift = move_left_vertical(
+                    controller, distance_mm=50.0, speed_mm_s=ctx.args.auto_speed_mm_s,
+                )
+                ctx.runtime.emit_event(lift)
+            except Exception as recovery_error:
+                ctx.runtime.emit('stage_failed', stage=spec.stage.value, error=f'VLM 重抓停止或上抬失败：{recovery_error}')
+                print(f'VLM 重抓停止或上抬失败：{recovery_error}', file=sys.stderr)
+                return 1
+            sequencer.skip_to(Stage.LEFT_GRASP.value)
+            continue
         except Exception as exc:  # noqa: BLE001 - reported and stops the sequence
             sequencer.fail_current(str(exc))
             ctx.runtime.emit("stage_failed", stage=spec.stage.value, error=str(exc))

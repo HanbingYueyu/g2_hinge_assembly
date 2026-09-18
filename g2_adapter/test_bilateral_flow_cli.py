@@ -277,6 +277,58 @@ class HeadTargetGateTests(unittest.TestCase):
 
 
 class DispatchTests(unittest.TestCase):
+    def test_vlm_failure_during_placement_restarts_left_grasp_without_relocalizing_head_or_opening_gripper(self):
+        from contextlib import nullcontext
+        from types import SimpleNamespace
+        from vlm_gripper_monitor import GripperMonitor, VlmRegraspRequested
+        context, runtime = self.make_context()
+        context.services.put('head_targets', {'hinge': {'position': [1,2,3]}})
+        monitor = GripperMonitor(None, None, lambda record: None)
+        context.services.put('vlm_gripper_monitor', monitor)
+        sent = []
+        context.services.robot = SimpleNamespace(move_arm_joint_servo=lambda *args: sent.append(args))
+        context.services.controller = SimpleNamespace(checked_arm_state=lambda: (0.,)*14, _motion_write=nullcontext)
+        visits = []
+        failed = [False]
+        def handler(stage):
+            def run(_ctx):
+                visits.append(stage)
+                if stage is Stage.LEFT_TO_LL1_AND_SEAT and not failed[0]:
+                    failed[0] = True
+                    raise VlmRegraspRequested('dropped')
+                return {}
+            return run
+        with patch.dict(flow.STAGE_HANDLERS, {stage: handler(stage) for stage in flow.STAGE_HANDLERS}), patch('run_bilateral_flow_gdk.time.sleep'), patch('left_seat_motion.move_left_vertical', return_value={'event': 'left_vertical_lift_complete'}) as lift:
+            self.assertEqual(flow._drive(context, context.args), 0)
+        lift.assert_called_once_with(context.services.controller, distance_mm=50.0, speed_mm_s=context.args.auto_speed_mm_s)
+        self.assertEqual(visits.count(Stage.LEFT_GRASP), 2)
+        self.assertEqual(visits.count(Stage.HEAD_LOCALIZE), 1)
+        self.assertEqual(len(sent), 20)
+        self.assertTrue(all(args == ([0.]*7, .01, 0, False) for args in sent))
+        self.assertEqual(runtime.left_gripper_opens, 0)
+
+    def test_vlm_regrasp_lift_failure_stops_before_restarting_pickup(self):
+        from contextlib import nullcontext
+        from types import SimpleNamespace
+        from vlm_gripper_monitor import GripperMonitor, VlmRegraspRequested
+        context, runtime = self.make_context()
+        context.services.put('head_targets', {'hinge': {'position': [1, 2, 3]}})
+        context.services.put('vlm_gripper_monitor', GripperMonitor(None, None, lambda record: None))
+        context.services.robot = SimpleNamespace(move_arm_joint_servo=lambda *args: None)
+        context.services.controller = SimpleNamespace(checked_arm_state=lambda: (0.,)*14, _motion_write=nullcontext)
+        visits = []
+        def handler(stage):
+            def run(_ctx):
+                visits.append(stage)
+                if stage is Stage.LEFT_TO_LL1_AND_SEAT:
+                    raise VlmRegraspRequested('dropped')
+                return {}
+            return run
+        with patch.dict(flow.STAGE_HANDLERS, {stage: handler(stage) for stage in flow.STAGE_HANDLERS}), patch('run_bilateral_flow_gdk.time.sleep'), patch('left_seat_motion.move_left_vertical', side_effect=RuntimeError('lift not reached')):
+            self.assertEqual(flow._drive(context, context.args), 1)
+        self.assertEqual(visits.count(Stage.LEFT_GRASP), 1)
+        self.assertEqual(runtime.left_gripper_opens, 0)
+
     def test_left_motion_stages_keep_live_feed_in_both_placement_modes(self):
         from bilateral_web import BilateralWeb, RawPaneFeed
         for method in ("original", "teach"):
@@ -290,7 +342,7 @@ class DispatchTests(unittest.TestCase):
                 def handler(stage):
                     def run(_ctx):
                         if stage is Stage.LEFT_GRASP:
-                            self.assertEqual(feed.step(), "paused")
+                            self.assertEqual(feed.step(), "published")
                         if stage in (Stage.LEFT_TO_LL1_AND_SEAT, Stage.LEFT_RELEASE_LIFT_TO_LL2):
                             self.assertEqual(feed.step(), "published")
                             self.assertEqual(web.snapshot_pane("left")[0], b"current-left-frame")

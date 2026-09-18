@@ -68,7 +68,12 @@ def console_event_summary(record: dict) -> str | None:
         result = record.get("result") or {}
         label = {"vlm_gripper_result": "夹持", "vlm_pin_result": "凸轴", "vlm_c_hole_result": "C孔"}[event]
         value = result.get("state", result.get("obvious_c_leak"))
-        return f"[VLM {label}] result={value} confidence={result.get('confidence')} reason={result.get('reason')}"
+        stable = f" stable={record['stable_state']}" if 'stable_state' in record else ''
+        review = f" round={record['review_round']}/3" if 'review_round' in record else ''
+        timing = ''
+        if event == 'vlm_gripper_result':
+            timing = f" image_time={record.get('input_status', {}).get('image_time', 'unknown')} elapsed={record.get('elapsed_s', 'unknown')}s"
+        return f"[VLM {label}] result={value}{stable}{review} confidence={result.get('confidence')} reason={result.get('reason')}{timing}"
     if event == "vlm_check_warning":
         return f"[VLM 警告] task={record.get('task')} error={record.get('error')}"
     if record.get("level") == "warning":
@@ -341,6 +346,9 @@ class BilateralRuntime:
         self.worker.allow_advance_right = True
         try:
             while True:
+                guard = getattr(self.controller, 'check_automatic_guard', None)
+                if guard is not None:
+                    guard()
                 self.worker.raise_if_failed()
                 if self.worker.advance_requested:
                     self.worker.consume_advance()
