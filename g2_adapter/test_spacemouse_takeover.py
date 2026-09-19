@@ -318,11 +318,11 @@ class MotionPauseGateTests(unittest.TestCase):
 
 
 class WorkerTests(unittest.TestCase):
-    def test_activation_prepares_selected_arm_with_standard_joint_impedance(self):
+    def test_activation_uses_manual_position_control_and_restores_joint_impedance(self):
         for side, group in (("left", 0), ("right", 1)):
             with self.subTest(side=side):
                 robot = BilateralRobot()
-                robot.control_mode = 1
+                robot.control_mode = 3
                 gate = MotionPauseGate()
                 controller = G2Controller(FakeGdk, robot, allow_motion=True, motion_gate=gate)
                 worker = SpaceMouseTakeoverWorker(
@@ -335,13 +335,20 @@ class WorkerTests(unittest.TestCase):
 
                 worker._activate(side, frame(1.0), 1.0, ())
 
+                # Manual takeover is rigid position control, not impedance.
+                self.assertEqual(robot.control_mode, 1)
+                self.assertTrue(gate.is_paused())
+                self.assertEqual(robot.joint_impedance_calls, [])
+
+                worker._deactivate(resume=False)
+
+                # Automatic stages need joint impedance restored on that arm.
                 self.assertEqual(robot.control_mode, 3)
                 self.assertEqual([configured_group for _, configured_group in robot.joint_impedance_calls], [group])
                 self.assertEqual(
                     [item.kp for item in robot.joint_impedance_calls[0][0]],
                     list(STANDARD_JOINT_IMPEDANCE_KP),
                 )
-                self.assertTrue(gate.is_paused())
 
     def test_worker_routes_left_hold_right_press_to_dianpi_without_takeover(self):
         robot = BilateralRobot()

@@ -510,13 +510,19 @@ class SpaceMouseTakeoverWorker:
         self.active_side = side
         self._session = self._new_session(side)
         with self.controller.manual_motion():
-            self.controller.prepare_joint_impedance_control((side,))
+            # Manual takeover runs in position control so the arm is rigid.
+            self.controller.enter_manual_takeover_control()
             self._session.tick(self._without_consumed_buttons(frame, consumed), now)
 
     def _deactivate(self, *, resume: bool) -> None:
+        side = self.active_side
         if self._session is not None:
             with self.controller.manual_motion():
                 self._session.stop()
+                if side is not None:
+                    # Automatic stages require joint impedance; restore it
+                    # before the automatic gate can resume.
+                    self.controller.restore_automatic_joint_impedance((side,))
         self._session = None
         self.active_side = None
         if resume:

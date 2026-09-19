@@ -13,11 +13,11 @@ from typing import Callable
 import numpy as np
 
 try:
-    from .control import CartesianPoseTarget, G2Controller, quaternion_angle_deg
+    from .control import CartesianPoseTarget, G2Controller, MANUAL_TAKEOVER_CONTROL_MODE
     from .safety import SafetyError
     from .spacemouse_input import InputFrame, parse_axis_map
 except ImportError:
-    from control import CartesianPoseTarget, G2Controller, quaternion_angle_deg
+    from control import CartesianPoseTarget, G2Controller, MANUAL_TAKEOVER_CONTROL_MODE
     from safety import SafetyError
     from spacemouse_input import InputFrame, parse_axis_map
 
@@ -48,8 +48,6 @@ class TeleopConfig:
     # rotation to translation and axial rotation vectors.
     axis_map: tuple[int, ...] = (-2, -1, -3, -5, -4, -6)
     input_timeout_s: float = .15
-    max_position_error_m: float = .01
-    max_orientation_error_rad: float = .10
 
     def __post_init__(self):
         if self.side not in {'left', 'right'}:
@@ -57,7 +55,6 @@ class TeleopConfig:
         bounds = {
             'speed_m_s': (0, .03), 'angular_speed_rad_s': (0, .5),
             'deadzone': (0, .5), 'input_timeout_s': (.04, .3),
-            'max_position_error_m': (0, .02), 'max_orientation_error_rad': (0, .2),
         }
         for name, (low, high) in bounds.items():
             value = getattr(self, name)
@@ -101,6 +98,11 @@ class TeleopSession:
         self.allow_side_switch = bool(allow_side_switch)
         self.side = config.side
         self.target: CartesianPoseTarget | None = None
+        # Latched hold target while the joystick is neutral.  Re-basing the
+        # target on the measured pose every tick made an idle arm follow any
+        # external push; keeping one fixed point restores real joint-impedance
+        # stiffness.
+        self._hold_target: CartesianPoseTarget | None = None
         self._gripper_open: dict[str, bool] = {}
         self._gripper_goal: float | None = None
         self._last_time: float | None = None
@@ -123,8 +125,14 @@ class TeleopSession:
     def _healthy(self):
         self.controller.checked_arm_state()
         status = self.controller.motion_status_summary()
-        if status['mode'] not in {0, 1} or status['control_mode'] != 3 or status['error_code'] != 0:
-            raise SafetyError(f'遥操作需要 mode=0/1、control_mode=3 且无故障: {status}')
+        if (
+            status['mode'] not in {0, 1}
+            or status['control_mode'] not in {MANUAL_TAKEOVER_CONTROL_MODE, 3}
+            or status['error_code'] != 0
+        ):
+            raise SafetyError(
+                f'遥操作需要 mode=0/1、control_mode={MANUAL_TAKEOVER_CONTROL_MODE} 或 3 且无故障: {status}'
+            )
 
     def _actual(self):
         return self.controller.read_end_effector_pose('arm_l_end_link' if self.side == 'left' else 'arm_r_end_link')
@@ -201,6 +209,7 @@ class TeleopSession:
 
     def _activate(self):
         self.target = self._actual()
+        self._hold_target = None
         _, positions = self._gripper()
         self._gripper_open[self.side] = positions[0] < OPEN_RAD / 2
         self._gripper_goal = None
@@ -292,20 +301,6 @@ class TeleopSession:
             return self.event
 
         actual = self._actual()
-        position_error_m = float(np.linalg.norm(np.asarray(self.target.position_m) - actual.position_m))
-        orientation_error_deg = quaternion_angle_deg(self.target.orientation_xyzw, actual.orientation_xyzw)
-        if (position_error_m > self.config.max_position_error_m or
-                math.radians(orientation_error_deg) > self.config.max_orientation_error_rad):
-            raise SafetyError(
-                '末端跟随误差超限；撤销未到达的目标：'
-                f'side={self.side}, position_error_mm={position_error_m * 1000:.3f}, '
-                f'orientation_error_deg={orientation_error_deg:.3f}, '
-                f'position_limit_mm={self.config.max_position_error_m * 1000:.3f}, '
-                f'orientation_limit_deg={math.degrees(self.config.max_orientation_error_rad):.3f}, '
-                f'target_position_m={self.target.position_m}, actual_position_m={actual.position_m}, '
-                f'target_orientation_xyzw={self.target.orientation_xyzw}, '
-                f'actual_orientation_xyzw={actual.orientation_xyzw}'
-            )
         clicks = set(frame.pressed)
         both = clicks == {0, 1} or all(frame.buttons)
         for button in clicks:
@@ -345,16 +340,17 @@ class TeleopSession:
             else:
                 self._right_pending_click = now
 
-        # Integrate one velocity step from the latest measured pose. Using
-        # the previous command as the base lets normal servo latency compound
-        # into a growing target/feedback error and eventually trips the guard.
-        # A measured-pose base keeps this interface velocity-like: a stalled
-        # arm receives a bounded one-step target instead of an old backlog.
-        base = actual
-        target = integrate_pose(base, axes, dt, self.config.speed_m_s, self.config.angular_speed_rad_s)
-        if (np.linalg.norm(np.asarray(target.position_m) - actual.position_m) > self.config.max_position_error_m or
-                math.radians(quaternion_angle_deg(target.orientation_xyzw, actual.orientation_xyzw)) > self.config.max_orientation_error_rad):
-            raise SafetyError('新目标跟随误差超限')
+        # Neutral input latches one fixed hold point so joint impedance keeps
+        # a real restoring force; only an actual joystick deflection integrates
+        # a new step, and that step is based on the latest measured pose so a
+        # stalled arm receives a bounded one-step target instead of a backlog.
+        if neutral:
+            if self._hold_target is None:
+                self._hold_target = actual
+            target = self._hold_target
+        else:
+            self._hold_target = None
+            target = integrate_pose(actual, axes, dt, self.config.speed_m_s, self.config.angular_speed_rad_s)
         self._send(target)
         self.target = target
         return self.event

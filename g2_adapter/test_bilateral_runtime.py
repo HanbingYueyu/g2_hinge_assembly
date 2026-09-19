@@ -7,6 +7,12 @@ from argparse import Namespace
 from pathlib import Path
 from unittest.mock import Mock, patch
 
+# Import OpenCV before any ``patch.dict("sys.modules", ...)`` below.  run_flow()
+# lazily imports vlm_flow_checks -> cv2; when that first import happens inside
+# the mocked sys.modules it leaves cv2 partially initialised, so the next
+# test's cv2 import fails with "module 'cv2.dnn' has no attribute 'DictValue'".
+import cv2  # noqa: F401
+
 from bilateral_runtime import (
     OPEN_GRIPPER_RAD,
     STAGED_PRESETS,

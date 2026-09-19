@@ -57,6 +57,10 @@ _DEFAULT_ACTUAL_ARRIVAL_STABLE_SAMPLES = 3
 STANDARD_JOINT_IMPEDANCE_KP: tuple[float, ...] = (
     400.0, 400.0, 400.0, 500.0, 300.0, 200.0, 200.0,
 )
+# Supervised manual takeover (SpaceMouse) intentionally runs in position
+# control so the arm holds a commanded pose firmly instead of yielding to a
+# light push.  Automatic motion restores joint impedance afterwards.
+MANUAL_TAKEOVER_CONTROL_MODE = 1
 
 
 def quaternion_slerp(
@@ -1548,6 +1552,29 @@ class G2Controller:
                 f"actual={{'control_mode': {int(status.control_mode)}, "
                 f"'error_code': {int(status.error_code)}, 'error_msg': '{status.error_msg}'}}"
             )
+
+    def enter_manual_takeover_control(self) -> None:
+        """Switch to position control for a supervised manual takeover.
+
+        SpaceMouse takeover is intentionally rigid: the operator needs the arm
+        to hold a commanded pose firmly instead of yielding to a light push.
+        Automatic motion restores joint impedance when takeover ends.  This is
+        not a formal-motion fallback; it is the explicit manual-control mode.
+        """
+        self._require_motion()
+        self.set_control_mode(MANUAL_TAKEOVER_CONTROL_MODE)
+        status = self.motion_status_summary()
+        if status["control_mode"] != MANUAL_TAKEOVER_CONTROL_MODE or status["error_code"] != 0:
+            raise SafetyError(
+                "manual takeover requires healthy position control_mode="
+                f"{MANUAL_TAKEOVER_CONTROL_MODE}; actual={status}"
+            )
+
+    def restore_automatic_joint_impedance(
+        self, sides: Sequence[str] = ("left", "right")
+    ) -> None:
+        """Return to standard joint impedance after a manual takeover."""
+        self.prepare_joint_impedance_control(sides)
 
     def set_control_mode(self, control_mode: int) -> None:
         """Set and verify a GDK control mode through the sole command boundary."""

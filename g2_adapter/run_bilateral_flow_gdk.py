@@ -594,30 +594,40 @@ def stage_left_grasp(ctx: FlowContext) -> dict:
 
 
 def stage_left_to_ll1_and_seat(ctx: FlowContext) -> dict:
-    if ctx.args.left_placement_method == "teach":
-        try:
-            from .left_teach_placement import replay_left_placement
-        except ImportError:
-            from left_teach_placement import replay_left_placement
-        return replay_left_placement(ctx.services, ctx.args)
+    monitor = ctx.services.get('vlm_gripper_monitor')
     try:
-        from .left_seat_motion import force_guarded_left_descent
-    except ImportError:
-        from left_seat_motion import force_guarded_left_descent
-    records = ctx.runtime.move_left_presets(
-        ("LL1",),
-        velocity_rad_s=ctx.args.auto_preset_velocity_rad_s,
-        arrival_tolerance_rad=ctx.args.preset_arrival_tolerance_rad,
-        timeout_s=ctx.args.preset_timeout_s,
-    )
-    descent = force_guarded_left_descent(
-        ctx.services.controller, ctx.services.robot,
-        max_distance_mm=ctx.args.left_seat_max_descent_mm,
-        force_threshold_n=ctx.args.left_seat_force_threshold_n,
-        speed_mm_s=ctx.args.auto_speed_mm_s,
-    )
-    ctx.runtime.emit_event(descent)
-    return {"presets": [record["preset"] for record in records], "descent": descent}
+        if ctx.args.left_placement_method == "teach":
+            try:
+                from .left_teach_placement import replay_left_placement
+            except ImportError:
+                from left_teach_placement import replay_left_placement
+            return replay_left_placement(ctx.services, ctx.args)
+        try:
+            from .left_seat_motion import force_guarded_left_descent
+        except ImportError:
+            from left_seat_motion import force_guarded_left_descent
+        records = ctx.runtime.move_left_presets(
+            ("LL1",),
+            velocity_rad_s=ctx.args.auto_preset_velocity_rad_s,
+            arrival_tolerance_rad=ctx.args.preset_arrival_tolerance_rad,
+            timeout_s=ctx.args.preset_timeout_s,
+        )
+        descent = force_guarded_left_descent(
+            ctx.services.controller, ctx.services.robot,
+            max_distance_mm=ctx.args.left_seat_max_descent_mm,
+            force_threshold_n=ctx.args.left_seat_force_threshold_n,
+            speed_mm_s=ctx.args.auto_speed_mm_s,
+        )
+        ctx.runtime.emit_event(descent)
+        return {"presets": [record["preset"] for record in records], "descent": descent}
+    finally:
+        if monitor is not None:
+            # The hinge has been seated.  From here the left arm only releases
+            # and lifts away, so a later "not attached" vote (which is expected
+            # once the jaws open) must never request another pickup.  Leaving
+            # the monitor in post_grasp kept polling through the gate and
+            # turned a finished placement into a regrasp.
+            monitor.set_phase('idle')
 
 
 def stage_left_release_lift_to_ll2(ctx: FlowContext) -> dict:

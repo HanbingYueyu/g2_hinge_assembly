@@ -35,11 +35,13 @@ class TeleopHealthTests(unittest.TestCase):
         self.assertEqual(controller.motion_status_summary()['control_mode'], 3)
         TeleopSession(controller, TeleopConfig())._healthy()
 
-    def test_health_accepts_joint_impedance_mode_and_rejects_position_mode(self):
+    def test_health_accepts_joint_impedance_and_manual_position_mode(self):
         robot = BilateralRobot()
         session = TeleopSession(G2Controller(FakeGdk, robot, allow_motion=True), TeleopConfig())
         session._healthy()
         robot.control_mode = 1
+        session._healthy()
+        robot.control_mode = 2
         with self.assertRaises(SafetyError):
             session._healthy()
 
@@ -116,6 +118,20 @@ class TeleopTests(unittest.TestCase):
         self.assertEqual(pose.position.x, 0)
         self.assertEqual(pose.orientation.z, 0)
         self.assertEqual(pose.orientation.w, 1)
+
+    def test_neutral_latches_one_hold_point_instead_of_following_a_push(self):
+        self.tick((1, 0, 0, 0, 0, 0))
+        moved = self.robot.requests[-1].right_end_effector_pose.position.x
+        self.assertGreater(moved, 0)
+        self.tick()
+        latched = self.robot.requests[-1].right_end_effector_pose.position.x
+        self.assertAlmostEqual(latched, moved, places=6)
+        # An external push while the joystick stays neutral must not move the
+        # commanded hold point; joint impedance keeps a restoring force.
+        self.robot.right_end_pose.position.x = latched + 0.05
+        self.tick()
+        pose = self.robot.requests[-1].right_end_effector_pose
+        self.assertAlmostEqual(pose.position.x, latched, places=6)
 
     def test_switch_while_deflected_is_rejected_and_not_queued(self):
         self.left_double_click((1, 0, 0, 0, 0, 0))
@@ -261,7 +277,7 @@ class TeleopTests(unittest.TestCase):
 
     def test_bad_mode_and_loop_stall_prevent_further_commands(self):
         count = len(self.robot.requests)
-        self.robot.control_mode = 1
+        self.robot.control_mode = 2
         with self.assertRaises(SafetyError):
             self.tick()
         self.assertEqual(len(self.robot.requests), count)
