@@ -139,7 +139,7 @@ YOLO 掩膜及各自的有效深度点数。只有同时具有有效深度的候
 
 现有权重来自另一套 `680×420` 相机视角，和 G2 左 D405 的原生 `1280×1056` 视角、光照、托盘位置
 不一致。不要继续用它的低置信度输出来自动生成真值；应重新采集 G2 原生彩色图，并人工勾出每个可见
-铰链的轮廓。`capture_left_d405_hinge_yolo_dataset.py` 是浏览器标注器：冻结一帧后会自动按提示词运行一次 SAM，
+铰链的轮廓。`capture_hinge_yolo_dataset_gdk.py` 是浏览器标注器：冻结一帧后会自动按提示词运行一次 SAM，
 再逐个确认、删除误检或清空后手画；SAM 建议绝不会自动保存。用左键沿铰链边缘点多边形，
 点完一个铰链按“完成当前实例”，一帧中所有铰链都标完再保存。没有铰链的空托盘、机械臂遮挡、手进入画面的
 负样本也要保存为空标签。
@@ -151,7 +151,7 @@ YOLO 掩膜及各自的有效深度点数。只有同时具有有效深度的候
 cd /home/flyfuture/g2_hinge_assembly
 
 ./scripts/run_gdk_sam3_python.sh \
-  g2_adapter/capture_left_d405_hinge_yolo_dataset.py \
+  g2_adapter/capture_hinge_yolo_dataset_gdk.py \
   --host 0.0.0.0 --port 8770 \
   --sam-prompt "silver triangular hinge"
 ```

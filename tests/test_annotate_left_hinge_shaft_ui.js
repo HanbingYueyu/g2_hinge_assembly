@@ -21,11 +21,14 @@ function element(id) {
     };
     return elements[id];
 }
+let strokeWidths = [], fillCount = 0;
 let ctx = {
     clearRect() {}, drawImage() {}, beginPath() {}, ellipse() {}, stroke() {},
     arc() {}, fill() {}, moveTo() {}, lineTo() {}, closePath() {},
     strokeStyle: '', fillStyle: '', lineWidth: 0,
 };
+ctx.stroke = function() { strokeWidths.push(this.lineWidth); };
+ctx.fill = function() { fillCount++; };
 let canvas = {
     width: 400, height: 300,
     addEventListener(name, fn) { handlers[name] = fn; },
@@ -67,6 +70,15 @@ handlers.pointerup({button:0, pointerId:3});
 assert(polys[0].rx===oldRx+20, 'ellipse handle did not resize');
 let saved=serializable()[0];
 assert(saved.shape==='ellipse' && saved.points.length===48, 'ellipse serialization is not editable metadata');
+width=1280; height=1056; c.width=1280; c.height=1056;
+polys=[{class_id:1,shape:'ellipse',cx:640,cy:528,rx:20,ry:16}];
+selected=-1; strokeWidths=[]; draw();
+assert(strokeWidths[0]===2, 'unselected hole outline must be 2 px');
+selected=0; strokeWidths=[]; draw();
+assert(strokeWidths[0]===2.5, 'selected hole outline must be 2.5 px');
+polys=[{class_id:1,points:[[620,510],[660,510],[660,546],[620,546]]}];
+selected=-1; fillCount=0; draw();
+assert(fillCount===0, 'saved hole polygon must not draw dense vertex dots');
 print('UI ellipse create/edit/serialize smoke test: PASS');
 `;
 eval('(function(){' + testScript + '\n})();');

@@ -6,7 +6,7 @@ Accepted source layouts (first match wins):
 * ``<source>/images/all`` + ``<source>/labels/all``
   output of ``annotate_left_hinge_shaft_sam3.py`` (single "all" split)
 * ``<source>/images_all`` + ``<source>/labels_all``
-  raw capture layout from ``capture_left_d405_hinge_yolo_dataset.py``
+  raw capture layout from ``capture_hinge_yolo_dataset_gdk.py``
 
 Class names come from ``<source>/classes.txt`` or ``<source>/dataset_info.json``,
 falling back to ``--class-names``.  Frames are shuffled with a fixed seed and

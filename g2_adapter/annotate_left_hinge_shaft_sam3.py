@@ -22,9 +22,9 @@ import cv2
 import numpy as np
 
 try:
-    from .capture_left_d405_hinge_yolo_dataset import SamAssistant
+    from .capture_hinge_yolo_dataset_gdk import SamAssistant
 except ImportError:
-    from capture_left_d405_hinge_yolo_dataset import SamAssistant
+    from capture_hinge_yolo_dataset_gdk import SamAssistant
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -65,8 +65,8 @@ function toggleDraw(){const on=!drawMode;clearModes();if(on){drawMode=true;setCl
 function toggleEllipse(){const on=!ellipseMode;clearModes();if(on){ellipseMode=true;setClass(1);document.querySelector('#ellipse').classList.add('active')}draw()}
 function p(e){const r=c.getBoundingClientRect();return{x:(e.clientX-r.left)*width/r.width,y:(e.clientY-r.top)*height/r.height}}
 function draw(){if(!img.complete)return;x.clearRect(0,0,c.width,c.height);x.drawImage(img,0,0,c.width,c.height);const sx=c.width/width,sy=c.height/height,k=Math.max(1,width/640);
-  polys.forEach((q,i)=>{const col=q.class_id===0?'#00ff59':'#ff7a00';x.strokeStyle=col;x.fillStyle=col;x.lineWidth=(i===selected?3:2)*k;if(q.shape==='ellipse'){x.beginPath();x.ellipse(q.cx*sx,q.cy*sy,q.rx*sx,q.ry*sy,0,0,Math.PI*2);x.stroke();if(i===selected){[[q.cx+q.rx,q.cy],[q.cx,q.cy+q.ry],[q.cx-q.rx,q.cy],[q.cx,q.cy-q.ry]].forEach(z=>{x.beginPath();x.arc(z[0]*sx,z[1]*sy,4*k,0,Math.PI*2);x.fill()})}return}if(!q.points||q.points.length<2)return;x.beginPath();x.moveTo(q.points[0][0]*sx,q.points[0][1]*sy);q.points.slice(1).forEach(z=>x.lineTo(z[0]*sx,z[1]*sy));if(q.points.length>2)x.closePath();x.stroke();q.points.forEach(z=>{x.beginPath();x.arc(z[0]*sx,z[1]*sy,3*k,0,Math.PI*2);x.fill()})});
-  const e=ellipsePreview;if(e){x.strokeStyle='#ff7a00';x.lineWidth=2*k;x.beginPath();x.ellipse(e.cx*sx,e.cy*sy,e.rx*sx,e.ry*sy,0,0,Math.PI*2);x.stroke()}if(current.length){x.strokeStyle='#ff7a00';x.fillStyle='#ff7a00';x.lineWidth=2*k;x.beginPath();x.moveTo(current[0][0]*sx,current[0][1]*sy);current.slice(1).forEach(z=>x.lineTo(z[0]*sx,z[1]*sy));x.stroke();current.forEach(z=>{x.beginPath();x.arc(z[0]*sx,z[1]*sy,3*k,0,Math.PI*2);x.fill()})}
+  polys.forEach((q,i)=>{const col=q.class_id===0?'#00ff59':'#ff7a00';x.strokeStyle=col;x.fillStyle=col;x.lineWidth=q.class_id===1?(i===selected?2.5:2):(i===selected?3:2)*k;if(q.shape==='ellipse'){x.beginPath();x.ellipse(q.cx*sx,q.cy*sy,q.rx*sx,q.ry*sy,0,0,Math.PI*2);x.stroke();if(i===selected){[[q.cx+q.rx,q.cy],[q.cx,q.cy+q.ry],[q.cx-q.rx,q.cy],[q.cx,q.cy-q.ry]].forEach(z=>{x.beginPath();x.arc(z[0]*sx,z[1]*sy,4*k,0,Math.PI*2);x.fill()})}return}if(!q.points||q.points.length<2)return;x.beginPath();x.moveTo(q.points[0][0]*sx,q.points[0][1]*sy);q.points.slice(1).forEach(z=>x.lineTo(z[0]*sx,z[1]*sy));if(q.points.length>2)x.closePath();x.stroke();if(q.class_id===0)q.points.forEach(z=>{x.beginPath();x.arc(z[0]*sx,z[1]*sy,3*k,0,Math.PI*2);x.fill()})});
+  const e=ellipsePreview;if(e){x.strokeStyle='#ff7a00';x.lineWidth=2;x.beginPath();x.ellipse(e.cx*sx,e.cy*sy,e.rx*sx,e.ry*sy,0,0,Math.PI*2);x.stroke()}if(current.length){x.strokeStyle='#ff7a00';x.fillStyle='#ff7a00';x.lineWidth=2;x.beginPath();x.moveTo(current[0][0]*sx,current[0][1]*sy);current.slice(1).forEach(z=>x.lineTo(z[0]*sx,z[1]*sy));x.stroke();current.forEach(z=>{x.beginPath();x.arc(z[0]*sx,z[1]*sy,3*k,0,Math.PI*2);x.fill()})}
 }
 function maxZoomFor(){const base=Math.min(1,1280/width);return Math.max(1,Math.min(4,2560/(Math.max(1,width,height)*base)))}
 function applyZoom(redraw=true){if(!width||!height)return;const base=Math.min(1,1280/width);zoom=Math.max(0.5,Math.min(maxZoomFor(),zoom));const scale=base*zoom;c.width=Math.max(1,Math.round(width*scale));c.height=Math.max(1,Math.round(height*scale));c.style.width=c.width+'px';c.style.height=c.height+'px';const el=document.querySelector('#zoomLabel');if(el)el.textContent=Math.round(zoom*100)+'%';try{localStorage.setItem('dsh-anno-zoom',String(zoom))}catch(e){}if(redraw)draw()}

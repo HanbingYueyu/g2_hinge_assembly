@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Read-only browser collector for a native G2 left-D405 YOLO-seg dataset.
+"""Read-only browser collector for a native G2 hinge YOLO-seg dataset.
 
 The operator freezes a current GDK colour frame in a browser and draws a
 polygon around *every* visible hinge.  Saved labels are standard one-class
@@ -122,7 +122,7 @@ class CaptureStore:
     def freeze(self) -> None:
         with self.lock:
             if self.latest_jpeg is None:
-                raise RuntimeError("尚未收到左 D405 图像")
+                raise RuntimeError("尚未收到彩色相机图像")
             image = cv2.imdecode(np.frombuffer(self.latest_jpeg, dtype=np.uint8), cv2.IMREAD_COLOR)
             if image is None:
                 raise RuntimeError("无法解码当前相机图像")

@@ -23,11 +23,11 @@ import cv2
 import numpy as np
 
 try:
-    from .capture_left_d405_hinge_yolo_dataset import SamAssistant
+    from .capture_hinge_yolo_dataset_gdk import SamAssistant
     from .camera import decode_color_rgb
     from .yolo_hinge import infer_yolo_masks, load_yolo_segmentation_model
 except ImportError:
-    from capture_left_d405_hinge_yolo_dataset import SamAssistant
+    from capture_hinge_yolo_dataset_gdk import SamAssistant
     from camera import decode_color_rgb
     from yolo_hinge import infer_yolo_masks, load_yolo_segmentation_model
 
