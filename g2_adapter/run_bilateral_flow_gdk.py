@@ -867,6 +867,11 @@ def stage_finish(ctx: FlowContext) -> dict:
             "note": "只读告警：不阻止收尾、不请求任何运动",
         })
     opened = ctx.runtime.open_all_grippers()
+    controller = ctx.services.controller
+    if controller is not None:
+        # The electric screwdriver has been released; leave the right-arm
+        # post-grasp position-control phase so later motion is impedance again.
+        controller.set_position_control_phase(False)
     home = ctx.runtime.move_both_to_home(
         velocity_rad_s=ctx.args.auto_preset_velocity_rad_s,
         arrival_tolerance_rad=ctx.args.preset_arrival_tolerance_rad,

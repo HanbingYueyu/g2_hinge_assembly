@@ -127,6 +127,7 @@ def lift_after_grasp(
     before: CartesianPoseTarget,
     *,
     speed_mps: float | None = None,
+    control_mode: int = 3,
 ) -> dict:
     """Lift the held right end-link 100 mm in base +Z and verify feedback."""
     target = lift_target_from_pose(before)
@@ -138,6 +139,7 @@ def lift_after_grasp(
         rate_hz=50.0,
         life_time_s=0.10,
         max_translation_velocity_mps=lift_speed_mps,
+        control_mode=control_mode,
     )
     try:
         stream.update_target(target)
@@ -189,6 +191,7 @@ def move_right_preset(
     velocity_rad_s: float = PRESET_VELOCITY_RAD_S,
     arrival_tolerance_rad: float = PRESET_ARRIVAL_TOLERANCE_RAD,
     timeout_s: float = PRESET_TIMEOUT_S,
+    control_mode: int = 3,
 ) -> dict:
     """Move the right arm to a named preset with feedback confirmation."""
     if not math.isfinite(float(velocity_rad_s)) or not float(velocity_rad_s) > 0.0:
@@ -204,6 +207,7 @@ def move_right_preset(
         velocity_rad_s=velocity_rad_s,
         life_time_s=timeout_s,
         detail=f"traditional right preset {preset_name}",
+        control_mode=control_mode,
     )
     deadline = time.monotonic() + timeout_s
     while time.monotonic() < deadline:
@@ -250,6 +254,7 @@ def move_right_pr2(
     velocity_rad_s: float = PRESET_VELOCITY_RAD_S,
     arrival_tolerance_rad: float = PRESET_ARRIVAL_TOLERANCE_RAD,
     timeout_s: float = PRESET_TIMEOUT_S,
+    control_mode: int = 3,
 ) -> dict:
     """Move the right arm to the post-grasp transport preset."""
     result = move_right_preset(
@@ -259,6 +264,7 @@ def move_right_pr2(
         velocity_rad_s=velocity_rad_s,
         arrival_tolerance_rad=arrival_tolerance_rad,
         timeout_s=timeout_s,
+        control_mode=control_mode,
     )
     result["gripper"] = "preserved_closed; no gripper request is issued"
     return result
@@ -271,6 +277,7 @@ def execute_post_grasp_transport(
     pr2_pose_name: str = PR2_POSE_NAME,
     lift_speed_mps: float | None = None,
     preset_velocity_rad_s: float = PRESET_VELOCITY_RAD_S,
+    control_mode: int = 3,
 ) -> tuple[dict, dict, dict]:
     """Save the grasp pose, lift, then move to the transport preset in order."""
     saved = pose_snapshot(controller)
@@ -279,8 +286,12 @@ def execute_post_grasp_transport(
         "reason": "save_before_post_grasp_lift_and_pr2",
     })
     lift_args = {} if lift_speed_mps is None else {"speed_mps": lift_speed_mps}
+    if control_mode != 3:
+        lift_args["control_mode"] = control_mode
     lift = lift_after_grasp(controller, pose_from_snapshot(saved), **lift_args)
     pr2_args: dict = {}
+    if control_mode != 3:
+        pr2_args["control_mode"] = control_mode
     if pr2_pose_name != PR2_POSE_NAME:
         pr2_args["preset_name"] = pr2_pose_name
     if preset_velocity_rad_s != PRESET_VELOCITY_RAD_S:

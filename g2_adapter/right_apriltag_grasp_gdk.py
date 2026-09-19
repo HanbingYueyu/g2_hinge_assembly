@@ -39,7 +39,7 @@ try:
         constrained_pregrasp_end_candidate,
     )
     from .camera import decode_color_rgb, intrinsic_to_dict, transform_to_dict
-    from .control import CartesianPoseTarget, G2Controller, quaternion_slerp
+    from .control import CartesianPoseTarget, G2Controller, POSITION_CONTROL_MODE, quaternion_slerp
     from .right_post_grasp_sequence import (
         PRESET_VELOCITY_RAD_S, PR1_POSE_NAME, PR2_POSE_NAME, execute_post_grasp_transport,
         load_right_pose, move_right_preset,
@@ -55,7 +55,7 @@ except ImportError:
         constrained_pregrasp_end_candidate,
     )
     from camera import decode_color_rgb, intrinsic_to_dict, transform_to_dict
-    from control import CartesianPoseTarget, G2Controller, quaternion_slerp
+    from control import CartesianPoseTarget, G2Controller, POSITION_CONTROL_MODE, quaternion_slerp
     from right_post_grasp_sequence import (
         PRESET_VELOCITY_RAD_S, PR1_POSE_NAME, PR2_POSE_NAME, execute_post_grasp_transport,
         load_right_pose, move_right_preset,
@@ -2355,6 +2355,15 @@ def run_right_grasp_stage(*, services=None, argv=None) -> int:
                         print(json.dumps(close_record, ensure_ascii=False), flush=True)
                         log.write(json.dumps(close_record, ensure_ascii=False) + "\n")
                         log.flush()
+                        # Joint impedance cannot hold/lift the heavy electric
+                        # screwdriver.  Enter the position-control phase as soon
+                        # as the grasp closes: the optional PR2 transport, the
+                        # staged hole move, the teach placement, manual takeover
+                        # and the return all then run in mode 1.  This must not
+                        # depend on --post-grasp-pr2, which the staged flow does
+                        # not pass.
+                        controller.set_position_control_phase(True)
+                        controller.enter_position_control("right post-grasp phase")
                         if args.post_grasp_pr2:
                             if pr2_target is None:
                                 raise RuntimeError(f"未加载右手 {args.post_grasp_pose} 目标；停止前往运输点")
@@ -2368,6 +2377,7 @@ def run_right_grasp_stage(*, services=None, argv=None) -> int:
                                     else args.auto_speed_mm_s / 1000.0
                                 ),
                                 preset_velocity_rad_s=preset_velocity_rad_s,
+                                control_mode=POSITION_CONTROL_MODE,
                             )
                             for event in post_grasp_events:
                                 event["utc"] = datetime.now(timezone.utc).isoformat()
@@ -2397,6 +2407,7 @@ def run_right_grasp_stage(*, services=None, argv=None) -> int:
                             takeover_worker.stop_for_final_motion()
                             controller.motion_gate = None
                             return_screwdriver(controller, saved_grasp_pose, config, emit_return_event)
+                            controller.set_position_control_phase(False)
                         return 0
                     if args.max_frames == 0:
                         continue

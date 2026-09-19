@@ -57,10 +57,11 @@ _DEFAULT_ACTUAL_ARRIVAL_STABLE_SAMPLES = 3
 STANDARD_JOINT_IMPEDANCE_KP: tuple[float, ...] = (
     400.0, 400.0, 400.0, 500.0, 300.0, 200.0, 200.0,
 )
-# Supervised manual takeover (SpaceMouse) intentionally runs in position
-# control so the arm holds a commanded pose firmly instead of yielding to a
-# light push.  Automatic motion restores joint impedance afterwards.
-MANUAL_TAKEOVER_CONTROL_MODE = 1
+# Position control (control_mode=1).  Used by supervised manual takeover and
+# by the right-arm post-grasp phase, where joint impedance cannot hold/lift the
+# heavy electric screwdriver rigidly enough.
+POSITION_CONTROL_MODE = 1
+MANUAL_TAKEOVER_CONTROL_MODE = POSITION_CONTROL_MODE
 
 
 def quaternion_slerp(
@@ -691,6 +692,7 @@ class RightEndEffectorPositionStream:
         feedback_rate_hz: float = _DEFAULT_FEEDBACK_RATE_HZ,
         soft_follow_error_m: float = _DEFAULT_SOFT_FOLLOW_ERROR_M,
         feedback_stale_timeout_s: float = _DEFAULT_FEEDBACK_STALE_TIMEOUT_S,
+        control_mode: int = 3,
     ) -> None:
         if not 45.0 <= rate_hz <= 55.0:
             raise ValueError("Cartesian position publication rate must be in [45, 55] Hz")
@@ -706,7 +708,10 @@ class RightEndEffectorPositionStream:
             raise ValueError("soft follow error must be in (0, 0.05] m")
         if not 0.10 <= feedback_stale_timeout_s <= 2.0:
             raise ValueError("feedback stale timeout must be in [0.10, 2.0] seconds")
+        if int(control_mode) not in {POSITION_CONTROL_MODE, 3}:
+            raise ValueError("right end-effector stream control_mode must be 1 or 3")
         self._controller = controller
+        self._control_mode = int(control_mode)
         self._period_s = 1.0 / float(rate_hz)
         self._feedback_period_s = 1.0 / float(feedback_rate_hz)
         self._life_time_s = float(life_time_s)
@@ -889,9 +894,14 @@ class RightEndEffectorPositionStream:
             # 2=planning).  It is legitimately 0 immediately after switching
             # control_mode and before the first pose command, so the joint
             # impedance stream gates only on the persistent mode and errors.
-            if int(status.mode) not in {0, 1} or int(status.control_mode) != 3 or int(status.error_code) != 0:
+            if (
+                int(status.mode) not in {0, 1}
+                or int(status.control_mode) != self._control_mode
+                or int(status.error_code) != 0
+            ):
                 raise SafetyError(
-                    "right end-effector actual-arrival wait requires motion mode 0/1 and healthy joint impedance control_mode=3; "
+                    "right end-effector actual-arrival wait requires motion mode 0/1 and healthy "
+                    f"control_mode={self._control_mode}; "
                     f"actual={{'mode': {int(status.mode)}, 'control_mode': {int(status.control_mode)}, "
                     f"'error_code': {int(status.error_code)}, 'error_msg': '{status.error_msg}'}}"
                 )
@@ -1070,9 +1080,14 @@ class RightEndEffectorPositionStream:
                     )
             try:
                 status = self._controller.motion_status_summary()
-                if status["mode"] not in {0, 1} or status["control_mode"] != 3 or status["error_code"] != 0:
+                if (
+                    status["mode"] not in {0, 1}
+                    or status["control_mode"] != self._control_mode
+                    or status["error_code"] != 0
+                ):
                     raise SafetyError(
-                        "right end-effector position stream requires motion mode 0/1 and healthy joint impedance control_mode=3; "
+                        "right end-effector position stream requires motion mode 0/1 and healthy "
+                        f"control_mode={self._control_mode}; "
                         f"actual={status}"
                     )
                 next_target = self._controller._send_right_cartesian_pose(
@@ -1123,6 +1138,19 @@ class G2Controller:
         self.max_servo_velocity_rad_s = float(max_servo_velocity_rad_s)
         self.motion_gate = motion_gate
         self._configured_joint_impedance: dict[str, tuple[float, ...]] = {}
+        # While the right arm holds the heavy electric screwdriver, every
+        # automatic motion boundary runs in position control (1) instead of
+        # joint impedance (3).  The mode is global, so this covers the whole
+        # grasp-close -> screwdriver-release window.
+        self.position_control_phase = False
+
+    def set_position_control_phase(self, enabled: bool) -> None:
+        """Force automatic motion boundaries to position control (1) or not.
+
+        Used for the right-arm post-grasp phase: joint impedance cannot hold or
+        lift the heavy electric screwdriver.
+        """
+        self.position_control_phase = bool(enabled)
 
     def checked_arm_state(self) -> tuple[float, ...]:
         self.check_automatic_guard()
@@ -1142,12 +1170,13 @@ class G2Controller:
         }
 
     def _require_joint_impedance_mode(self, operation: str) -> None:
-        """Reject formal motion after joint impedance mode becomes unhealthy."""
+        """Reject formal motion after the required control mode becomes unhealthy."""
+        required = POSITION_CONTROL_MODE if self.position_control_phase else 3
         status = self.motion_status_summary()
-        if status["control_mode"] != 3 or status["error_code"] != 0:
+        if status["control_mode"] != required or status["error_code"] != 0:
+            label = "position control_mode=1" if required == POSITION_CONTROL_MODE else "joint impedance control_mode=3"
             raise SafetyError(
-                f"{operation} requires healthy joint impedance control_mode=3; "
-                f"actual={status}"
+                f"{operation} requires healthy {label}; actual={status}"
             )
 
     def read_end_effector_pose(self, frame_name: str) -> CartesianPoseTarget:
@@ -1206,6 +1235,7 @@ class G2Controller:
         life_time_s: float = 10.0,
         detail: str = "traditional preset",
         joint_impedance_kp: Sequence[float] = STANDARD_JOINT_IMPEDANCE_KP,
+        control_mode: int = 3,
     ) -> None:
         """Submit one planning-mode request so GDK performs its collision checks."""
         self._require_motion()
@@ -1218,7 +1248,13 @@ class G2Controller:
         target = tuple(float(value) for value in positions_rad)
         if len(target) != 7 or not all(math.isfinite(value) for value in target):
             raise SafetyError("preset must contain seven finite joint positions")
-        self.prepare_joint_impedance_control((side,), kp=joint_impedance_kp)
+        mode = int(control_mode)
+        if mode == 3:
+            self.prepare_joint_impedance_control((side,), kp=joint_impedance_kp)
+        elif mode == POSITION_CONTROL_MODE:
+            self.enter_position_control(f"{side} preset")
+        else:
+            raise ValueError("preset control_mode must be 1 or 3")
         current = list(self.checked_arm_state())
         names = LEFT_ARM_JOINT_NAMES if side == "left" else RIGHT_ARM_JOINT_NAMES
         offset = 0 if side == "left" else 7
@@ -1523,8 +1559,15 @@ class G2Controller:
         sides: Sequence[str] = ("left", "right"),
         kp: Sequence[float] = STANDARD_JOINT_IMPEDANCE_KP,
     ) -> None:
-        """Enter joint impedance mode and configure each requested arm once."""
+        """Enter joint impedance mode and configure each requested arm once.
+
+        During the right-arm post-grasp position-control phase this instead
+        ensures control_mode=1 and skips the impedance configuration.
+        """
         self._require_motion()
+        if self.position_control_phase:
+            self.enter_position_control("post-grasp position-control phase")
+            return
         requested = set(sides)
         if not requested.issubset({"left", "right"}):
             raise ValueError("sides must contain only left and right")
@@ -1553,6 +1596,22 @@ class G2Controller:
                 f"'error_code': {int(status.error_code)}, 'error_msg': '{status.error_msg}'}}"
             )
 
+    def enter_position_control(self, operation: str = "position control") -> None:
+        """Switch to position control (control_mode=1) and verify it.
+
+        Position control holds a commanded pose rigidly.  It is used for
+        supervised manual takeover and for the right-arm post-grasp phase, where
+        joint impedance cannot hold/lift the heavy electric screwdriver.
+        """
+        self._require_motion()
+        self.set_control_mode(POSITION_CONTROL_MODE)
+        status = self.motion_status_summary()
+        if status["control_mode"] != POSITION_CONTROL_MODE or status["error_code"] != 0:
+            raise SafetyError(
+                f"{operation} requires healthy position control_mode="
+                f"{POSITION_CONTROL_MODE}; actual={status}"
+            )
+
     def enter_manual_takeover_control(self) -> None:
         """Switch to position control for a supervised manual takeover.
 
@@ -1561,14 +1620,7 @@ class G2Controller:
         Automatic motion restores joint impedance when takeover ends.  This is
         not a formal-motion fallback; it is the explicit manual-control mode.
         """
-        self._require_motion()
-        self.set_control_mode(MANUAL_TAKEOVER_CONTROL_MODE)
-        status = self.motion_status_summary()
-        if status["control_mode"] != MANUAL_TAKEOVER_CONTROL_MODE or status["error_code"] != 0:
-            raise SafetyError(
-                "manual takeover requires healthy position control_mode="
-                f"{MANUAL_TAKEOVER_CONTROL_MODE}; actual={status}"
-            )
+        self.enter_position_control("manual takeover")
 
     def restore_automatic_joint_impedance(
         self, sides: Sequence[str] = ("left", "right")
@@ -1713,26 +1765,37 @@ class G2Controller:
         max_translation_velocity_mps: float = 0.01,
         allow_orientation_change: bool = False,
         max_angular_velocity_rad_s: float = 0.5,
+        control_mode: int = 3,
     ) -> RightEndEffectorPositionStream:
-        """Start a mode-3 right end-link stream.
+        """Start a right end-link stream in joint impedance (3) or position (1).
 
         The default keeps the calibrated local-motion invariant of a fixed
-        orientation.  Autonomous coarse approach must opt in explicitly and
-        supplies a separately bounded angular velocity.
+        orientation.  ``control_mode=1`` is used for the post-grasp phase that
+        holds/lifts the heavy electric screwdriver, which joint impedance
+        cannot track rigidly enough.
         """
         self._require_motion()
-        self.prepare_joint_impedance_control(("right",))
+        mode = int(control_mode)
+        if self.position_control_phase and mode == 3:
+            mode = POSITION_CONTROL_MODE
+        if mode == 3:
+            self.prepare_joint_impedance_control(("right",))
+        elif mode == POSITION_CONTROL_MODE:
+            self.enter_position_control("right position stream")
+        else:
+            raise ValueError("right end-effector stream control_mode must be 1 or 3")
         status = self.motion_status_summary()
-        if status["mode"] not in {0, 1} or status["control_mode"] != 3 or status["error_code"] != 0:
+        if status["mode"] not in {0, 1} or status["control_mode"] != mode or status["error_code"] != 0:
             raise SafetyError(
-                "right end-effector position stream requires motion mode 0/1 and healthy GDK joint impedance control_mode=3; "
-                f"actual={status}"
+                "right end-effector position stream requires motion mode 0/1 and healthy "
+                f"control_mode={mode}; actual={status}"
             )
         stream = RightEndEffectorPositionStream(
             self, rate_hz=rate_hz, life_time_s=life_time_s,
             max_translation_velocity_mps=max_translation_velocity_mps,
             allow_orientation_change=allow_orientation_change,
             max_angular_velocity_rad_s=max_angular_velocity_rad_s,
+            control_mode=mode,
         )
         stream.start(initial_target)
         return stream

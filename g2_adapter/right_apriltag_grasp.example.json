@@ -67,7 +67,7 @@
     "max_final_approach_m": 0.050,
     "final_speed_mps": 0.005,
     "final_timeout_s": 10.0,
-    "final_actual_position_tolerance_m": 0.0005,
+    "final_actual_position_tolerance_m": 0.002,
     "final_actual_orientation_tolerance_deg": 0.5,
     "final_actual_stable_samples": 10
   },
