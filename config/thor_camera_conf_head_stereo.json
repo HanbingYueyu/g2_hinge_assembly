@@ -1,0 +1,13 @@
+{
+  "cam10": {"fps": "30", "name": "head_stereo_right", "publish": true},
+  "cam12": {"fps": "30", "name": "head_stereo_left", "publish": true},
+  "cam14": {"fps": "30", "name": "head_color", "publish": true},
+  "cam16": {"fps": "30", "name": "head_depth", "publish": true},
+  "cam20": {"fps": "30", "name": "hand_right_depth", "publish": true},
+  "cam22": {"fps": "30", "name": "hand_right_color", "publish": true},
+  "cam24": {"fps": "30", "name": "hand_left_depth", "publish": true},
+  "cam26": {"fps": "30", "name": "hand_left_color", "publish": true},
+  "cam32": {"fps": "30", "name": "head_back_fisheye", "publish": false},
+  "cam34": {"fps": "30", "name": "head_left_fisheye", "publish": false},
+  "cam36": {"fps": "30", "name": "head_right_fisheye", "publish": false}
+}

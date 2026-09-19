@@ -15,6 +15,11 @@ HEAD_DEPTH_DIAGNOSTIC_CONFIG = (
     PROJECT_ROOT / "config" / "thor_camera_conf_head_depth_diagnostic.json"
 )
 PROFILE_REQUIREMENTS = {
+    (PROJECT_ROOT / 'config' / 'thor_camera_conf_head_stereo.json').resolve(): {
+        'enabled': {'head_stereo_left', 'head_stereo_right', 'head_color', 'head_depth',
+                    'hand_left_color', 'hand_right_color', 'hand_left_depth', 'hand_right_depth'},
+        'disabled': {'head_back_fisheye', 'head_left_fisheye', 'head_right_fisheye'},
+    },
     DEFAULT_CONFIG.resolve(): {
         "enabled": {"head_color", "head_depth", "hand_left_depth", "hand_right_depth"},
         "disabled": {"head_stereo_left", "head_stereo_right", "head_back_fisheye",
