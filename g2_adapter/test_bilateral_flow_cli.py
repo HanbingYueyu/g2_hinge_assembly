@@ -287,7 +287,11 @@ class DispatchTests(unittest.TestCase):
         context.services.put('vlm_gripper_monitor', monitor)
         sent = []
         context.services.robot = SimpleNamespace(move_arm_joint_servo=lambda *args: sent.append(args))
-        context.services.controller = SimpleNamespace(checked_arm_state=lambda: (0.,)*14, _motion_write=nullcontext)
+        context.services.controller = SimpleNamespace(
+            checked_arm_state=lambda: (0.,)*14,
+            _motion_write=nullcontext,
+            hold_joint_positions=lambda side, positions: context.services.robot.move_arm_joint_servo(positions, .01, 0, False),
+        )
         visits = []
         failed = [False]
         def handler(stage):
@@ -315,7 +319,11 @@ class DispatchTests(unittest.TestCase):
         context.services.put('head_targets', {'hinge': {'position': [1, 2, 3]}})
         context.services.put('vlm_gripper_monitor', GripperMonitor(None, None, lambda record: None))
         context.services.robot = SimpleNamespace(move_arm_joint_servo=lambda *args: None)
-        context.services.controller = SimpleNamespace(checked_arm_state=lambda: (0.,)*14, _motion_write=nullcontext)
+        context.services.controller = SimpleNamespace(
+            checked_arm_state=lambda: (0.,)*14,
+            _motion_write=nullcontext,
+            hold_joint_positions=lambda side, positions: context.services.robot.move_arm_joint_servo(positions, .01, 0, False),
+        )
         visits = []
         def handler(stage):
             def run(_ctx):
@@ -384,6 +392,12 @@ class DispatchTests(unittest.TestCase):
                 self.left_presets.append(tuple(names))
                 return [{"preset": name} for name in names]
 
+            def open_all_grippers(self, **_kwargs):
+                return {"event": "all_grippers_opened"}
+
+            def move_both_to_home(self, **_kwargs):
+                return {"event": "workflow_home_arrived"}
+
         runtime = FakeRuntime()
         context = flow.FlowContext(
             gdk=None, services=StageServices(), runtime=runtime,
@@ -408,6 +422,37 @@ class DispatchTests(unittest.TestCase):
         self.assertEqual(descent.call_args.kwargs["max_distance_mm"], 10.0)
         self.assertEqual(descent.call_args.kwargs["force_threshold_n"], 3.0)
         self.assertEqual(lift.call_args.kwargs["distance_mm"], 100.0)
+
+    def test_pre_release_vlm_warning_is_read_only(self):
+        context, runtime = self.make_context()
+        context.services.robot = object()
+        with patch("run_bilateral_flow_gdk._one_shot_gripper_check", return_value="dropped"), \
+             patch("left_seat_motion.move_left_vertical", return_value={"event": "lift"}):
+            released = flow.stage_left_release_lift_to_ll2(context)
+        # The warning must not block the release or request a regrasp.
+        self.assertEqual(runtime.left_gripper_opens, 1)
+        self.assertEqual(released["pre_release_vlm"], "dropped")
+        warnings = [record for name, record in runtime.events if name == "vlm_pre_release_warning"]
+        self.assertEqual(len(warnings), 1)
+        self.assertTrue(warnings[0]["read_only"])
+        self.assertEqual(warnings[0]["action"], "continue_release")
+
+    def test_finish_runs_read_only_assembly_check_before_closing(self):
+        context, runtime = self.make_context()
+        records = [
+            {"event": "vlm_pin_result", "task": "pin", "ok": True,
+             "result": {"state": "not_inserted", "confidence": 0.9}},
+            {"event": "vlm_c_hole_result", "task": "c-hole", "ok": True,
+             "result": {"obvious_c_leak": True, "confidence": 0.8}},
+        ]
+        with patch("run_bilateral_flow_gdk._one_shot_assembly_check", return_value=records):
+            result = flow.stage_finish(context)
+        self.assertEqual(result["grippers"], "all_grippers_opened")
+        self.assertEqual(result["final_vlm"]["pin"]["state"], "not_inserted")
+        self.assertTrue(result["final_vlm"]["c-hole"]["obvious_c_leak"])
+        warnings = [record for name, record in runtime.events if name == "vlm_finish_warning"]
+        self.assertEqual(len(warnings), 1)
+        self.assertTrue(warnings[0]["read_only"])
 
     def test_handler_table_covers_every_non_gate_stage(self):
         expected = {spec.stage for spec in DEFAULT_PLAN if not spec.waits_for_advance}

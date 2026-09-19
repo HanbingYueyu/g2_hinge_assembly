@@ -20,8 +20,9 @@ def pixel_jacobian_from_end_pose_trials(
 ) -> np.ndarray:
     """Fit ``pixel_delta = J @ actual_end_link_xy_delta`` from two trials.
 
-    The two trials must originate from the same GDK mode-1 end-pose control
-    interface used in production.  Actual status-pose displacement rather
+    The two trials must originate from the same GDK end-pose control
+    interface used in production (historical probes used mode 1; formal motion
+    now uses mode 3). Actual status-pose displacement rather
     than nominal request is used, so small whole-body IK cross-axis coupling
     is included in the calibrated mapping.
     """

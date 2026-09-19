@@ -54,6 +54,9 @@ _DEFAULT_FEEDBACK_STALE_TIMEOUT_S = 0.30
 _DEFAULT_ACTUAL_ARRIVAL_POSITION_TOLERANCE_M = 0.005
 _DEFAULT_ACTUAL_ARRIVAL_ORIENTATION_TOLERANCE_DEG = 2.0
 _DEFAULT_ACTUAL_ARRIVAL_STABLE_SAMPLES = 3
+STANDARD_JOINT_IMPEDANCE_KP: tuple[float, ...] = (
+    400.0, 400.0, 400.0, 500.0, 300.0, 200.0, 200.0,
+)
 
 
 def quaternion_slerp(
@@ -206,12 +209,13 @@ class LeftCartesianImpedanceStream:
 
 
 class LeftEndEffectorPositionStream:
-    """Keep a mode-1 left end-link target alive at 50 Hz without pose steps.
+    """Keep a mode-3 left end-link target alive at 50 Hz without pose steps.
 
     ``end_effector_pose_control`` is a whole-body-IK interface in position
-    mode.  Per GDK's contract, commands must be published at 50 Hz and may
-    not jump.  This stream therefore holds the last target continuously and
-    slews only translation; the end-link orientation is fixed at startup.
+    control under joint impedance.  Per GDK's contract, commands must be
+    published at 50 Hz and may not jump.  This stream therefore holds the
+    last target continuously and slews only translation; the end-link
+    orientation is fixed at startup.
     Target progression is paced by a lower-rate actual end-link feedback
     cache, so a slow robot can catch up without accumulating open-loop error.
     """
@@ -313,11 +317,28 @@ class LeftEndEffectorPositionStream:
             if self._stop.is_set() or self._thread is None:
                 raise RuntimeError("end-effector position stream is not running")
             if not self._allow_orientation_change and quaternion_angle_deg(target.orientation_xyzw, self._fixed_orientation) > _FIXED_ORIENTATION_TOLERANCE_DEG:
-                raise SafetyError("mode-1 visual servo must keep the initial end-link orientation")
+                raise SafetyError("mode-3 visual servo must keep the initial end-link orientation")
             self._desired = target
             self._target_generation += 1
             self._actual_arrival_stable_samples = 0
             self._at_target.clear()
+
+    def rebase_to_measured_pose(self) -> None:
+        """Re-anchor the internal commanded point on the latest measured pose.
+
+        The 50 Hz slew loop refuses to advance while the measured pose is more
+        than ``soft_follow_error_m`` away from the internal commanded point.
+        An external stop (for example a force contact) can leave that point far
+        from the real arm, freezing the stream on a stale target so a new
+        recovery target is never executed.  Recovery callers rebase first so
+        the slew restarts from where the robot actually is.
+        """
+        with self._lock:
+            if (
+                self._actual is not None
+                and time.monotonic() - self._actual_at <= self._feedback_stale_timeout_s
+            ):
+                self._commanded = self._actual
 
     def wait_until_target(self, timeout_s: float) -> bool:
         """Wait until actual end-link feedback reaches the current target."""
@@ -408,6 +429,9 @@ class LeftEndEffectorPositionStream:
         latest: CartesianPoseTarget | None = None
         while time.monotonic() < deadline:
             self.raise_if_failed()
+            self._controller._require_joint_impedance_mode(
+                "left end-effector actual-arrival wait"
+            )
             with self._lock:
                 actual = self._actual
                 actual_at = self._actual_at
@@ -613,6 +637,9 @@ class LeftEndEffectorPositionStream:
                     )
                 next_target = CartesianPoseTarget(tuple(float(value) for value in next_position), next_orientation)
             try:
+                self._controller._require_joint_impedance_mode(
+                    "left end-effector position stream"
+                )
                 next_target = self._controller._send_left_cartesian_pose(
                     next_target,
                     self._life_time_s,
@@ -638,7 +665,7 @@ class LeftEndEffectorPositionStream:
 
 
 class RightEndEffectorPositionStream:
-    """50-Hz, rate-limited mode-1 stream for ``arm_r_end_link``.
+    """50-Hz, rate-limited mode-3 stream for ``arm_r_end_link``.
 
     The stream can optionally synchronize the right Omnipicker through GDK's
     ``EndEffectorPose.end_effector_joint_*`` fields.  This is important while
@@ -748,11 +775,25 @@ class RightEndEffectorPositionStream:
                 not self._allow_orientation_change
                 and quaternion_angle_deg(target.orientation_xyzw, self._fixed_orientation) > _FIXED_ORIENTATION_TOLERANCE_DEG
             ):
-                raise SafetyError("right mode-1 local grasp motion must keep the calibrated end-link orientation")
+                raise SafetyError("right mode-3 local grasp motion must keep the calibrated end-link orientation")
             self._desired = target
             self._target_generation += 1
             self._actual_arrival_stable_samples = 0
             self._at_target.clear()
+
+    def rebase_to_measured_pose(self) -> None:
+        """Re-anchor the internal commanded point on the latest measured pose.
+
+        Mirrors :meth:`LeftEndEffectorPositionStream.rebase_to_measured_pose`:
+        recovery callers rebase after an external stop so the slew restarts
+        from the real arm instead of a stale commanded point.
+        """
+        with self._lock:
+            if (
+                self._actual is not None
+                and time.monotonic() - self._actual_at <= self._feedback_stale_timeout_s
+            ):
+                self._commanded = self._actual
 
     def set_right_gripper_target(self, position_rad: float) -> None:
         """Synchronize the right Omnipicker with this 50-Hz pose stream.
@@ -842,11 +883,11 @@ class RightEndEffectorPositionStream:
             status = self._controller.robot.get_motion_control_status()
             # ``mode`` is the instantaneous motion state (0=stop, 1=servo,
             # 2=planning).  It is legitimately 0 immediately after switching
-            # control_mode and before the first pose command, so the position
-            # stream gates only on the persistent control mode and errors.
-            if int(status.mode) not in {0, 1} or int(status.control_mode) != 1 or int(status.error_code) != 0:
+            # control_mode and before the first pose command, so the joint
+            # impedance stream gates only on the persistent mode and errors.
+            if int(status.mode) not in {0, 1} or int(status.control_mode) != 3 or int(status.error_code) != 0:
                 raise SafetyError(
-                    "right end-effector actual-arrival wait requires motion mode 0/1 and healthy control_mode=1; "
+                    "right end-effector actual-arrival wait requires motion mode 0/1 and healthy joint impedance control_mode=3; "
                     f"actual={{'mode': {int(status.mode)}, 'control_mode': {int(status.control_mode)}, "
                     f"'error_code': {int(status.error_code)}, 'error_msg': '{status.error_msg}'}}"
                 )
@@ -1025,9 +1066,9 @@ class RightEndEffectorPositionStream:
                     )
             try:
                 status = self._controller.motion_status_summary()
-                if status["mode"] not in {0, 1} or status["control_mode"] != 1 or status["error_code"] != 0:
+                if status["mode"] not in {0, 1} or status["control_mode"] != 3 or status["error_code"] != 0:
                     raise SafetyError(
-                        "right end-effector position stream requires motion mode 0/1 and healthy control_mode=1; "
+                        "right end-effector position stream requires motion mode 0/1 and healthy joint impedance control_mode=3; "
                         f"actual={status}"
                     )
                 next_target = self._controller._send_right_cartesian_pose(
@@ -1077,6 +1118,7 @@ class G2Controller:
         self.control_period_s = float(control_period_s)
         self.max_servo_velocity_rad_s = float(max_servo_velocity_rad_s)
         self.motion_gate = motion_gate
+        self._configured_joint_impedance: dict[str, tuple[float, ...]] = {}
 
     def checked_arm_state(self) -> tuple[float, ...]:
         self.check_automatic_guard()
@@ -1094,6 +1136,15 @@ class G2Controller:
             "error_code": int(getattr(status, "error_code", -1)),
             "error_msg": str(getattr(status, "error_msg", "")),
         }
+
+    def _require_joint_impedance_mode(self, operation: str) -> None:
+        """Reject formal motion after joint impedance mode becomes unhealthy."""
+        status = self.motion_status_summary()
+        if status["control_mode"] != 3 or status["error_code"] != 0:
+            raise SafetyError(
+                f"{operation} requires healthy joint impedance control_mode=3; "
+                f"actual={status}"
+            )
 
     def read_end_effector_pose(self, frame_name: str) -> CartesianPoseTarget:
         """Read a named end-link pose from GDK's motion-status source of truth."""
@@ -1150,6 +1201,7 @@ class G2Controller:
         velocity_rad_s: float = 0.08,
         life_time_s: float = 10.0,
         detail: str = "traditional preset",
+        joint_impedance_kp: Sequence[float] = STANDARD_JOINT_IMPEDANCE_KP,
     ) -> None:
         """Submit one planning-mode request so GDK performs its collision checks."""
         self._require_motion()
@@ -1159,10 +1211,11 @@ class G2Controller:
             raise SafetyError("preset velocity must be a positive finite value")
         if not math.isfinite(life_time_s) or not 0.1 <= life_time_s <= 30.0:
             raise SafetyError("life_time_s must be in [0.1, 30]")
-        current = list(self.checked_arm_state())
         target = tuple(float(value) for value in positions_rad)
         if len(target) != 7 or not all(math.isfinite(value) for value in target):
             raise SafetyError("preset must contain seven finite joint positions")
+        self.prepare_joint_impedance_control((side,), kp=joint_impedance_kp)
+        current = list(self.checked_arm_state())
         names = LEFT_ARM_JOINT_NAMES if side == "left" else RIGHT_ARM_JOINT_NAMES
         offset = 0 if side == "left" else 7
         current[offset : offset + 7] = target
@@ -1191,6 +1244,7 @@ class G2Controller:
         if not math.isfinite(life_time_s) or not 0.1 <= life_time_s <= 30.0:
             raise SafetyError("bilateral preset life_time_s must be in [0.1, 30]")
         target = validate_arm_target(positions_rad)
+        self.prepare_joint_impedance_control()
         request = self.gdk.JointControlReq()
         request.detail = detail
         request.life_time = float(life_time_s)
@@ -1215,6 +1269,7 @@ class G2Controller:
         """
         self._require_motion()
         target = validate_arm_target(target_rad)
+        self.prepare_joint_impedance_control()
         start = self.checked_arm_state()
         max_delta = max(abs(end - begin) for begin, end in zip(start, target))
         minimum_duration = max_delta / self.max_servo_velocity_rad_s
@@ -1244,6 +1299,7 @@ class G2Controller:
             now = time.monotonic()
             if now - last_status_check >= 0.1:
                 self.checked_arm_state()
+                self._require_joint_impedance_mode("joint servo trajectory")
                 last_status_check = now
             with self._motion_write():
                 self.robot.move_arm_joint_servo(
@@ -1271,6 +1327,7 @@ class G2Controller:
         duration = float(duration_s)
         if not math.isfinite(duration) or duration <= 0.0:
             raise SafetyError("servo waypoint duration must be a positive finite value")
+        self.prepare_joint_impedance_control()
         start = self.checked_arm_state()
         path = (start, *targets)
         minimums = tuple(
@@ -1307,6 +1364,7 @@ class G2Controller:
             now = time.monotonic()
             if now - last_status_check >= 0.1:
                 self.checked_arm_state()
+                self._require_joint_impedance_mode("joint servo waypoint trajectory")
                 last_status_check = now
             self.robot.move_arm_joint_servo(command, self.control_period_s, 2, False)
             sent += 1
@@ -1327,10 +1385,39 @@ class G2Controller:
         """
         self._require_motion()
         target = validate_arm_target(target_rad)
+        self.prepare_joint_impedance_control()
         self.checked_arm_state()
         self.robot.move_arm_joint_servo(
             list(target), self.control_period_s, 2, False
         )
+
+    def hold_joint_positions(self, side: str, positions_rad: Sequence[float]) -> None:
+        """Send one measured single-arm joint hold through the safe boundary.
+
+        Callers that must replace an already-issued destination without using
+        one of the streaming interfaces (for example an interrupt-recovery
+        hold) use this instead of reaching into ``robot`` directly, so the
+        joint-impedance mode and the motion gate are always enforced.
+        """
+        self._require_motion()
+        if side not in {"left", "right"}:
+            raise ValueError("side must be left or right")
+        try:
+            positions = tuple(float(value) for value in positions_rad)
+        except (TypeError, ValueError) as exc:
+            raise SafetyError("joint hold must contain seven finite joint positions") from exc
+        if len(positions) != 7 or not all(math.isfinite(value) for value in positions):
+            raise SafetyError("joint hold must contain seven finite joint positions")
+        self._require_joint_impedance_mode(f"{side} joint position hold")
+        group = 0 if side == "left" else 1
+        with self._motion_write():
+            result = self.robot.move_arm_joint_servo(
+                list(positions), self.control_period_s, group, False
+            )
+        if result not in (None, 0):
+            raise SafetyError(
+                f"GDK move_arm_joint_servo failed for the {side} arm hold: result={result}"
+            )
 
     def enable_left_cartesian_impedance(self, kp: Sequence[float]) -> None:
         """Enter GDK mode 2 and configure only the left arm's six ``kp`` values.
@@ -1350,11 +1437,117 @@ class G2Controller:
         status = self.robot.get_motion_control_status()
         if int(status.error_code) != 0:
             raise SafetyError(f"cannot enter Cartesian impedance: motion error {int(status.error_code)}: {status.error_msg}")
-        if int(status.control_mode) != 1:
-            raise SafetyError(f"left grasp must begin in position mode 1, current control_mode={int(status.control_mode)}")
+        if int(status.control_mode) not in {1, 3}:
+            raise SafetyError(
+                "left Cartesian impedance diagnostic must begin in position mode 1 "
+                f"or joint impedance mode 3, current control_mode={int(status.control_mode)}"
+            )
         self.set_control_mode(2)
         impedances = [self.gdk.Impedance(kp=value) for value in values]
-        self.robot.set_cartesian_impedance(impedances, 0)
+        result = self.robot.set_cartesian_impedance(impedances, 0)
+        if result not in (None, 0):
+            raise SafetyError(f"GDK set_cartesian_impedance failed: result={result}")
+
+    def set_joint_impedance(self, side: str, kp: Sequence[float]) -> None:
+        """Configure one arm's seven joint impedance gains in control mode 3."""
+        self._require_motion()
+        if side not in {"left", "right"}:
+            raise ValueError("side must be left or right")
+        try:
+            values = tuple(float(value) for value in kp)
+        except (TypeError, ValueError) as exc:
+            raise SafetyError("joint impedance must contain seven positive finite kp values") from exc
+        if len(values) != 7 or not all(math.isfinite(value) and value > 0.0 for value in values):
+            raise SafetyError("joint impedance must contain seven positive finite kp values")
+
+        self.set_control_mode(3)
+        group = 0 if side == "left" else 1
+        impedances = [self.gdk.Impedance(kp=value) for value in values]
+        with self._motion_write():
+            result = self.robot.set_joint_impedance(impedances, group)
+        if result not in (None, 0):
+            raise SafetyError(
+                f"GDK set_joint_impedance failed for the {side} arm: result={result}"
+            )
+        status = self.robot.get_motion_control_status()
+        if int(status.error_code) != 0 or int(status.control_mode) != 3:
+            raise SafetyError(
+                "joint impedance requires healthy control_mode=3; "
+                f"actual={{'control_mode': {int(status.control_mode)}, "
+                f"'error_code': {int(status.error_code)}, 'error_msg': '{status.error_msg}'}}"
+            )
+        self._verify_joint_impedance_readback(side, values)
+        self._configured_joint_impedance[side] = values
+
+    def _verify_joint_impedance_readback(self, side: str, values: Sequence[float]) -> None:
+        """Confirm the requested ``kp`` is what GDK reports back for one arm.
+
+        A non-zero setter result or an error code is already rejected by the
+        caller; this catches a setter that returns success without applying the
+        gains, which would otherwise be frozen into the idempotency cache.
+        Readback is skipped when GDK does not expose ``get_joint_impedance``
+        or returns an unexpected length.
+        """
+        getter = getattr(self.robot, "get_joint_impedance", None)
+        if getter is None:
+            return
+        measured = list(getter())
+        if len(measured) == 7:
+            selected = measured
+        elif len(measured) == 14:
+            offset = 0 if side == "left" else 7
+            selected = measured[offset : offset + 7]
+        else:
+            return
+        actual = tuple(float(getattr(item, "kp", math.nan)) for item in selected)
+        if len(actual) != 7 or not all(math.isfinite(value) for value in actual):
+            raise SafetyError(
+                f"joint impedance readback for the {side} arm is not finite: {actual}"
+            )
+        requested = tuple(float(value) for value in values)
+        if any(
+            abs(got - wanted) > max(1e-6, abs(wanted) * 1e-3)
+            for wanted, got in zip(requested, actual)
+        ):
+            raise SafetyError(
+                f"joint impedance readback mismatch for the {side} arm: "
+                f"requested={requested} actual={actual}"
+            )
+
+    def prepare_joint_impedance_control(
+        self,
+        sides: Sequence[str] = ("left", "right"),
+        kp: Sequence[float] = STANDARD_JOINT_IMPEDANCE_KP,
+    ) -> None:
+        """Enter joint impedance mode and configure each requested arm once."""
+        self._require_motion()
+        requested = set(sides)
+        if not requested.issubset({"left", "right"}):
+            raise ValueError("sides must contain only left and right")
+        ordered_sides = tuple(side for side in ("left", "right") if side in requested)
+        try:
+            values = tuple(float(value) for value in kp)
+        except (TypeError, ValueError) as exc:
+            raise SafetyError("joint impedance must contain seven positive finite kp values") from exc
+        if len(values) != 7 or not all(math.isfinite(value) and value > 0.0 for value in values):
+            raise SafetyError("joint impedance must contain seven positive finite kp values")
+
+        status = self.robot.get_motion_control_status()
+        if int(status.error_code) != 0:
+            raise SafetyError(f"cannot prepare joint impedance: motion error {int(status.error_code)}: {status.error_msg}")
+        if int(status.control_mode) != 3:
+            self._configured_joint_impedance.clear()
+            self.set_control_mode(3)
+        for side in ordered_sides:
+            if self._configured_joint_impedance.get(side) != values:
+                self.set_joint_impedance(side, values)
+        status = self.robot.get_motion_control_status()
+        if int(status.error_code) != 0 or int(status.control_mode) != 3:
+            raise SafetyError(
+                "joint impedance preparation requires healthy control_mode=3; "
+                f"actual={{'control_mode': {int(status.control_mode)}, "
+                f"'error_code': {int(status.error_code)}, 'error_msg': '{status.error_msg}'}}"
+            )
 
     def set_control_mode(self, control_mode: int) -> None:
         """Set and verify a GDK control mode through the sole command boundary."""
@@ -1368,7 +1561,11 @@ class G2Controller:
         if int(before.control_mode) == mode:
             return
         with self._motion_write():
-            self.robot.set_control_mode(mode)
+            result = self.robot.set_control_mode(mode)
+        if result not in (None, 0):
+            raise SafetyError(f"GDK set_control_mode({mode}) returned {result}")
+        if mode != 3:
+            self._configured_joint_impedance.clear()
         # GDK documents control_mode as a persistent robot state.  Its status
         # update can lag the setter by a short DDS cycle, so do not mistake an
         # immediate stale read for a failed mode transition.
@@ -1410,13 +1607,14 @@ class G2Controller:
         allow_orientation_change: bool = False,
         max_angular_velocity_rad_s: float = 0.5,
     ) -> LeftEndEffectorPositionStream:
-        """Start GDK's direct mode-1 end-link pose control without a mode change."""
+        """Start GDK's direct end-link pose control in joint impedance mode 3."""
         self._require_motion()
+        self.prepare_joint_impedance_control(("left",))
         status = self.motion_status_summary()
-        if status["control_mode"] != 1 or status["error_code"] != 0:
+        if status["control_mode"] != 3 or status["error_code"] != 0:
             raise SafetyError(
-                "end-effector position stream requires healthy GDK control_mode=1 (position control); "
-                f"actual={status}. control_mode=3 is joint impedance and is deliberately refused by this position-only workflow"
+                "end-effector position stream requires healthy GDK joint impedance control_mode=3; "
+                f"actual={status}"
             )
         stream = LeftEndEffectorPositionStream(
             self,
@@ -1439,9 +1637,9 @@ class G2Controller:
     ) -> LeftEndEffectorPositionStream:
         """Hold the measured left end-link pose while driving its Omnipicker.
 
-        GDK mode-1 pose control accepts the end-effector joint target in the
-        same 50-Hz request as the pose.  A short-lived stream avoids relying
-        on a standalone ``move_end_effector_joint`` request while a preceding
+        GDK joint impedance mode 3 accepts the end-effector joint target in
+        the same 50-Hz pose request.  A short-lived stream avoids relying on
+        a standalone ``move_end_effector_joint`` request while a preceding
         arm preset is still settling.
         """
         initial_target = self.read_end_effector_pose("arm_l_end_link")
@@ -1461,7 +1659,7 @@ class G2Controller:
     def send_left_end_effector_position_setpoint(
         self, target: CartesianPoseTarget, *, life_time_s: float = 0.10
     ) -> None:
-        """Send one mode-1 left end-link setpoint from the caller's thread.
+        """Send one mode-3 left end-link setpoint from the caller's thread.
 
         This is intentionally a low-level, motion-gated primitive for the
         supervised diagnostic probe.  Production visual servo uses the 50 Hz
@@ -1470,11 +1668,12 @@ class G2Controller:
         self._require_motion()
         if not math.isfinite(life_time_s) or not 0.04 <= life_time_s <= 0.20:
             raise SafetyError("end-effector position life_time must be in [0.04, 0.20] seconds")
+        self.prepare_joint_impedance_control(("left",))
         status = self.motion_status_summary()
-        if status["control_mode"] != 1 or status["error_code"] != 0:
+        if status["control_mode"] != 3 or status["error_code"] != 0:
             raise SafetyError(
-                "end-effector position setpoint requires healthy GDK control_mode=1 (position control); "
-                f"actual={status}. control_mode=3 is joint impedance and is deliberately refused by this position-only workflow"
+                "end-effector position setpoint requires healthy GDK joint impedance control_mode=3; "
+                f"actual={status}"
             )
         self._send_left_cartesian_pose(target, life_time_s)
 
@@ -1488,17 +1687,18 @@ class G2Controller:
         allow_orientation_change: bool = False,
         max_angular_velocity_rad_s: float = 0.5,
     ) -> RightEndEffectorPositionStream:
-        """Start a mode-1 right end-link stream.
+        """Start a mode-3 right end-link stream.
 
         The default keeps the calibrated local-motion invariant of a fixed
         orientation.  Autonomous coarse approach must opt in explicitly and
         supplies a separately bounded angular velocity.
         """
         self._require_motion()
+        self.prepare_joint_impedance_control(("right",))
         status = self.motion_status_summary()
-        if status["mode"] not in {0, 1} or status["control_mode"] != 1 or status["error_code"] != 0:
+        if status["mode"] not in {0, 1} or status["control_mode"] != 3 or status["error_code"] != 0:
             raise SafetyError(
-                "right end-effector position stream requires motion mode 0/1 and healthy GDK control_mode=1; "
+                "right end-effector position stream requires motion mode 0/1 and healthy GDK joint impedance control_mode=3; "
                 f"actual={status}"
             )
         stream = RightEndEffectorPositionStream(
@@ -1549,7 +1749,7 @@ class G2Controller:
         end_effector_joint_positions: Sequence[float] = (),
         refresh_target: Callable[[CartesianPoseTarget], CartesianPoseTarget] | None = None,
     ) -> CartesianPoseTarget:
-        """Internal sender for the right mode-1 stream; callers never bypass it."""
+        """Internal sender for the right mode-3 stream; callers never bypass it."""
         self._require_motion()
         if len(end_effector_joint_names) != len(end_effector_joint_positions):
             raise ValueError("end-effector joint names and positions must have the same length")

@@ -19,6 +19,9 @@ class ForceContactParameters:
     relief_max_lift_m: float
     relief_force_delta_threshold_n: float
     relief_consecutive_samples: int
+    # Extra upward clearance commanded after the force has been released.
+    # 0 disables it; the amount is applied on top of the relief lift.
+    relief_extra_lift_m: float = 0.0
 
     def validate(self) -> None:
         if not self.frame_name:
@@ -37,6 +40,8 @@ class ForceContactParameters:
             raise ValueError("contact.relief_force_delta_threshold_n must be positive and finite")
         if self.relief_consecutive_samples < 1:
             raise ValueError("contact.relief_consecutive_samples must be at least 1")
+        if not math.isfinite(self.relief_extra_lift_m) or not 0.0 <= self.relief_extra_lift_m <= 0.02:
+            raise ValueError("contact.relief_extra_lift_m must be in [0, 0.02]")
 
 
 class ForceContactDetector:

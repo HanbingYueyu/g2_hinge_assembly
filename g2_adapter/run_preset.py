@@ -60,6 +60,7 @@ def main() -> int:
         if not args.allow_motion:
             print("只读预检完成；未发送运动命令。")
             return 0
+        controller.prepare_joint_impedance_control((preset["side"],))
         controller.move_preset(
             preset["side"],
             preset["joint_positions_rad"],

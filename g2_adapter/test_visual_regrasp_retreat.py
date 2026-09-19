@@ -24,6 +24,7 @@ class VisualRetryTests(unittest.TestCase):
         events = []
         origin = CartesianPoseTarget((.2,.1,.3), (0.,0.,0.,1.))
         stream = SimpleNamespace(raise_if_failed=lambda: None,
+                                 rebase_to_measured_pose=lambda: None,
                                  update_target=lambda target: events.append(('target',target)),
                                  wait_until_target=lambda _: True,
                                  stop=lambda: events.append(('stop',)))
@@ -37,7 +38,7 @@ class VisualRetryTests(unittest.TestCase):
 
     def test_failed_arrival_does_not_open(self):
         origin = CartesianPoseTarget((.2,.1,.3), (0.,0.,0.,1.))
-        stream = SimpleNamespace(raise_if_failed=lambda: None,update_target=lambda target: None,wait_until_target=lambda _: True,stop=lambda: None)
+        stream = SimpleNamespace(raise_if_failed=lambda: None,rebase_to_measured_pose=lambda: None,update_target=lambda target: None,wait_until_target=lambda _: True,stop=lambda: None)
         controller = SimpleNamespace(start_left_end_effector_position_stream=lambda *a,**kw: stream)
         with patch('left_grasp_gdk.measured_left_end_link_pose', return_value=origin), patch('left_grasp_gdk.wait_actual_left_target', side_effect=RuntimeError('not reached')), patch('left_grasp_gdk.open_left_gripper_with_feedback') as opening:
             with self.assertRaisesRegex(RuntimeError,'not reached'):

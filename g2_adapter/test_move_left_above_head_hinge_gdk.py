@@ -1,4 +1,10 @@
 import unittest
+import contextlib
+import io
+import tempfile
+from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import Mock, patch
 import numpy as np
 
 from move_left_above_head_hinge_gdk import (
@@ -14,6 +20,77 @@ from move_left_above_head_hinge_gdk import (
     select_leftmost_hinge,
 )
 from control import quaternion_angle_deg
+
+
+class HeadHingeEntryPreparationTests(unittest.TestCase):
+    def test_orientation_and_preset_paths_prepare_left_before_motion(self):
+        for orientation_only in (False, True):
+            with self.subTest(orientation_only=orientation_only):
+                self._run_entry(allow_motion=True, orientation_only=orientation_only)
+
+    def test_preparation_failure_prevents_all_left_motion(self):
+        self._run_entry(allow_motion=True, fail=True)
+
+    def test_read_only_localization_does_not_construct_a_controller(self):
+        self._run_entry(allow_motion=False)
+
+    def _run_entry(self, *, allow_motion, orientation_only=True, fail=False):
+        import move_left_above_head_hinge_gdk as module
+        from control import CartesianPoseTarget
+
+        events = []
+        controller = Mock()
+        current = CartesianPoseTarget((0.5, 0.2, 0.8), (0.0, 0.0, 0.0, 1.0))
+        controller.read_end_effector_pose.return_value = current
+        def prepare(sides):
+            self.assertEqual(sides, ("left",))
+            events.append("prepare")
+            if fail:
+                raise RuntimeError("preparation failed")
+        controller.prepare_joint_impedance_control.side_effect = prepare
+        controller.move_preset.side_effect = lambda *a, **k: events.append("preset")
+        stream = Mock()
+        controller.start_left_end_effector_position_stream.side_effect = lambda *a, **k: events.append("stream") or stream
+        gdk = Mock()
+        gdk.gdk_init.return_value = gdk.GDKRes.kSuccess
+        frame = SimpleNamespace(timestamp_ns=1, width=8, height=8)
+        gdk.Camera.return_value.get_latest_image.return_value = frame
+        gdk.Camera.return_value.get_nearest_image.return_value = frame
+        with tempfile.TemporaryDirectory() as directory, contextlib.ExitStack() as stack:
+            stack.enter_context(patch("sys.argv", ["test", "--samples", "1", "--min-inlier-samples", "1"]))
+            args = module.parse_args()
+            args.allow_motion, args.orientation_only = allow_motion, orientation_only
+            args.log, args.save_overlay = Path(directory) / "log.jsonl", Path(directory) / "overlay.jpg"
+            stack.enter_context(patch.dict("sys.modules", {"agibot_gdk": gdk}))
+            constructor = stack.enter_context(patch.object(module, "G2Controller", return_value=controller))
+            patches = {
+                "parse_args": args, "load_yolo_segmentation_model": Mock(), "load_left_preset": [0.0] * 7,
+                "fixed_forward_down_orientation": (0.0, 0.0, 0.0, 1.0),
+                "transform_to_dict": {}, "base_from_head_at": ({}, "exact_image_time", 0.0),
+                "decode_color_rgb": np.zeros((8, 8, 3), dtype=np.uint8),
+                "decode_depth_u16": np.zeros((8, 8), dtype=np.uint16), "intrinsic_to_dict": {},
+                "align_depth_to_color": np.zeros((8, 8)),
+                "infer_yolo_masks": ([np.ones((8, 8), dtype=bool)], [0.9], [0]),
+                "depth_points": (None, np.tile([0.5, 0.2, 0.8], (20, 1))),
+                "wait_preset": None,
+            }
+            for name, result in patches.items():
+                stack.enter_context(patch.object(module, name, return_value=result))
+            stack.enter_context(patch.object(module, "apply_transform", side_effect=lambda tf, point: point))
+            stack.enter_context(patch.object(module, "wait_actual_left_target", side_effect=lambda c, s, target, **k: target))
+            stack.enter_context(patch.object(module.time, "sleep"))
+            stack.enter_context(contextlib.redirect_stdout(io.StringIO()))
+            stack.enter_context(contextlib.redirect_stderr(io.StringIO()))
+            self.assertEqual(module.main(), 1 if fail else 0)
+            if not allow_motion:
+                constructor.assert_not_called()
+                self.assertEqual(events, [])
+            elif fail:
+                self.assertEqual(events, ["prepare"])
+            else:
+                expected = ["prepare", "stream"] if orientation_only else ["prepare", "preset", "prepare", "stream"]
+                self.assertEqual(events, expected)
+            controller.set_control_mode.assert_not_called()
 
 
 class HeadHingeMoveTests(unittest.TestCase):

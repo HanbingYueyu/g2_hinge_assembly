@@ -129,6 +129,8 @@ class StageSettings:
         ]
         if args.left_height_reference is not None:
             argv.extend(("--height-reference", str(Path(args.left_height_reference).expanduser())))
+        if getattr(args, "relief_extra_lift_mm", None) is not None:
+            argv.extend(("--relief-extra-lift-mm", str(args.relief_extra_lift_mm)))
         if args.log is not None:
             argv.extend(("--log", str(Path(args.log).expanduser())))
         return argv
@@ -201,6 +203,8 @@ def parse_args(argv=None) -> argparse.Namespace:
                         help="下探视觉伺服的估计水平误差死区，默认 5 mm。")
     parser.add_argument("--post-grasp-target-lost-timeout-s", type=float, default=1.0,
                         help="抓取后同一目标连续不可见多久才重新抓取，默认 1 秒。")
+    parser.add_argument("--relief-extra-lift-mm", type=float, default=None,
+                        help="泄力阈值达到后额外上抬的毫米数；省略时用 left config 的 contact.relief_extra_lift_m（默认 0），允许 [0, 20]。")
     parser.add_argument("--approach-yaw-deg", type=float, default=0.0, help="到铰链上方时的偏航角，默认 0（正对前方）。")
     parser.add_argument("--approach-pitch-deg", type=float, default=42.0, help="到铰链上方时的下俯角，默认 42。")
     parser.add_argument("--approach-roll-deg", type=float, default=180.0, help="到铰链上方时的滚转角，默认 180。")
@@ -372,6 +376,9 @@ def validate_args(args: argparse.Namespace) -> int | None:
         0.0 < args.yolo_center_fraction <= 1.0,
         math.isfinite(args.final_descent_visual_tolerance_mm) and args.final_descent_visual_tolerance_mm > 0.0,
         0.1 <= args.post_grasp_target_lost_timeout_s <= 30.0,
+        args.relief_extra_lift_mm is None or (
+            math.isfinite(args.relief_extra_lift_mm) and 0.0 <= args.relief_extra_lift_mm <= 20.0
+        ),
         math.isfinite(args.web_port) and 0 <= args.web_port <= 65535,
     )
     if not all(checks):
@@ -565,7 +572,11 @@ def stage_left_grasp(ctx: FlowContext) -> dict:
     ctx.services.put('left_raw_feed', ctx.feeds.get('left'))
     monitor = ctx.services.get('vlm_gripper_monitor')
     if monitor is not None:
-        monitor.set_phase('pre_grasp')
+        # VLM is not polled before a grasp exists: the monitor stays idle until
+        # the gripper actually closes, then left_grasp switches it to
+        # 'post_grasp'.  This avoids burning remote VLM calls on the approach
+        # and descent, where "not attached" is expected and meaningless.
+        monitor.set_phase('idle')
     try:
         from .left_grasp_gdk import run_left_cycle
     except ImportError:
@@ -613,6 +624,23 @@ def stage_left_release_lift_to_ll2(ctx: FlowContext) -> dict:
     monitor = ctx.services.get('vlm_gripper_monitor')
     if monitor is not None:
         monitor.finish_before_release()
+    # Read-only pre-release confirmation: the hinge has just been seated by the
+    # force-guarded descent.  A remote VLM may still not see it between the
+    # jaws, so this only warns; it never blocks the release and never requests
+    # a regrasp (that veto caused repeated false-negative regrasps before).
+    pre_release_state = _one_shot_gripper_check(ctx, phase="pre_release")
+    if pre_release_state in {"not_attached", "dropped"}:
+        print(
+            f"[VLM 放件前] 只读告警：VLM 判定 {pre_release_state}；不触发重抓，继续按原流程放件。",
+            flush=True,
+        )
+        ctx.runtime.emit_event({
+            "event": "vlm_pre_release_warning",
+            "state": pre_release_state,
+            "read_only": True,
+            "action": "continue_release",
+            "note": "只读告警：不阻止放件、不请求重抓",
+        })
     try:
         from .left_seat_motion import move_left_vertical
     except ImportError:
@@ -631,6 +659,7 @@ def stage_left_release_lift_to_ll2(ctx: FlowContext) -> dict:
     return {
         "release": released["event"], "lift": lift,
         "presets": [record["preset"] for record in records],
+        "pre_release_vlm": pre_release_state,
     }
 
 
@@ -642,6 +671,43 @@ def stage_right_to_lr1(ctx: FlowContext) -> dict:
         timeout_s=ctx.args.preset_timeout_s,
     )
     return {"preset": record["preset"]}
+
+
+def _vlm_client(ctx: FlowContext):
+    if ctx.args.disable_vlm_checks:
+        return None
+    return ctx.services.get("vlm_client")
+
+
+def _one_shot_gripper_check(ctx: FlowContext, *, phase: str) -> str:
+    """Read-only left-gripper check; returns the VLM state, never commands."""
+    client = _vlm_client(ctx)
+    if client is None:
+        return "unknown"
+    try:
+        from .vlm_flow_checks import run_gripper_check
+    except ImportError:
+        from vlm_flow_checks import run_gripper_check
+    record = {**run_gripper_check(ctx.services.web, client), "workflow_phase": phase}
+    ctx.runtime.emit_event(record)
+    if not record.get("ok"):
+        return "unknown"
+    return str((record.get("result") or {}).get("state", "unknown"))
+
+
+def _one_shot_assembly_check(ctx: FlowContext, *, phase: str) -> list[dict]:
+    """Read-only pin + C-hole check; returns records, never commands."""
+    client = _vlm_client(ctx)
+    if client is None:
+        return []
+    try:
+        from .vlm_flow_checks import run_assembly_checks
+    except ImportError:
+        from vlm_flow_checks import run_assembly_checks
+    records = run_assembly_checks(ctx.services.web, client)
+    for record in records:
+        ctx.runtime.emit_event({**record, "workflow_phase": phase})
+    return records
 
 
 def stage_vlm_gripper_check(ctx: FlowContext) -> dict:
@@ -755,13 +821,48 @@ def stage_right_return(ctx: FlowContext) -> dict:
 
 
 def stage_finish(ctx: FlowContext) -> dict:
+    # Read-only final assembly gate before the closing motion.  Re-check pin B
+    # insertion and obvious C-hole leak; it warns but never vetoes, because the
+    # closing action only opens the grippers and returns home.
+    final_records = _one_shot_assembly_check(ctx, phase="finish")
+    final_summary: dict = {}
+    for record in final_records:
+        task = str(record.get("task"))
+        if not record.get("ok"):
+            final_summary[task] = {"ok": False, "error": record.get("error")}
+            continue
+        result = record.get("result") or {}
+        final_summary[task] = {
+            "ok": True,
+            "state": result.get("state"),
+            "obvious_c_leak": result.get("obvious_c_leak"),
+            "confidence": result.get("confidence"),
+        }
+    suspicious = [
+        task
+        for task, item in final_summary.items()
+        if (task == "pin" and item.get("state") == "not_inserted")
+        or (task == "c-hole" and item.get("obvious_c_leak") is True)
+    ]
+    if suspicious:
+        print(
+            f"[VLM 收尾] 只读告警：{'、'.join(suspicious)} 提示装配异常；不阻止收尾动作。",
+            flush=True,
+        )
+        ctx.runtime.emit_event({
+            "event": "vlm_finish_warning",
+            "tasks": suspicious,
+            "read_only": True,
+            "action": "continue_finish",
+            "note": "只读告警：不阻止收尾、不请求任何运动",
+        })
     opened = ctx.runtime.open_all_grippers()
     home = ctx.runtime.move_both_to_home(
         velocity_rad_s=ctx.args.auto_preset_velocity_rad_s,
         arrival_tolerance_rad=ctx.args.preset_arrival_tolerance_rad,
         timeout_s=ctx.args.preset_timeout_s,
     )
-    return {"grippers": opened["event"], "home": home["event"]}
+    return {"grippers": opened["event"], "home": home["event"], "final_vlm": final_summary}
 
 
 STAGE_HANDLERS = {
@@ -829,6 +930,7 @@ def run_flow(args: argparse.Namespace) -> int:
         gate = MotionPauseGate()
         controller = G2Controller(agibot_gdk, robot, allow_motion=True, motion_gate=gate)
         controller.checked_arm_state()
+        controller.prepare_joint_impedance_control()
         def flow_event_sink(event: dict) -> None:
             record = {"utc": datetime.now(timezone.utc).isoformat(), **event}
             append_jsonl_record(log_path, record)
@@ -1054,7 +1156,7 @@ def _drive(ctx: FlowContext, args: argparse.Namespace) -> int:
             if monitor is None or not (ctx.services.get('head_targets') or {}).get('hinge'):
                 ctx.runtime.emit('stage_failed', stage=spec.stage.value, error='VLM 重抓缺少本次头部铰链定位')
                 return 1
-            monitor.set_phase('pre_grasp')
+            monitor.set_phase('idle')
             ctx.runtime.emit('vlm_regrasp_requested', stage=spec.stage.value, reason=str(exc))
             print('[VLM 重抓] 停止当前动作，先竖直上抬 50 mm，再返回铰链预接近点重新夹取。', flush=True)
             try:
@@ -1064,8 +1166,7 @@ def _drive(ctx: FlowContext, args: argparse.Namespace) -> int:
                 # do not open the gripper while returning to the tray.
                 current = list(controller.checked_arm_state()[:7])
                 for _ in range(20):
-                    with controller._motion_write():
-                        ctx.services.robot.move_arm_joint_servo(current, .01, 0, False)
+                    controller.hold_joint_positions("left", current)
                     time.sleep(.01)
                 try:
                     from .left_seat_motion import move_left_vertical

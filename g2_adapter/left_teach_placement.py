@@ -47,7 +47,13 @@ class _GatedRobot:
 
     def __getattr__(self, name):
         function = getattr(self.robot, name)
-        if name not in {"get_joint_states", "set_control_mode", "joint_control_request", "move_arm_joint_servo"} or self.gate is None:
+        if name not in {
+            "get_joint_states",
+            "set_control_mode",
+            "set_joint_impedance",
+            "joint_control_request",
+            "move_arm_joint_servo",
+        } or self.gate is None:
             return function
 
         def write(*args, **kwargs):
@@ -89,7 +95,14 @@ def replay_left_placement(services, args):
     trajectory = validate_teach_args(args)
     robot = _GatedRobot(services.robot, services.gate, stop_on_takeover=True,
                         automatic_guard=getattr(getattr(services, 'controller', None), 'check_automatic_guard', None))
-    session = G2TrajectorySession(services.gdk, robot, "left", monotonic_fn=robot.clock, event_sink=print)
+    session = G2TrajectorySession(
+        services.gdk,
+        robot,
+        "left",
+        controller=getattr(services, "controller", None),
+        monotonic_fn=robot.clock,
+        event_sink=print,
+    )
     result = {"method": "teach", "trajectory": str(Path(args.left_teach_trajectory).expanduser().resolve()), "speed_scale": args.left_teach_speed_scale}
     with end_on_takeover(result, robot, "左手", getattr(services, "worker", None)):
         result["sent"] = session.replay(trajectory, speed_scale=args.left_teach_speed_scale, start_velocity_rad_s=args.left_teach_start_velocity_rad_s)

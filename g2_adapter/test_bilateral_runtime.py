@@ -5,7 +5,7 @@ import tempfile
 import unittest
 from argparse import Namespace
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from bilateral_runtime import (
     OPEN_GRIPPER_RAD,
@@ -14,6 +14,125 @@ from bilateral_runtime import (
     console_event_summary,
 )
 from safety import SafetyError
+
+
+class ProductionEntryPreparationTests(unittest.TestCase):
+    def test_flow_prepares_both_arms_before_workers_and_stages(self):
+        self._run_flow_preparation(fail=False)
+
+    def test_flow_preparation_failure_prevents_workers_and_stages(self):
+        self._run_flow_preparation(fail=True)
+
+    def _run_flow_preparation(self, *, fail):
+        import run_bilateral_flow_gdk as module
+
+        events = []
+        controller = Mock()
+        controller.checked_arm_state.side_effect = lambda: events.append("state")
+        def prepare(sides=("left", "right")):
+            self.assertEqual(sides, ("left", "right"))
+            events.append("prepare")
+            if fail:
+                raise SafetyError("preparation failed")
+        controller.prepare_joint_impedance_control.side_effect = prepare
+        gdk = Mock()
+        gdk.gdk_init.return_value = gdk.GDKRes.kSuccess
+        with tempfile.TemporaryDirectory() as directory, contextlib.ExitStack() as stack:
+            args = module.parse_args(["--allow-motion", "--disable-vlm-checks", "--web-port", "0",
+                                      "--log", str(Path(directory) / "flow.jsonl")])
+            stack.enter_context(patch.dict("sys.modules", {"agibot_gdk": gdk, "torch": Mock()}))
+            stack.enter_context(patch("control.G2Controller", side_effect=lambda *a, **k: events.append("controller") or controller))
+            worker = stack.enter_context(patch("spacemouse_takeover.SpaceMouseTakeoverWorker"))
+            worker.return_value.start.side_effect = lambda: events.append("worker")
+            dianpi = stack.enter_context(patch("dianpi_runner.DianpiCycleRunner"))
+            dianpi.return_value.start_p10_monitor.side_effect = lambda: events.append("dianpi")
+            stack.enter_context(patch.object(module, "KeyboardStageAdvance"))
+            stack.enter_context(patch.object(module.time, "sleep"))
+            stack.enter_context(patch("yolo_hinge.load_yolo_segmentation_model"))
+            stack.enter_context(patch("right_apriltag_grasp_gdk.detector_for_41h12"))
+            drive = stack.enter_context(patch.object(module, "_drive", side_effect=lambda *a: events.append("stage") or 0))
+            stack.enter_context(contextlib.redirect_stdout(io.StringIO()))
+            if fail:
+                with self.assertRaisesRegex(SafetyError, "preparation failed"):
+                    module.run_flow(args)
+                worker.assert_not_called()
+                dianpi.assert_not_called()
+                drive.assert_not_called()
+            else:
+                self.assertEqual(module.run_flow(args), 0)
+                self.assertEqual(events, ["controller", "state", "prepare", "dianpi", "worker", "stage"])
+            gdk.gdk_release.assert_called_once()
+
+    def test_preset_prepares_only_the_moving_arm(self):
+        for side in ("left", "right"):
+            with self.subTest(side=side):
+                self._run_preset_entry(side=side, allow_motion=True)
+
+    def test_preset_preview_does_not_prepare_or_move(self):
+        self._run_preset_entry(side="left", allow_motion=False)
+
+    def test_preset_preparation_failure_prevents_planning(self):
+        self._run_preset_entry(side="right", allow_motion=True, fail=True)
+
+    def _run_preset_entry(self, *, side, allow_motion, fail=False):
+        import run_preset as module
+
+        with tempfile.TemporaryDirectory() as directory, contextlib.ExitStack() as stack:
+            poses = Path(directory) / "poses.json"
+            poses.write_text(json.dumps({"poses": {"selected": {"side": side, "joint_positions_rad": [0.0] * 7}}}))
+            args = Namespace(poses=poses, preset="selected", allow_motion=allow_motion, velocity_rad_s=0.08)
+            controller, events = self._entry_controller(stack, module, args, fail=fail)
+            self.assertEqual(module.main(), 1 if fail else 0)
+            self.assertEqual(events, (["prepare"] if fail else ["prepare", "move"]) if allow_motion else [])
+            if allow_motion:
+                controller.prepare_joint_impedance_control.assert_called_once_with((side,))
+
+    def test_sequence_prepares_left_before_presets_or_handoff(self):
+        for handoff in (False, True):
+            with self.subTest(handoff=handoff):
+                self._run_sequence_entry(allow_motion=True, handoff=handoff)
+
+    def test_sequence_preview_does_not_prepare_or_move(self):
+        self._run_sequence_entry(allow_motion=False)
+
+    def test_sequence_preparation_failure_prevents_handoff_and_planning(self):
+        self._run_sequence_entry(allow_motion=True, handoff=True, fail=True)
+
+    def _run_sequence_entry(self, *, allow_motion, handoff=False, fail=False):
+        import run_left_premove_sequence as module
+
+        with tempfile.TemporaryDirectory() as directory, contextlib.ExitStack() as stack:
+            args = Namespace(poses=Path("unused"), allow_motion=allow_motion, handoff=handoff,
+                             velocity_rad_s=0.08, arrival_tolerance_rad=0.03, timeout_per_preset_s=25.0,
+                             log=Path(directory) / "sequence.jsonl")
+            controller, events = self._entry_controller(stack, module, args, fail=fail)
+            stack.enter_context(patch.object(module, "load_presets", return_value=[("p1", [0.0] * 7), ("p2", [0.0] * 7)]))
+            stack.enter_context(patch.object(module, "open_handoff_gripper", side_effect=lambda c: events.append("gripper") or {}))
+            self.assertEqual(module.main(), 1 if fail else 0)
+            expected = ["prepare", *(["gripper"] if handoff else []), "move", "move"]
+            self.assertEqual(events, (["prepare"] if fail else expected) if allow_motion else [])
+            if allow_motion:
+                controller.prepare_joint_impedance_control.assert_called_once_with(("left",))
+
+    def _entry_controller(self, stack, module, args, *, fail):
+        events = []
+        controller = Mock()
+        controller.checked_arm_state.return_value = [0.0] * 14
+        def prepare(*_args):
+            events.append("prepare")
+            if fail:
+                raise SafetyError("preparation failed")
+        controller.prepare_joint_impedance_control.side_effect = prepare
+        controller.move_preset.side_effect = lambda *a, **k: events.append("move")
+        gdk = Mock()
+        gdk.gdk_init.return_value = gdk.GDKRes.kSuccess
+        stack.enter_context(patch.dict("sys.modules", {"agibot_gdk": gdk}))
+        stack.enter_context(patch.object(module, "parse_args", return_value=args))
+        stack.enter_context(patch.object(module, "G2Controller", return_value=controller))
+        stack.enter_context(patch.object(module.time, "sleep"))
+        stack.enter_context(contextlib.redirect_stdout(io.StringIO()))
+        stack.enter_context(contextlib.redirect_stderr(io.StringIO()))
+        return controller, events
 
 
 class FakeController:

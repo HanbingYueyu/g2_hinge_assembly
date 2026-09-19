@@ -1,6 +1,9 @@
 import math
 import json
 import unittest
+import contextlib
+import io
+import tempfile
 from types import SimpleNamespace
 from pathlib import Path
 from unittest.mock import patch
@@ -9,6 +12,97 @@ import numpy as np
 
 from right_apriltag_grasp_gdk import wait_for_manual_finish, return_screwdriver
 from unittest.mock import Mock
+
+
+class RightEntryPreparationTests(unittest.TestCase):
+    def test_execute_prepares_right_before_worker_premove_and_grasp(self):
+        self._run_entry(execute=True, worker=True, premove=True)
+
+    def test_preparation_failure_prevents_worker_and_motion(self):
+        self._run_entry(execute=True, worker=True, premove=True, fail=True)
+
+    def test_read_only_with_or_without_allow_motion_does_not_prepare(self):
+        for allow_motion in (False, True):
+            with self.subTest(allow_motion=allow_motion):
+                self._run_entry(execute=False, allow_motion=allow_motion)
+
+    def test_mode_three_is_verified_before_gripper_motion(self):
+        self._run_entry(execute=True, verified_mode=1)
+
+    def _run_entry(self, *, execute, worker=False, premove=False, fail=False,
+                   allow_motion=False, verified_mode=3):
+        import right_apriltag_grasp_gdk as module
+        from apriltag_workpiece import GraspTargets
+        from control import CartesianPoseTarget
+
+        events = []
+        controller = Mock()
+        controller.read_end_effector_pose.return_value = CartesianPoseTarget((0.4, -0.3, 0.8), (0, 0, 0, 1))
+        controller.motion_status_summary.return_value = {"mode": 0, "control_mode": verified_mode, "error_code": 0}
+        def prepare(sides):
+            self.assertEqual(sides, ("right",))
+            events.append("prepare")
+            if fail:
+                raise RuntimeError("preparation failed")
+        controller.prepare_joint_impedance_control.side_effect = prepare
+        gdk = Mock()
+        gdk.gdk_init.return_value = gdk.GDKRes.kSuccess
+        gdk.Camera.return_value.get_latest_image.return_value = SimpleNamespace(timestamp_ns=1, width=8, height=8)
+        gdk.TF.return_value.lookup_transform_latest.return_value = (Mock(), 1)
+        estimator = Mock(sample_counts={}, last_diagnostics={})
+        estimator.estimate.return_value = SimpleNamespace(camera_from_workpiece=np.eye(4))
+        targets = GraspTargets(np.eye(4), np.eye(4), np.eye(4))
+        with tempfile.TemporaryDirectory() as directory, contextlib.ExitStack() as stack:
+            config = json.loads(Path(module.__file__).with_name("right_apriltag_grasp.example.json").read_text())
+            config.pop("grasp_distance_mm", None)
+            config_path = Path(directory) / "config.json"
+            config_path.write_text(json.dumps(config))
+            argv = ["--config", str(config_path), "--max-frames", "1", "--web-port", "0",
+                    "--terminal-output", "json", "--log", str(Path(directory) / "log.jsonl"), "--stop-after-transport"]
+            if execute:
+                argv += ["--execute", "--allow-motion"]
+            elif allow_motion:
+                argv += ["--allow-motion"]
+            if worker:
+                argv += ["--spacemouse-device", "/dev/fake"]
+            if premove:
+                argv += ["--premove-pr1"]
+            stack.enter_context(patch.dict("sys.modules", {"agibot_gdk": gdk}))
+            patches = {
+                "G2Controller": controller, "detector_for_41h12": Mock(),
+                "RollingWorkpiecePoseEstimator": estimator,
+                "decode_color_rgb": np.zeros((8, 8, 3), dtype=np.uint8),
+                "intrinsic_to_dict": {"fx": 1, "fy": 1, "ppx": 0, "ppy": 0, "distortion": ()},
+                "transform_to_dict": {}, "inverse_transform_dict": {}, "transform_from_dict": np.eye(4),
+                "camera_to_base_at": ({}, {"mode": "exact_image_time"}),
+                "detect_corners": {}, "g2_grasp_targets": targets, "horizontal_grasp_targets": targets,
+                "target_record": {}, "load_right_pose": [0.0] * 7,
+            }
+            for name, result in patches.items():
+                stack.enter_context(patch.object(module, name, return_value=result))
+            gate = stack.enter_context(patch.object(module, "MotionPauseGate"))
+            gate.return_value.is_paused.return_value = False
+            worker_class = stack.enter_context(patch.object(module, "SpaceMouseTakeoverWorker"))
+            worker_class.return_value.start.side_effect = lambda: events.append("worker")
+            stack.enter_context(patch.object(module, "DianpiCycleRunner"))
+            stack.enter_context(patch.object(module, "move_right_preset", side_effect=lambda *a, **k: events.append("premove") or {}))
+            stack.enter_context(patch.object(module, "move_right_gripper_with_feedback", side_effect=lambda *a, **k: events.append("open") or {}))
+            stack.enter_context(patch.object(module, "execute_local_grasp", side_effect=lambda *a, **k: events.append("grasp") or {}))
+            stack.enter_context(contextlib.redirect_stdout(io.StringIO()))
+            errors = stack.enter_context(contextlib.redirect_stderr(io.StringIO()))
+            result = module.main(argv)
+            self.assertEqual(result, 1 if fail or (execute and verified_mode != 3) else 0, errors.getvalue())
+            if not execute:
+                self.assertEqual(events, [])
+            elif fail:
+                self.assertEqual(events, ["prepare"])
+                worker_class.assert_not_called()
+            elif verified_mode != 3:
+                self.assertEqual(events, ["prepare", "prepare"])
+            else:
+                self.assertEqual(events, ["prepare", "worker", "premove", "prepare", "open", "grasp"])
+            controller.set_control_mode.assert_not_called()
+            gdk.gdk_release.assert_called_once()
 
 
 class ManualFinishTests(unittest.TestCase):

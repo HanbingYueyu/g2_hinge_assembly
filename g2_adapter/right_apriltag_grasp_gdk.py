@@ -1443,8 +1443,9 @@ def execute_local_grasp(
     safety = require_mapping(config.get("local_motion"), "local_motion")
     if not config.get("calibrated"):
         raise RuntimeError("config.calibrated=false：禁止动作；先完成 G2 右端链接/抓取 TCP 标定")
+    # Historical persisted verification key, not a live mode-1 requirement.
     if not config.get("right_mode1_probe_verified"):
-        raise RuntimeError("right_mode1_probe_verified=false：未通过受看护的右手 1 mm mode-1 探针，禁止动作")
+        raise RuntimeError("right_mode1_probe_verified=false：未通过受看护的右手 1 mm 末端位姿探针，禁止动作")
     current = controller.read_end_effector_pose("arm_r_end_link")
     pregrasp = target_pose(targets.base_from_pregrasp_end)
     grasp = target_pose(targets.base_from_grasp_end)
@@ -1466,7 +1467,7 @@ def execute_local_grasp(
     if not autonomous_approach and (start_distance > max_start_m or start_angle_deg > max_start_deg):
         raise RuntimeError(
             f"当前右端链接不在已标定局部起点：{start_distance * 1000:.1f} mm / {start_angle_deg:.1f} deg；"
-            "不得用无规划 mode-1 做大范围靠近"
+            "不得用无规划末端位姿流做大范围靠近"
         )
     if autonomous_approach and (start_distance > max_start_m or start_angle_deg > max_start_deg):
         raise RuntimeError(
@@ -1826,6 +1827,8 @@ def run_right_grasp_stage(*, services=None, argv=None) -> int:
                 motion_gate=motion_gate,
             )
             controller.checked_arm_state()
+        if args.execute:
+            controller.prepare_joint_impedance_control(("right",))
         if injected and services.worker is not None:
             takeover_worker = services.worker
             dianpi_runner = services.dianpi_runner
@@ -2262,19 +2265,19 @@ def run_right_grasp_stage(*, services=None, argv=None) -> int:
                             raise RuntimeError(
                                 f"执行前机器人处于规划态或有错误，拒绝切换控制模式：{before_control_mode}"
                             )
-                        controller.set_control_mode(1)
+                        controller.prepare_joint_impedance_control(("right",))
                         after_control_mode = controller.motion_status_summary()
                         if (
                             after_control_mode["mode"] not in {0, 1}
-                            or after_control_mode["control_mode"] != 1
+                            or after_control_mode["control_mode"] != 3
                             or after_control_mode["error_code"] != 0
                         ):
                             raise RuntimeError(
-                                f"未进入健康 motion mode=0/1、control_mode=1，拒绝动作：{after_control_mode}"
+                                f"未进入健康 motion mode=0/1、control_mode=3，拒绝动作：{after_control_mode}"
                             )
                         control_mode_record = {
                             "event": "right_control_mode_ready",
-                            "requested_control_mode": 1,
+                            "requested_control_mode": 3,
                             "before": before_control_mode,
                             "after": after_control_mode,
                             "motion": "mode_switch_only",

@@ -3,7 +3,9 @@ import io
 import unittest
 from unittest.mock import patch
 
-from run_spacemouse_gdk import ensure_position_mode, main, run_loop
+import test_control
+from control import G2Controller
+from run_spacemouse_gdk import ensure_joint_impedance_mode, main, run_loop
 from spacemouse_input import InputError, InputFrame
 from spacemouse_teleop import PreviewController, TeleopConfig, TeleopSession
 
@@ -35,21 +37,23 @@ class Source:
 
 
 class CLITests(unittest.TestCase):
-    def test_robot_start_switches_control_mode_3_to_position_mode_1(self):
-        robot = __import__('test_control').FakeRobot()
-        robot.control_mode = 3
-        controller = __import__('control').G2Controller(__import__('test_control').FakeGdk, robot, allow_motion=True)
-        ensure_position_mode(controller)
-        self.assertEqual(robot.control_mode, 1)
+    def test_robot_start_switches_position_mode_to_joint_impedance(self):
+        robot = test_control.FakeRobot()
+        robot.control_mode = 1
+        controller = G2Controller(test_control.FakeGdk, robot, allow_motion=True)
+        ensure_joint_impedance_mode(controller)
+        self.assertEqual(robot.control_mode, 3)
+        self.assertEqual([group for _, group in robot.joint_impedance_calls], [0, 1])
 
     def test_robot_start_rejects_planning_mode_before_switching(self):
-        robot = __import__('test_control').FakeRobot()
+        robot = test_control.FakeRobot()
         robot.motion_mode = 2
-        robot.control_mode = 3
-        controller = __import__('control').G2Controller(__import__('test_control').FakeGdk, robot, allow_motion=True)
+        robot.control_mode = 1
+        controller = G2Controller(test_control.FakeGdk, robot, allow_motion=True)
         with self.assertRaises(Exception):
-            ensure_position_mode(controller)
-        self.assertEqual(robot.control_mode, 3)
+            ensure_joint_impedance_mode(controller)
+        self.assertEqual(robot.control_mode, 1)
+        self.assertEqual(robot.joint_impedance_calls, [])
 
     def test_loop_runs_at_50hz_and_stops_at_duration(self):
         clock = Clock()

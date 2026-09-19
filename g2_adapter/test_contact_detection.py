@@ -51,6 +51,25 @@ class ContactDetectionTests(unittest.TestCase):
         )
         parameters.validate()
 
+    def test_relief_extra_lift_defaults_to_zero_and_is_bounded(self):
+        self.assertEqual(self.parameters.relief_extra_lift_m, 0.0)
+        base = dict(
+            frame_name="arm_l_end_link",
+            force_delta_threshold_n=2.0,
+            consecutive_samples=1,
+            baseline_samples=20,
+            sample_period_s=0.02,
+            require_for_grasp=True,
+            relief_max_lift_m=0.015,
+            relief_force_delta_threshold_n=1.0,
+            relief_consecutive_samples=3,
+        )
+        for value in (0.0, 0.01, 0.02):
+            ForceContactParameters(**base, relief_extra_lift_m=value).validate()
+        for value in (-0.001, 0.021, float("nan")):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                ForceContactParameters(**base, relief_extra_lift_m=value).validate()
+
 
 if __name__ == "__main__":
     unittest.main()

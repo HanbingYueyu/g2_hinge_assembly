@@ -56,6 +56,11 @@ class TeachTakeoverTests(unittest.TestCase):
                 self.assertTrue(completed_without_resume, "示教仍在等待接管退出")
                 self.assertEqual(len(robot.servo_commands), 1)
                 self.assertTrue(outcome[0]["interrupted_by_takeover"])
+                self.assertEqual(robot.control_mode, 3)
+                self.assertEqual(
+                    tuple(item.kp for item in robot.impedance_calls[-1][0]),
+                    (400, 400, 400, 500, 300, 200, 200),
+                )
 
 
 if __name__ == "__main__":

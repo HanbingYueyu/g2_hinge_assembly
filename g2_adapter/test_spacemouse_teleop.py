@@ -7,13 +7,14 @@ import numpy as np
 from control import CartesianPoseTarget, G2Controller, MotionDisabledError, quaternion_angle_deg
 from safety import SafetyError
 from spacemouse_input import CompactReports, InputFrame
-from spacemouse_teleop import TeleopConfig, TeleopSession, integrate_pose
+from spacemouse_teleop import PreviewController, TeleopConfig, TeleopSession, integrate_pose
 from test_control import FakeGdk, FakePose, FakeRobot
 
 
 class BilateralRobot(FakeRobot):
     def __init__(self):
         super().__init__()
+        self.control_mode = 3
         self.left_pose = FakePose()
         self.left_pose.position.y = .2
 
@@ -26,6 +27,21 @@ class BilateralRobot(FakeRobot):
 
 def frame(now, axes=(0,) * 6, pressed=(), buttons=(False, False), times=None, ready=True):
     return InputFrame(axes, buttons, pressed, times or (now, now), ready)
+
+
+class TeleopHealthTests(unittest.TestCase):
+    def test_preview_simulates_joint_impedance_health_without_hardware(self):
+        controller = PreviewController()
+        self.assertEqual(controller.motion_status_summary()['control_mode'], 3)
+        TeleopSession(controller, TeleopConfig())._healthy()
+
+    def test_health_accepts_joint_impedance_mode_and_rejects_position_mode(self):
+        robot = BilateralRobot()
+        session = TeleopSession(G2Controller(FakeGdk, robot, allow_motion=True), TeleopConfig())
+        session._healthy()
+        robot.control_mode = 1
+        with self.assertRaises(SafetyError):
+            session._healthy()
 
 
 class TeleopTests(unittest.TestCase):
@@ -245,11 +261,11 @@ class TeleopTests(unittest.TestCase):
 
     def test_bad_mode_and_loop_stall_prevent_further_commands(self):
         count = len(self.robot.requests)
-        self.robot.control_mode = 3
+        self.robot.control_mode = 1
         with self.assertRaises(SafetyError):
             self.tick()
         self.assertEqual(len(self.robot.requests), count)
-        self.robot.control_mode = 1
+        self.robot.control_mode = 3
         with self.assertRaises(SafetyError):
             self.session.tick(frame(self.now + 1), self.now + 1)
         self.assertEqual(len(self.robot.requests), count)

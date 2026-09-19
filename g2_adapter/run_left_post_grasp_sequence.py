@@ -70,7 +70,7 @@ def write_log(stream, event: dict) -> None:
 def lift_before_p4(controller: G2Controller) -> dict:
     """Raise the measured left flange 150 mm in base +Z before P4.
 
-    This uses GDK's mode-1 end-effector position stream at the same 50 Hz as
+    This uses GDK's mode-3 end-effector position stream at the same 50 Hz as
     the grasp servo. It preserves the current flange orientation and never
     includes an end-effector-joint request, so the held gripper state is left
     untouched. P4 is not requested unless the measured lift is within 10 mm

@@ -50,17 +50,15 @@ def emit_json(document):
     print(json.dumps(document, ensure_ascii=False, allow_nan=False), flush=True)
 
 
-def ensure_position_mode(controller):
-    """Enter GDK mode 1 before the first teleoperation pose command."""
+def ensure_joint_impedance_mode(controller: G2Controller) -> None:
+    """Enter GDK mode 3 with standard gains before teleoperation."""
     before = controller.motion_status_summary()
     if before['mode'] not in {0, 1} or before['error_code'] != 0:
         raise RuntimeError(f"启动前拒绝切换：GDK 状态异常 {before}")
-    if before['control_mode'] != 1:
-        controller.set_control_mode(1)
+    controller.prepare_joint_impedance_control()
     after = controller.motion_status_summary()
-    if after['mode'] not in {0, 1} or after['control_mode'] != 1 or after['error_code'] != 0:
-        raise RuntimeError(f"启动前未进入健康 control_mode=1：{after}")
-    return before, after
+    if after['mode'] not in {0, 1} or after['control_mode'] != 3 or after['error_code'] != 0:
+        raise RuntimeError(f"启动前未进入健康 control_mode=3：{after}")
 
 
 def run_loop(source, session, *, duration_s=0, clock=time.monotonic, sleep=time.sleep, emit=emit_json):
@@ -113,7 +111,9 @@ def main(argv=None) -> int:
                 robot = agibot_gdk.Robot()
                 time.sleep(.5)
                 controller = G2Controller(agibot_gdk, robot, allow_motion=True)
-                mode_before, mode_after = ensure_position_mode(controller)
+                mode_before = controller.motion_status_summary()
+                ensure_joint_impedance_mode(controller)
+                mode_after = controller.motion_status_summary()
                 controller.checked_arm_state()
             else:
                 controller = PreviewController()

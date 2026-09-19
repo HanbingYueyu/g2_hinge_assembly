@@ -6,6 +6,7 @@ import unittest
 from control import (
     CartesianPoseTarget,
     G2Controller,
+    LeftEndEffectorPositionStream,
     MotionDisabledError,
     MotionRebasePending,
     RightEndEffectorPositionStream,
@@ -73,6 +74,11 @@ class FakeRobot:
         self.requests = []
         self.gripper_requests = []
         self.cartesian_impedance = []
+        self.joint_impedance_calls = []
+        self.joint_impedance_state = [FakeImpedance(kp=0.0) for _ in range(14)]
+        self.joint_impedance_result = 0
+        self.joint_impedance_readback = None
+        self.set_control_mode_result = 0
         self.motion_mode = 1
         self.control_mode = 1
         self.left_end_pose = FakePose()
@@ -141,9 +147,25 @@ class FakeRobot:
 
     def set_control_mode(self, mode):
         self.control_mode = mode
+        return self.set_control_mode_result
 
     def set_cartesian_impedance(self, impedances, group):
         self.cartesian_impedance.append((impedances, group))
+        return 0
+
+    def set_joint_impedance(self, impedances, group):
+        self.joint_impedance_calls.append((impedances, group))
+        if self.joint_impedance_result != 0:
+            return self.joint_impedance_result
+        offset = 0 if group == 0 else 7
+        for index, item in enumerate(impedances):
+            self.joint_impedance_state[offset + index] = FakeImpedance(kp=item.kp)
+        return 0
+
+    def get_joint_impedance(self):
+        if self.joint_impedance_readback is not None:
+            return [FakeImpedance(kp=value) for value in self.joint_impedance_readback]
+        return [FakeImpedance(kp=item.kp) for item in self.joint_impedance_state]
 
     def end_effector_pose_control(self, request):
         self.requests.append(request)
@@ -169,6 +191,170 @@ class FakeRobot:
 
 
 class ControlTests(unittest.TestCase):
+    def test_preset_custom_joint_impedance_is_active_before_planner_submission(self):
+        custom_kp = (50, 50, 50, 60, 30, 30, 30)
+        robot = FakeRobot()
+        observed = []
+        def submit(request):
+            observed.append((robot.control_mode, [
+                (group, tuple(value.kp for value in values))
+                for values, group in robot.joint_impedance_calls
+            ]))
+            robot.requests.append(request)
+        robot.joint_control_request = submit
+        controller = G2Controller(FakeGdk, robot, allow_motion=True)
+        controller.move_preset("right", [0.0] * 7, joint_impedance_kp=custom_kp)
+        self.assertEqual(observed, [(3, [(1, custom_kp)])])
+        controller.move_preset("right", [0.0] * 7)
+        self.assertEqual(observed[-1], (3, [
+            (1, custom_kp), (1, (400, 400, 400, 500, 300, 200, 200)),
+        ]))
+
+    def test_prepare_joint_impedance_enters_mode_3_and_configures_both_arms(self):
+        robot = FakeRobot()
+        controller = G2Controller(FakeGdk, robot, allow_motion=True)
+
+        controller.prepare_joint_impedance_control()
+
+        self.assertEqual(robot.control_mode, 3)
+        self.assertEqual([group for _, group in robot.joint_impedance_calls], [0, 1])
+        self.assertEqual(
+            [[item.kp for item in values] for values, _ in robot.joint_impedance_calls],
+            [[400, 400, 400, 500, 300, 200, 200]] * 2,
+        )
+
+    def test_prepare_joint_impedance_is_idempotent_while_mode_3_stays_healthy(self):
+        robot = FakeRobot()
+        controller = G2Controller(FakeGdk, robot, allow_motion=True)
+        controller.prepare_joint_impedance_control()
+        controller.prepare_joint_impedance_control()
+        self.assertEqual(len(robot.joint_impedance_calls), 2)
+
+    def test_formal_motion_interfaces_prepare_joint_impedance(self):
+        robot = FakeRobot()
+        controller = G2Controller(FakeGdk, robot, allow_motion=True)
+
+        controller.move_preset("left", [0.0] * 7)
+        self.assertEqual(robot.control_mode, 3)
+
+        controller.servo_step([0.0] * 14)
+        stream = controller.start_left_end_effector_position_stream(
+            CartesianPoseTarget((0.1, 0.2, 0.3), (0.0, 0.0, 0.0, 1.0))
+        )
+        stream.stop()
+
+        self.assertEqual(robot.control_mode, 3)
+        self.assertEqual([group for _, group in robot.joint_impedance_calls], [0, 1])
+
+    def test_read_only_controller_construction_does_not_change_mode(self):
+        robot = FakeRobot()
+        G2Controller(FakeGdk, robot, allow_motion=False)
+        self.assertEqual(robot.control_mode, 1)
+        self.assertEqual(robot.joint_impedance_calls, [])
+
+    def test_set_joint_impedance_rejects_failed_write_without_caching(self):
+        robot = FakeRobot()
+        controller = G2Controller(FakeGdk, robot, allow_motion=True)
+        robot.joint_impedance_result = 7
+
+        with self.assertRaisesRegex(SafetyError, "set_joint_impedance failed"):
+            controller.set_joint_impedance("left", (400.0,) * 7)
+
+        self.assertNotIn("left", controller._configured_joint_impedance)
+
+    def test_set_joint_impedance_detects_readback_mismatch(self):
+        robot = FakeRobot()
+        controller = G2Controller(FakeGdk, robot, allow_motion=True)
+        robot.joint_impedance_readback = [0.0] * 14
+
+        with self.assertRaisesRegex(SafetyError, "readback mismatch"):
+            controller.set_joint_impedance("left", (400.0,) * 7)
+
+        self.assertNotIn("left", controller._configured_joint_impedance)
+
+    def test_set_control_mode_rejects_failed_switch(self):
+        robot = FakeRobot()
+        controller = G2Controller(FakeGdk, robot, allow_motion=True)
+        robot.set_control_mode_result = 5
+
+        with self.assertRaisesRegex(SafetyError, "set_control_mode"):
+            controller.set_control_mode(3)
+
+    def test_prepare_rejects_invalid_gains_and_side(self):
+        robot = FakeRobot()
+        controller = G2Controller(FakeGdk, robot, allow_motion=True)
+
+        with self.assertRaisesRegex(SafetyError, "seven positive finite"):
+            controller.prepare_joint_impedance_control(("left",), (0.0,) * 7)
+        with self.assertRaisesRegex(SafetyError, "seven positive finite"):
+            controller.prepare_joint_impedance_control(("left",), (400.0,) * 6)
+        with self.assertRaises(ValueError):
+            controller.prepare_joint_impedance_control(("middle",))
+
+        self.assertEqual(robot.joint_impedance_calls, [])
+
+    def test_prepare_reconfigures_the_arm_after_leaving_mode_three(self):
+        robot = FakeRobot()
+        controller = G2Controller(FakeGdk, robot, allow_motion=True)
+        controller.prepare_joint_impedance_control(("left",))
+        self.assertEqual([group for _, group in robot.joint_impedance_calls], [0])
+
+        controller.set_control_mode(1)
+        controller.prepare_joint_impedance_control(("left",))
+
+        self.assertEqual([group for _, group in robot.joint_impedance_calls], [0, 0])
+
+    def test_prepare_configures_only_the_requested_stale_group(self):
+        robot = FakeRobot()
+        controller = G2Controller(FakeGdk, robot, allow_motion=True)
+
+        controller.prepare_joint_impedance_control(("left",))
+        controller.prepare_joint_impedance_control(("left", "right"))
+
+        self.assertEqual([group for _, group in robot.joint_impedance_calls], [0, 1])
+
+    def test_hold_joint_positions_requires_mode_three_and_checks_arguments(self):
+        robot = FakeRobot()
+        controller = G2Controller(FakeGdk, robot, allow_motion=True)
+
+        with self.assertRaisesRegex(SafetyError, "control_mode=3"):
+            controller.hold_joint_positions("left", [0.0] * 7)
+
+        controller.prepare_joint_impedance_control(("left",))
+        controller.hold_joint_positions("left", [0.1] * 7)
+        self.assertEqual(robot.requests[-1], ([0.1] * 7, 0.01, 0, False))
+
+        with self.assertRaisesRegex(SafetyError, "seven finite"):
+            controller.hold_joint_positions("left", [0.0] * 6)
+
+    def test_rebase_to_measured_pose_reanchors_only_on_fresh_feedback(self):
+        def left_stream():
+            return LeftEndEffectorPositionStream(
+                object(), rate_hz=50.0, life_time_s=0.10, max_translation_velocity_mps=0.01
+            )
+
+        def right_stream():
+            return RightEndEffectorPositionStream(
+                object(), rate_hz=50.0, life_time_s=0.10, max_translation_velocity_mps=0.01
+            )
+
+        for factory in (left_stream, right_stream):
+            with self.subTest(stream=factory().__class__.__name__):
+                stream = factory()
+                stale_target = CartesianPoseTarget((0.0, 0.0, 0.0), (0.0, 0.0, 0.0, 1.0))
+                measured = CartesianPoseTarget((0.1, 0.0, 0.0), (0.0, 0.0, 0.0, 1.0))
+
+                stream._commanded = stale_target
+                stream._actual = measured
+                stream._actual_at = time.monotonic()
+                stream.rebase_to_measured_pose()
+                self.assertEqual(stream._commanded, measured)
+
+                stream._commanded = stale_target
+                stream._actual_at = time.monotonic() - 10.0
+                stream.rebase_to_measured_pose()
+                self.assertEqual(stream._commanded, stale_target)
+
     def test_quaternion_slerp_follows_shortest_unit_arc(self):
         quarter_turn = quaternion_slerp(
             (0.0, 0.0, 0.0, 1.0),
@@ -277,10 +463,61 @@ class ControlTests(unittest.TestCase):
             CartesianPoseTarget((0.1, -0.2, 0.3), (0.0, 0.0, 0.0, 1.0))
         )
         try:
-            robot.control_mode = 3
+            robot.control_mode = 1
             stream.update_target(CartesianPoseTarget((0.101, -0.2, 0.3), (0.0, 0.0, 0.0, 1.0)))
             with self.assertRaises(SafetyError):
                 stream.wait_until_target(0.5)
+        finally:
+            stream.stop()
+
+    def test_left_stream_stops_when_control_mode_changes(self):
+        robot = FakeRobot()
+        controller = G2Controller(FakeGdk, robot, allow_motion=True)
+        initial = CartesianPoseTarget((0.1, 0.2, 0.3), (0.0, 0.0, 0.0, 1.0))
+        stream = controller.start_left_end_effector_position_stream(initial)
+        try:
+            deadline = time.monotonic() + 0.5
+            while not robot.requests and time.monotonic() < deadline:
+                time.sleep(0.01)
+            self.assertGreaterEqual(len(robot.requests), 1)
+
+            robot.control_mode = 1
+            stream.update_target(CartesianPoseTarget(
+                (0.101, 0.2, 0.3), initial.orientation_xyzw,
+            ))
+            with self.assertRaises(SafetyError):
+                stream.wait_until_target(0.5)
+            request_count = len(robot.requests)
+            time.sleep(0.05)
+            self.assertEqual(len(robot.requests), request_count)
+        finally:
+            stream.stop()
+
+    def test_left_actual_arrival_wait_rejects_control_mode_change(self):
+        robot = FakeRobot()
+        controller = G2Controller(FakeGdk, robot, allow_motion=True)
+        initial = CartesianPoseTarget((0.1, 0.2, 0.3), (0.0, 0.0, 0.0, 1.0))
+        stream = controller.start_left_end_effector_position_stream(initial)
+        try:
+            self.assertTrue(stream.wait_until_target(0.5))
+            original_status = robot.get_motion_control_status
+
+            def status_with_healthy_writer():
+                status = original_status()
+                if threading.current_thread().name == "g2-left-end-effector-position":
+                    status.control_mode = 3
+                return status
+
+            robot.get_motion_control_status = status_with_healthy_writer
+            robot.control_mode = 1
+            with self.assertRaises(SafetyError):
+                stream.wait_until_actual_target(
+                    initial,
+                    0.2,
+                    position_tolerance_m=0.00001,
+                    orientation_tolerance_deg=0.1,
+                    stable_samples=1,
+                )
         finally:
             stream.stop()
 
@@ -474,6 +711,8 @@ class ControlTests(unittest.TestCase):
         self.assertEqual(request.joint_names, list(ARM_JOINT_NAMES))
         self.assertEqual(request.joint_positions, target)
         self.assertEqual(request.joint_velocities, [0.05] * 14)
+        self.assertEqual(robot.control_mode, 3)
+        self.assertEqual([group for _, group in robot.joint_impedance_calls], [0, 1])
 
     def test_gripper_uses_gdk_group(self):
         robot = FakeRobot()
@@ -502,6 +741,31 @@ class ControlTests(unittest.TestCase):
         self.assertEqual(sent, 3)
         self.assertEqual(len(robot.requests), 3)
         self.assertEqual(robot.requests[-1][0], [0.005] * 14)
+        self.assertEqual(robot.control_mode, 3)
+        self.assertEqual([group for _, group in robot.joint_impedance_calls], [0, 1])
+
+    def test_servo_to_stops_when_control_mode_changes(self):
+        robot = FakeRobot()
+        controller = G2Controller(
+            FakeGdk,
+            robot,
+            allow_motion=True,
+            control_period_s=0.02,
+            max_servo_velocity_rad_s=0.15,
+        )
+        original_servo = robot.move_arm_joint_servo
+
+        def drop_mode_after_first_command(positions, period, mode, flag):
+            original_servo(positions, period, mode, flag)
+            if len(robot.requests) == 1:
+                robot.control_mode = 1
+
+        robot.move_arm_joint_servo = drop_mode_after_first_command
+
+        with self.assertRaises(SafetyError):
+            controller.servo_to([0.02] * 14, duration_s=0.24)
+        self.assertGreaterEqual(len(robot.requests), 1)
+        self.assertLess(len(robot.requests), 12)
 
     def test_servo_waypoints_reaches_final_target_within_requested_duration(self):
         robot = FakeRobot()
@@ -519,9 +783,35 @@ class ControlTests(unittest.TestCase):
 
         self.assertEqual(sent, 3)
         self.assertEqual(robot.requests[-1][0], [0.004] * 14)
+        self.assertEqual(robot.control_mode, 3)
+        self.assertEqual([group for _, group in robot.joint_impedance_calls], [0, 1])
+
+    def test_servo_waypoints_stop_when_control_mode_changes(self):
+        robot = FakeRobot()
+        controller = G2Controller(
+            FakeGdk,
+            robot,
+            allow_motion=True,
+            control_period_s=0.02,
+            max_servo_velocity_rad_s=0.15,
+        )
+        original_servo = robot.move_arm_joint_servo
+
+        def drop_mode_after_first_command(positions, period, mode, flag):
+            original_servo(positions, period, mode, flag)
+            if len(robot.requests) == 1:
+                robot.control_mode = 1
+
+        robot.move_arm_joint_servo = drop_mode_after_first_command
+
+        with self.assertRaises(SafetyError):
+            controller.servo_waypoints(([0.02] * 14,), duration_s=0.24)
+        self.assertGreaterEqual(len(robot.requests), 1)
+        self.assertLess(len(robot.requests), 12)
 
     def test_cartesian_impedance_uses_mode_2_and_50hz_stream(self):
         robot = FakeRobot()
+        robot.control_mode = 3
         controller = G2Controller(FakeGdk, robot, allow_motion=True)
         controller.enable_left_cartesian_impedance([600.0, 600.0, 600.0, 30.0, 30.0, 30.0])
         self.assertEqual(robot.control_mode, 2)
@@ -589,7 +879,7 @@ class ControlTests(unittest.TestCase):
                 finally:
                     stream.stop()
 
-    def test_end_effector_position_stream_uses_mode_1_without_switching_modes(self):
+    def test_end_effector_position_stream_uses_mode_3(self):
         robot = FakeRobot()
         controller = G2Controller(FakeGdk, robot, allow_motion=True)
         stream = controller.start_left_end_effector_position_stream(
@@ -600,7 +890,7 @@ class ControlTests(unittest.TestCase):
         time.sleep(0.05)
         stream.stop()
 
-        self.assertEqual(robot.control_mode, 1)
+        self.assertEqual(robot.control_mode, 3)
         self.assertGreaterEqual(len(robot.requests), 1)
         request = robot.requests[-1]
         self.assertEqual(request.group, 0)
@@ -655,7 +945,7 @@ class ControlTests(unittest.TestCase):
         self.assertEqual(request.end_effector_joint_positions, [0.0])
         self.assertAlmostEqual(robot.right_gripper_position, 0.0, places=6)
 
-    def test_single_end_effector_position_setpoint_requires_mode_1(self):
+    def test_single_end_effector_position_setpoint_requires_mode_3(self):
         robot = FakeRobot()
         controller = G2Controller(FakeGdk, robot, allow_motion=True)
         controller.send_left_end_effector_position_setpoint(
@@ -663,7 +953,7 @@ class ControlTests(unittest.TestCase):
             life_time_s=0.10,
         )
 
-        self.assertEqual(robot.control_mode, 1)
+        self.assertEqual(robot.control_mode, 3)
         request = robot.requests[-1]
         self.assertEqual(request.group, 0)
         self.assertEqual(request.left_end_effector_pose.position.y, 0.2)

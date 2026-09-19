@@ -220,9 +220,13 @@ class HoleTargetFromContextTests(unittest.TestCase):
             def get_tf_from_sensor(self, *_args):
                 raise AssertionError("sensor TF must not be read")
 
+        events = []
         class Controller:
             def set_control_mode(self, _mode):
-                pass
+                events.append(("mode", _mode))
+
+            def prepare_joint_impedance_control(self, sides):
+                events.append(("prepare", sides))
 
             def read_end_effector_pose(self, _frame):
                 raise RuntimeError("motion boundary reached")
@@ -241,6 +245,7 @@ class HoleTargetFromContextTests(unittest.TestCase):
                 head_model_path=pathlib.Path("unused.pt"), log=io.StringIO(),
                 prelocalized_targets=targets,
             )
+        self.assertEqual(events, [("prepare", ("left",))])
 
 
 class HoleFinalizePlanTests(unittest.TestCase):

@@ -61,7 +61,14 @@ def run_right_teach_sequence(services, args, runtime):
 def replay_right_placement(services, args):
     trajectory = validate_right_teach_args(args)
     robot = _GatedRobot(services.robot, services.gate, stop_on_takeover=True)
-    session = G2TrajectorySession(services.gdk, robot, "right", monotonic_fn=robot.clock, event_sink=print)
+    session = G2TrajectorySession(
+        services.gdk,
+        robot,
+        "right",
+        controller=getattr(services, "controller", None),
+        monotonic_fn=robot.clock,
+        event_sink=print,
+    )
     result = {"method": "teach", "trajectory": str(Path(args.right_teach_trajectory).expanduser().resolve()), "speed_scale": args.right_teach_speed_scale}
     with end_on_takeover(result, robot, "右手", getattr(services, "worker", None)):
         result["sent"] = session.replay(trajectory, speed_scale=args.right_teach_speed_scale, start_velocity_rad_s=args.right_teach_start_velocity_rad_s)

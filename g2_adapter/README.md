@@ -20,7 +20,7 @@
 
 `right_hole_target_detect_gdk.py` 用训练好的 `hole/target` YOLO 框检测模型读取右手彩色相机。它假设前序左手抓取、上抬和 P4 已完成；带 `--allow-motion` 时只把右臂移动到记录的 `right_post_grasp` 姿态，随后持续输出同一帧中的 `hole`（固定工装孔）和 `target`（被夹铰链销轴）框、置信度和中心误差。当前阶段不执行 XY 对孔、下探、力控或释放夹爪。
 
-`run_bilateral_alignment_gdk.py` 是独立的 P4 后定位入口：右臂预移动一次后固定观察，左臂通过 GDK mode-1 50 Hz 末端位姿流逐步做 XY 对孔。正确的双相机定义是：右手相机只识别固定工装 `hole`，左手 D405 在当前 P4 画面中优先选择深度最近的 `hinge`（可选面积最大或左右排序），再把其关联 `shaft` 作为被夹持的 `target`。网页同时显示左手全部 `hinge/shaft` 检测。选中后只在上一帧位置附近跟踪该铰链，不从日志读取目标。默认 `--geometry-mode off` 保留旧的单右图 pixel-J 诊断路径；`--geometry-mode direct` 同时打开左右 RGB-D，接入左右官方深度→彩色、RGB-D→各自末端外参与动态 `base_link←arm_*_end_link` TF，把两点都变换到 `base_link` 后计算三维 XY 误差。direct 默认仍只读，真实运动必须同时显式提供 `--allow-motion --approve-rgbd-direct-motion`。
+`run_bilateral_alignment_gdk.py` 是独立的 P4 后定位入口：右臂预移动一次后固定观察，左臂通过 GDK mode-3 50 Hz 末端位姿流逐步做 XY 对孔。正确的双相机定义是：右手相机只识别固定工装 `hole`，左手 D405 在当前 P4 画面中优先选择深度最近的 `hinge`（可选面积最大或左右排序），再把其关联 `shaft` 作为被夹持的 `target`。网页同时显示左手全部 `hinge/shaft` 检测。选中后只在上一帧位置附近跟踪该铰链，不从日志读取目标。默认 `--geometry-mode off` 保留旧的单右图 pixel-J 诊断路径；`--geometry-mode direct` 同时打开左右 RGB-D，接入左右官方深度→彩色、RGB-D→各自末端外参与动态 `base_link←arm_*_end_link` TF，把两点都变换到 `base_link` 后计算三维 XY 误差。direct 默认仍只读，真实运动必须同时显式提供 `--allow-motion --approve-rgbd-direct-motion`。
 
 帧状态默认以一行摘要在交互终端原地刷新；需要逐行 JSON 输出时使用 `--terminal-output json`。无论终端显示方式如何，完整紧凑帧记录仍写入 JSONL 日志。
 终端每帧优先显示 `hole_cam=(X,Y,Z)mm`、相机到孔的距离和可用的
@@ -236,15 +236,15 @@ cd /home/flyfuture/g2_hinge_assembly
 打印当前状态和目标。启动前仍必须满足《G2机器人控制注意事项与依赖路径.md》的
 现场、网络、PTP、急停和状态检查。
 
-当前左手视觉抓取是**纯位控**。根据 GDK 离线文档，`base` 应用模式支持机器人运动控制，`develop`
+当前左手视觉抓取默认使用关节阻抗（`control_mode=3`），标准 `kp=400 400 400 500 300 200 200`。根据 GDK 离线文档，`base` 应用模式支持机器人运动控制，`develop`
 用于自定义相机开关；因此操作员应先切到 `base` 并重启机器人/GDK 服务，再以只读方式确认左 D405 RGB-D
-仍可用，最后才可运行带 `--allow-motion` 的抓取。脚本不会切换 GDK 应用模式或 GDK control mode，也不会
+仍可用，最后才可运行带 `--allow-motion` 的抓取。脚本会在运动授权后准备关节阻抗模式与标准刚度，不会切换 GDK 应用模式，也不会
 重启机器人/GDK 服务。若重启后的 `base` 中左 D405 深度不可用，则这是需要先解决的相机配置问题，不能假设
-在 `develop` 中执行位控可行。
+在 `develop` 中执行运动控制可行。
 
-注意：GDK 的应用模式 `base/develop` 与运动 `control_mode` 是两件事。纯位控要求运行前的
-`control_mode=1`；`control_mode=3` 是关节阻抗，虽然 GDK 允许它调用末端位姿接口，但本项目不使用它。
-如状态显示为 3，可由操作员执行以下命令切换到 1；它只调用 `set_control_mode(1)`，不发送任何运动目标：
+注意：GDK 的应用模式 `base/develop` 与运动 `control_mode` 是两件事。正式运动自动准备
+`control_mode=3` 和标准关节刚度；只读路径不修改模式或刚度。拖拽示教临时使用 `50 50 50 60 30 30 30`，退出时恢复标准刚度并保持模式 `3`。
+以下为显式位置模式诊断/恢复命令，仅在操作员明确需要模式 `1` 时使用；它只调用 `set_control_mode(1)`，不发送运动目标、不恢复阻抗刚度，不是正式运动的前置步骤：
 
 ```bash
 /home/flyfuture/g2_hinge_assembly/scripts/run_gdk_sam3_python.sh \
@@ -255,7 +255,7 @@ cd /home/flyfuture/g2_hinge_assembly
 `--stop-after descend` 均可在 `calibrated=false` 时运行，且都不会发送闭爪命令。确认水平对准和
 下探位移均正确后，才将配置设为 `calibrated=true` 并省略 `--stop-after` 执行完整抓取。
 
-在 GDK 的 mode 2 问题解决前，不要把接触力作为闭爪条件。
+模式 `2` 仅用于显式笛卡尔阻抗诊断；正式抓取的接触阈值仍是模式 `3` 下的流程门控，不代表恒力控制。
 # 右手 AprilTag 工件抓取（由 OpenArm 包迁移）
 
 `right_apriltag_grasp_gdk.py` 是不依赖 ROS、MoveIt 或自写 IK 的右手流程：GDK 右手彩色流检测 `tagStandard41h12` 的 0/1/2 三张标签，按原 OpenArm 的 CAD 和 20 帧 PnP/RANSAC 计算 `T_camera_workpiece`，再用 GDK 的同图像时刻动态 TF（GDK 返回方向会在适配层显式反转为 `base_link <- arm_r_end_link`）与官方 `kRightHandRGBDToArmREndLink` 得到基座抓取点。默认只读：
@@ -303,7 +303,7 @@ scripts/run_gdk_sam3_python.sh g2_adapter/right_apriltag_grasp_gdk.py \
   --save-target outputs/right_grasp_tcp_candidate.json
 ```
 
-示例配置将这一步限制为平均重投影误差不高于 `1.5 px`，并要求精确图像时刻 TF；不满足时会拒绝输出候选值。审阅保存文件的 `right_end_from_grasp_tcp.matrix` 后，才可人工复制到配置；此命令不会把 `calibrated` 或 `right_mode1_probe_verified` 改为 `true`。
+示例配置将这一步限制为平均重投影误差不高于 `1.5 px`，并要求精确图像时刻 TF；不满足时会拒绝输出候选值。审阅保存文件的 `right_end_from_grasp_tcp.matrix` 后，才可人工复制到配置；此命令不会把 `calibrated` 或 `right_mode1_probe_verified` 改为 `true`。`right_mode1_probe_verified` 是保留兼容性的历史探针验证字段，不检查实时控制模式；当前探针及正式运动均使用模式 `3`。左手 `alignment.mapping_controller=gdk_mode1_end_effector_pose_control` 同样仅记录历史标定来源，不要求运行在模式 `1`。
 
 完成 grasp TCP 后，pregrasp 必须以 G2 实测值标定，不能沿用 OpenArm 中未实际发布的 pregrasp 偏置。操作员手动将右末端保持为 grasp 朝向，并沿该抓取接近轴后退 `15–50 mm`（横向偏差不超过 `10 mm`）；下面命令只读并输出候选，不发送运动、不改写配置：
 
@@ -326,7 +326,7 @@ scripts/run_gdk_sam3_python.sh g2_adapter/right_apriltag_grasp_gdk.py \
   --web-port 8768
 ```
 
-该模式不再因起点到 pregrasp 的距离或姿态偏差直接拒绝；程序会记录起点偏差，并继续按单步不超过 `5 mm/2°`、线速度 `10 mm/s`、角速度 `10°/s` 的限制运动。首次取得有效目标后，程序会在发送任何末端目标前自动调用并确认 `set_control_mode(1)`；随后先将右夹爪打开到 `-0.785 rad` 并确认 GDK 反馈，确认成功才启动右臂位置流。视觉更新期间末端由唯一的 50 Hz 流连续限速：平移每次跟随最新稳定二维码位置；朝向以首次锁定为基准，低于 `2°` 的检测抖动不改腕，超过阈值须连续 `3` 次彼此一致才重锁，重锁期间保持当前实际位姿。二维码暂时丢失时保持当前实际位姿并在最多 `30 s` 内等待后续锁定；若目标发生跳变，也不会追逐单帧结果，而是保持当前位置，要求新目标连续 `3` 次且彼此不超过 `10 mm/3°` 后才重新跟踪。到达最终 grasp 且实际位姿稳定后，保持这条 50 Hz 位姿流，并通过 GDK `EndEffectorPose.end_effector_joint_*` 同步发送闭爪目标，最多等待 `3.0 s` 反馈；反馈完全不向闭合方向移动（默认至少 `0.02 rad`）会判定抓取失败，不再输出流程完成。结果会区分到达闭端和被工件挡住；夹爪被工件撑住时不要求到达空夹零位，但必须有实际闭合位移。等待仍受 `max_iterations=80`、总流程 `120 s` 和 GDK 状态/反馈错误保护限制，超时停止且不闭爪。GDK mode-1 不提供碰撞规划，因此这仍是操作员看护下、清空直线路径后的受限自主预接近，不是自动避障；起点到目标的直线路径必须确认无遮挡。首次真机验证应先把 `calibrated` 保持为 `false`，仅完成代码/只读核验；未完成现场确认前不要运行带 `--allow-motion` 的命令。
+该模式不再因起点到 pregrasp 的距离或姿态偏差直接拒绝；程序会记录起点偏差，并继续按单步不超过 `5 mm/2°`、线速度 `10 mm/s`、角速度 `10°/s` 的限制运动。首次取得有效目标后，程序会在发送任何末端目标前自动准备右臂标准关节阻抗并确认 `control_mode=3`；随后先将右夹爪打开到 `-0.785 rad` 并确认 GDK 反馈，确认成功才启动右臂位置流。视觉更新期间末端由唯一的 50 Hz 流连续限速：平移每次跟随最新稳定二维码位置；朝向以首次锁定为基准，低于 `2°` 的检测抖动不改腕，超过阈值须连续 `3` 次彼此一致才重锁，重锁期间保持当前实际位姿。二维码暂时丢失时保持当前实际位姿并在最多 `30 s` 内等待后续锁定；若目标发生跳变，也不会追逐单帧结果，而是保持当前位置，要求新目标连续 `3` 次且彼此不超过 `10 mm/3°` 后才重新跟踪。到达最终 grasp 且实际位姿稳定后，保持这条 50 Hz 位姿流，并通过 GDK `EndEffectorPose.end_effector_joint_*` 同步发送闭爪目标，最多等待 `3.0 s` 反馈；反馈完全不向闭合方向移动（默认至少 `0.02 rad`）会判定抓取失败，不再输出流程完成。结果会区分到达闭端和被工件挡住；夹爪被工件撑住时不要求到达空夹零位，但必须有实际闭合位移。等待仍受 `max_iterations=80`、总流程 `120 s` 和 GDK 状态/反馈错误保护限制，超时停止且不闭爪。GDK 末端位姿流不提供碰撞规划，切到模式 `3` 也不改变这一边界，因此这仍是操作员看护下、清空直线路径后的受限自主预接近，不是自动避障；起点到目标的直线路径必须确认无遮挡。首次真机验证应先把 `calibrated` 保持为 `false`，仅完成代码/只读核验；未完成现场确认前不要运行带 `--allow-motion` 的命令。
 
 当前 OpenCV 的 ArUco 不含 `tagStandard41h12`，需在 `.venv-sam3` 安装 `pupil-apriltags`（见 `pyproject.toml` 的 `tags` extra）。示例配置刻意没有 G2 的 `right_end_from_grasp_tcp`，因此能做只读工件定位，却不会生成可执行 G2 末端目标。该变换、G2 右夹爪行程、观察位与工作空间必须重新实测；不得复制 OpenArm 的 TCP 偏置或夹爪数值。
 
@@ -339,7 +339,7 @@ scripts/run_gdk_python.sh g2_adapter/record_pose.py --name right_pr2 --save
 
 执行命令追加 `--premove-pr1 --post-grasp-pr2 --poses g2_adapter/recorded_poses.json` 后，程序会先按左手 P2/P3 的预设点方式移动到 `right_pr1`，清空旧视觉样本并重新锁定二维码；抓取反馈成功才会把当前右末端位姿和关节保存到本次时间戳日志，沿 `base_link +Z` 上抬 100 mm，实测到位并停止位置流后，再按预设点方式移动到 `right_pr2`。上抬或 PR2 到位失败时停止后续动作，不会张开夹爪；该阶段保持夹爪闭合且不再消费视觉目标。旧版本把 `right_pr1` 当作抓取后终点，不能直接沿用，必须按新语义重新记录 PR1，并新增 PR2。
 
-只有探针通过、填写 grasp TCP 和实测 pregrasp 映射，并由操作员把 `calibrated` 设为 `true` 后，才可使用 `--execute --allow-motion`。不带 `--autonomous-approach` 时仅运行已经位于 3 mm/0.5° 范围内的 pregrasp 到最多 50 mm 的末段；带该参数时才启用上面的受限粗到精自主预接近。GDK mode-1 无路径和碰撞规划，不得把它当作大范围自动避障。
+只有探针通过、填写 grasp TCP 和实测 pregrasp 映射，并由操作员把 `calibrated` 设为 `true` 后，才可使用 `--execute --allow-motion`。不带 `--autonomous-approach` 时仅运行已经位于 3 mm/0.5° 范围内的 pregrasp 到最多 50 mm 的末段；带该参数时才启用上面的受限粗到精自主预接近。GDK 末端位姿流无路径和碰撞规划，不得把它当作大范围自动避障。
 
 ## 分阶段双臂流程（单进程）
 

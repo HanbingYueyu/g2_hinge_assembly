@@ -110,7 +110,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 INTERRUPTED_EXIT_CODE = 130
 DEPTH_SCALE_M = 0.001
 # GDK's kLeftHandRGBDToArmLEndLink external calibration terminates here.  GDK
-# mode-1 end-effector pose control uses the same flange link by default.
+# Joint-impedance end-effector pose control uses the same flange link by default.
 LEFT_VISUAL_TIP_LINK = "arm_l_end_link"
 # Camera/model inference sets the cadence. Do not add an artificial delay
 # between display-only frames.
@@ -797,6 +797,12 @@ def parse_args(argv=None) -> argparse.Namespace:
         default=1.0,
         help="抓取后同一目标连续不可见多久才重新抓取，默认 1 秒。",
     )
+    parser.add_argument(
+        "--relief-extra-lift-mm",
+        type=float,
+        default=None,
+        help="泄力阈值达到后额外上抬的毫米数；省略时用 contact.relief_extra_lift_m（默认 0），允许 [0, 20]。",
+    )
     parser.add_argument("--log", type=Path, default=None, help="默认写入 logs/left_grasp_*.jsonl")
     parser.add_argument("--web-host", default="127.0.0.1", help="内嵌只读网页监听地址。")
     parser.add_argument("--web-port", type=int, default=0, help="内嵌 YOLO 网页端口；0 表示关闭。")
@@ -935,6 +941,7 @@ def load_config(path: Path, *, require_calibrated: bool) -> tuple[dict, GraspPar
     target_pixel = alignment.get("target_pixel_px")
     if not isinstance(target_pixel, list) or len(target_pixel) != 2:
         raise RuntimeError("alignment.target_pixel_px 必须为 [u, v]")
+    # Keep the persisted historical calibration provenance, independent of live mode 3.
     if alignment.get("mapping_controller") != "gdk_mode1_end_effector_pose_control":
         raise RuntimeError("alignment.mapping_controller 必须是 gdk_mode1_end_effector_pose_control；旧关节伺服标定禁止用于末端位姿控制")
     empirical_pixel_jacobian = np.asarray(alignment["pixel_jacobian_px_per_m"], dtype=np.float64)
@@ -974,6 +981,7 @@ def load_config(path: Path, *, require_calibrated: bool) -> tuple[dict, GraspPar
                 relief_max_lift_m=float(contact["relief_max_lift_m"]),
                 relief_force_delta_threshold_n=float(contact["relief_force_delta_threshold_n"]),
                 relief_consecutive_samples=int(contact["relief_consecutive_samples"]),
+                relief_extra_lift_m=float(contact.get("relief_extra_lift_m", 0.0)),
             )
             contact_parameters.validate()
         except (KeyError, TypeError, ValueError) as exc:
@@ -1121,6 +1129,7 @@ def compact_record(record: dict) -> dict:
             "gripper_position_rad", "adaptive_gripper_close_travel_rad", "adaptive_gripper_stall",
             "height_reference",
             "end_link_target_before_base_link", "end_link_target_after_base_link",
+            "final_descent_progress_m", "final_descent_termination", "actual_base_delta_m",
         )
         if key in record
     }
@@ -1134,6 +1143,16 @@ def compact_record(record: dict) -> dict:
     force = record.get("force_contact")
     if isinstance(force, dict) and "maximum_delta_force_n" in force:
         summary["force_delta_n"] = round(float(force["maximum_delta_force_n"]), 3)
+    relief = record.get("force_relief")
+    if isinstance(relief, dict):
+        summary["force_relief"] = {
+            key: relief[key]
+            for key in (
+                "required", "released", "latest_delta_force_n",
+                "consecutive_hits", "speed_mm_s", "max_lift_m",
+            )
+            if key in relief
+        }
     visual = record.get("final_descent_visual_servo")
     if isinstance(visual, dict):
         summary["visual_xy"] = {
@@ -1296,6 +1315,10 @@ def recover_for_visual_regrasp(
     # recovery must retain the stream's fixed visual-servo orientation rather
     # than reuse the newly measured quaternion.
     hold = CartesianPoseTarget(current.position_m, fixed_orientation_xyzw)
+    # A force contact or a stalled stream can leave the internal commanded
+    # point far from the measured pose, which freezes the slew and would make
+    # this recovery target unexecutable.  Rebase before commanding it.
+    position_stream.rebase_to_measured_pose()
     position_stream.update_target(hold)
     retract_target = CartesianPoseTarget(
         base_position_after_delta(hold.position_m, np.asarray((0.0, 0.0, retract_m))),
@@ -2253,45 +2276,40 @@ def run_head_coarse_approach_in_process(*, gdk, controller: G2Controller, tf, ar
             head_camera = None
             head_model = None
 
-        controller.set_control_mode(1)
+        controller.prepare_joint_impedance_control(("left",))
         current = controller.read_end_effector_pose(LEFT_VISUAL_TIP_LINK)
         orientation_error_deg = quaternion_angle_deg(current.orientation_xyzw, fixed_orientation)
-        if orientation_error_deg > 0.05:
-            stream = controller.start_left_end_effector_position_stream(
-                current, rate_hz=50.0, life_time_s=0.10, max_translation_velocity_mps=0.001,
-                allow_orientation_change=True, max_angular_velocity_rad_s=math.radians(20.0),
-            )
-            try:
-                orientation_target = CartesianPoseTarget(current.position_m, fixed_orientation)
-                stream.update_target(orientation_target)
-                timeout_s = max(5.0, orientation_error_deg / 20.0 + 3.0)
-                if not stream.wait_until_target(timeout_s):
-                    raise SafetyError("左手末端姿态调整命令未在限定时间内完成")
-                current = wait_actual_left_target(
-                    controller, stream, orientation_target, timeout_s=timeout_s + 5.0,
-                    tolerance_m=0.005, orientation_tolerance_deg=2.0,
-                )
-            finally:
-                stream.stop()
-        target = gripper_end_target(hinge_base, current.orientation_xyzw, tcp_end_m, args.head_above_mm / 1000.0)
+        # Do not turn to the approach orientation as a separate,
+        # translation-frozen wrist move.  On a VLM regrasp restart the arm is
+        # already near the tray, so a pure yaw turn there repeatedly hit wrist
+        # joint limits.  Translate and rotate in the same bounded stream so
+        # whole-body IK can spread the rotation over the arm.
+        target = gripper_end_target(hinge_base, fixed_orientation, tcp_end_m, args.head_above_mm / 1000.0)
         travel_mm = float(np.linalg.norm(np.asarray(target.position_m) - np.asarray(current.position_m)) * 1000.0)
         if travel_mm > 450.0:
             raise SafetyError(f"当前末端到头部目标直线距离 {travel_mm:.1f} mm，超过 450.0 mm")
         start = {"event": "left_above_hinge_motion_start", "travel_mm": round(travel_mm, 2),
+                 "orientation_error_deg": round(orientation_error_deg, 2),
                  "xy_speed_mm_s": args.xy_speed_mm_s,
                  "target_end_link_base_m": list(target.position_m), "orientation_xyzw": list(target.orientation_xyzw)}
         print(json.dumps(start, ensure_ascii=False), flush=True)
         json_record(log, start)
+        approach_timeout_s = max(
+            8.0,
+            travel_mm / args.xy_speed_mm_s + orientation_error_deg / 20.0 + 3.0,
+        )
         stream = controller.start_left_end_effector_position_stream(
             current, rate_hz=50.0, life_time_s=0.10,
             max_translation_velocity_mps=args.xy_speed_mm_s / 1000.0,
+            allow_orientation_change=True,
+            max_angular_velocity_rad_s=math.radians(20.0),
         )
         try:
             stream.update_target(target)
-            if not stream.wait_until_target(travel_mm / args.xy_speed_mm_s + 2.0):
+            if not stream.wait_until_target(approach_timeout_s):
                 raise SafetyError("左手位姿流未在限定时间内发送到目标")
             actual = wait_actual_left_target(
-                controller, stream, target, timeout_s=max(5.0, travel_mm / args.xy_speed_mm_s), tolerance_m=0.010,
+                controller, stream, target, timeout_s=approach_timeout_s, tolerance_m=0.010,
             )
         finally:
             stream.stop()
@@ -2653,6 +2671,13 @@ def run_left_cycle(*, services=None, argv=None) -> int:
                 stop_after=args.stop_after,
             ),
         )
+        if args.relief_extra_lift_mm is not None and contact_parameters is not None:
+            # Explicit CLI value (mm) wins over contact.relief_extra_lift_m.
+            contact_parameters = replace(
+                contact_parameters,
+                relief_extra_lift_m=float(args.relief_extra_lift_mm) / 1000.0,
+            )
+            contact_parameters.validate()
         height_samples = None
         if args.height_reference is not None:
             height_samples = load_height_samples(args.height_reference)
@@ -3056,7 +3081,7 @@ def run_left_cycle(*, services=None, argv=None) -> int:
             json_record(log, {"event": "gdk_motion_status_before_perception", **controller.motion_status_summary()})
             if args.full_cycle:
                 if args.head_coarse_approach:
-                    controller.set_control_mode(1)
+                    controller.prepare_joint_impedance_control(("left",))
                     assert gripper_close_timeout is not None and gripper_open is not None
                     initial_gripper_open_stream = controller.start_left_gripper_position_stream(gripper_open)
                     initial_gripper_open = {
@@ -3212,7 +3237,7 @@ def run_left_cycle(*, services=None, argv=None) -> int:
                         position_stream = None
                         assert gripper_open is not None and gripper_close_timeout is not None
                         if services is not None and services.get('vlm_gripper_monitor') is not None:
-                            services.get('vlm_gripper_monitor').set_phase('pre_grasp')
+                            services.get('vlm_gripper_monitor').set_phase('idle')
                         post_grasp_regrasp_open_stream = controller.start_left_gripper_position_stream(gripper_open)
                         post_grasp_regrasp_open = {
                             "reason": "post_grasp_verify_lift_target_not_reached",
@@ -3229,11 +3254,11 @@ def run_left_cycle(*, services=None, argv=None) -> int:
                         print(json.dumps(event, ensure_ascii=False))
                     if complete:
                         mode_before_visual = controller.motion_status_summary()
-                        controller.set_control_mode(1)
+                        controller.prepare_joint_impedance_control(("left",))
                         mode_after_visual = controller.motion_status_summary()
-                        if mode_after_visual["control_mode"] != 1 or mode_after_visual["error_code"] != 0:
+                        if mode_after_visual["control_mode"] != 3 or mode_after_visual["error_code"] != 0:
                             raise SafetyError(
-                                f"P3 后未进入健康 control_mode=1；拒绝张开夹爪或开始视觉伺服：{mode_after_visual}"
+                                f"P3 后未进入健康关节阻抗 control_mode=3；拒绝张开夹爪或开始视觉伺服：{mode_after_visual}"
                             )
                         json_record(log, {
                             "event": "premove_complete",
@@ -3466,7 +3491,7 @@ def run_left_cycle(*, services=None, argv=None) -> int:
                         position_stream = None
                         assert gripper_open is not None and gripper_tolerance is not None and gripper_close_timeout is not None
                         if services is not None and services.get('vlm_gripper_monitor') is not None:
-                            services.get('vlm_gripper_monitor').set_phase('pre_grasp')
+                            services.get('vlm_gripper_monitor').set_phase('idle')
                         lift_before_visual_reacquire(controller, speed_mm_s=args.xy_speed_mm_s)
                         post_grasp_regrasp_open_stream = controller.start_left_gripper_position_stream(gripper_open)
                         post_grasp_regrasp_open = {
@@ -3586,7 +3611,15 @@ def run_left_cycle(*, services=None, argv=None) -> int:
                             "same-target monitoring before P4; a fresh frame is required before the request",
                         )
                     elif time.monotonic() > monitor["deadline"]:
-                        raise SafetyError("受监控的 P4 前上抬超时；保持当前位置且拒绝进入 P4")
+                        stalled = measured_left_end_link_pose(controller)
+                        stalled_delta = np.asarray(stalled.position_m) - np.asarray(monitor["origin"].position_m)
+                        raise SafetyError(
+                            "受监控的 P4 前上抬超时；保持当前位置且拒绝进入 P4"
+                            f"（目标上抬 {PRE_P4_LIFT_M * 1000:.1f} mm，"
+                            f"实测 Δz {float(stalled_delta[2]) * 1000:.1f} mm，"
+                            f"横向 {float(np.linalg.norm(stalled_delta[:2])) * 1000:.1f} mm，"
+                            f"容差 {PRE_P4_LIFT_TOLERANCE_M * 1000:.1f} mm）"
+                        )
                     # This branch is intentionally non-blocking, but a tight
                     # GDK polling loop can starve the perception worker under
                     # CPython's GIL.  Yield briefly so YOLO keeps publishing.
@@ -3628,7 +3661,7 @@ def run_left_cycle(*, services=None, argv=None) -> int:
                         force_preview_phase = None
                         assert gripper_open is not None and gripper_close_timeout is not None
                         if services is not None and services.get('vlm_gripper_monitor') is not None:
-                            services.get('vlm_gripper_monitor').set_phase('pre_grasp')
+                            services.get('vlm_gripper_monitor').set_phase('idle')
                         if position_stream is not None:
                             position_stream.stop()
                             position_stream = None
@@ -3763,7 +3796,7 @@ def run_left_cycle(*, services=None, argv=None) -> int:
                             force_preview_phase = None
                             assert gripper_open is not None and gripper_close_timeout is not None
                             if services is not None and services.get('vlm_gripper_monitor') is not None:
-                                services.get('vlm_gripper_monitor').set_phase('pre_grasp')
+                                services.get('vlm_gripper_monitor').set_phase('idle')
                             if position_stream is not None:
                                 position_stream.stop()
                                 position_stream = None
@@ -4003,7 +4036,7 @@ def run_left_cycle(*, services=None, argv=None) -> int:
                                 force_preview_phase = None
                                 lost_duration_s = loss_now - post_grasp_target_lost_since
                                 if services is not None and services.get('vlm_gripper_monitor') is not None:
-                                    services.get('vlm_gripper_monitor').set_phase('pre_grasp')
+                                    services.get('vlm_gripper_monitor').set_phase('idle')
                                 position_stream, last_end_link_target, recovery = recover_for_visual_regrasp(
                                     controller,
                                     position_stream,
@@ -4192,9 +4225,9 @@ def run_left_cycle(*, services=None, argv=None) -> int:
                             )
                             if args.step_metric_xy and not coarse_active:
                                 delta_base = bounded_xy(item["step_pose"]["base_xy_error_m"], parameters.max_xy_step_m)
-                            command_source = "gdk_end_effector_pose_mode1_empirical_visual_xy"
+                            command_source = "gdk_end_effector_pose_mode3_empirical_visual_xy"
                             if args.step_metric_xy and not coarse_active:
-                                command_source = "gdk_end_effector_pose_mode1_step_metric_xy"
+                                command_source = "gdk_end_effector_pose_mode3_step_metric_xy"
                                 record["base_xy_error_m"] = item["step_pose"]["base_xy_error_m"]
                             record["pixel_error_px"] = [float(value) for value in pixel_error]
                             record["xy_step_limit_mm"] = parameters.max_xy_step_m * 1000.0
@@ -4203,7 +4236,7 @@ def run_left_cycle(*, services=None, argv=None) -> int:
                             assert step.base_delta_m is not None
                             assert step.motion_duration_s is not None
                             delta_base = np.asarray(step.base_delta_m, dtype=np.float64)
-                            command_source = "gdk_end_effector_pose_mode1_force_guarded_final_descent" if step.is_final_descent else "gdk_end_effector_pose_mode1_vertical_approach"
+                            command_source = "gdk_end_effector_pose_mode3_force_guarded_final_descent" if step.is_final_descent else "gdk_end_effector_pose_mode3_vertical_approach"
                         if step.is_final_descent and position_stream is not None:
                             prior_target_ready = position_stream.is_target_reached()
                             record["pre_final_xy_settle"] = {
@@ -4230,6 +4263,25 @@ def run_left_cycle(*, services=None, argv=None) -> int:
                                 measured_pose.position_m,
                                 last_end_link_target.orientation_xyzw,
                             )
+                        # The final descent terminates on measured distance, not
+                        # on the nominal speed*duration window: the 50 Hz pose
+                        # stream paces itself to measured feedback, so a
+                        # compliant arm may need longer than nominal.  Time is
+                        # kept only as a runaway guard.
+                        descent_completed = False
+                        descent_actual_down_m = 0.0
+                        descent_actual_lateral_m = 0.0
+                        descent_actual_delta_m = np.zeros(3, dtype=np.float64)
+                        descent_distance_m = 0.0
+                        descent_safety_s = 0.0
+                        descent_stall_s = 0.0
+                        descent_completion_tolerance_m = 0.0
+                        if step.is_final_descent:
+                            assert step.motion_duration_s is not None
+                            descent_distance_m = max(0.0, -float(delta_base[2]))
+                            descent_safety_s = max(15.0, step.motion_duration_s * 3.0 + 5.0)
+                            descent_stall_s = max(3.0, step.motion_duration_s * 0.2)
+                            descent_completion_tolerance_m = parameters.final_descent_completion_tolerance_m
                         if step.is_final_descent and args.allow_motion and contact_parameters is not None:
                             # This is deliberately captured after XY/depth
                             # alignment and before any final downward command.
@@ -4269,15 +4321,38 @@ def run_left_cycle(*, services=None, argv=None) -> int:
                                 if last_end_link_target is not None
                                 else actual_before_update.orientation_xyzw
                             )
+                            # Rebase X/Y only.  Copying the measured Z as well
+                            # let whole-body-IK/compliance drift ratchet the
+                            # approach height upward while the XY servo ran
+                            # (observed: +146 mm of unintended climb over 234
+                            # corrections in mode 3).  The commanded Z stays
+                            # the alignment reference so the stream corrects
+                            # drift instead of accumulating it.
+                            reference_z = (
+                                last_end_link_target.position_m[2]
+                                if last_end_link_target is not None
+                                else actual_before_update.position_m[2]
+                            )
                             last_end_link_target = CartesianPoseTarget(
-                                actual_before_update.position_m,
+                                (
+                                    actual_before_update.position_m[0],
+                                    actual_before_update.position_m[1],
+                                    reference_z,
+                                ),
                                 orientation,
                             )
                         elif last_end_link_target is None:
                             last_end_link_target = measured_left_end_link_pose(controller)
                         if args.step_profile is not None and step.camera_delta_m is not None and args.allow_motion:
                             actual = measured_left_end_link_pose(controller)
-                            last_end_link_target = CartesianPoseTarget(actual.position_m, last_end_link_target.orientation_xyzw)
+                            last_end_link_target = CartesianPoseTarget(
+                                (
+                                    actual.position_m[0],
+                                    actual.position_m[1],
+                                    last_end_link_target.position_m[2],
+                                ),
+                                last_end_link_target.orientation_xyzw,
+                            )
                         target = CartesianPoseTarget(
                             base_position_after_delta(last_end_link_target.position_m, delta_base),
                             last_end_link_target.orientation_xyzw,
@@ -4285,7 +4360,7 @@ def run_left_cycle(*, services=None, argv=None) -> int:
                         record.update({
                             "visual_tip_link": LEFT_VISUAL_TIP_LINK,
                             "command_source": command_source,
-                            "gdk_control_mode": 1,
+                            "gdk_control_mode": 3,
                             "delta_base_m": [float(value) for value in delta_base],
                             "end_link_target_before_base_link": list(last_end_link_target.position_m),
                             "end_link_target_after_base_link": list(target.position_m),
@@ -4361,14 +4436,65 @@ def run_left_cycle(*, services=None, argv=None) -> int:
                                         ),
                                     }
                                     perception.set_phase("force_contact_descent", force_preview_phase["overlay_note"])
-                                    final_deadline = time.monotonic() + step.motion_duration_s + 0.25
                                     maximum_delta_force_n = 0.0
                                     latest_force_n: np.ndarray | None = None
                                     latest_hits = 0
                                     force_relief_completed = False
                                     final_descent_retry_reason: str | None = None
-                                    while time.monotonic() < final_deadline:
+                                    descent_origin_m = np.asarray(
+                                        record["end_link_target_before_base_link"], dtype=np.float64
+                                    )
+                                    descent_safety_deadline = time.monotonic() + descent_safety_s
+                                    descent_stalled = False
+                                    descent_progress_reference_m = 0.0
+                                    descent_progress_reference_at = time.monotonic()
+                                    last_progress_read = 0.0
+                                    while True:
                                         position_stream.raise_if_failed()
+                                        progress_now = time.monotonic()
+                                        if progress_now - last_progress_read >= 0.1:
+                                            progress_pose = measured_left_end_link_pose(controller)
+                                            descent_actual_delta_m = (
+                                                np.asarray(progress_pose.position_m, dtype=np.float64)
+                                                - descent_origin_m
+                                            )
+                                            descent_actual_down_m = -float(descent_actual_delta_m[2])
+                                            descent_actual_lateral_m = float(
+                                                np.linalg.norm(descent_actual_delta_m[:2])
+                                            )
+                                            last_progress_read = progress_now
+                                            record["final_descent_progress_m"] = {
+                                                "target_down_m": descent_distance_m,
+                                                "actual_down_m": descent_actual_down_m,
+                                                "actual_lateral_m": descent_actual_lateral_m,
+                                                "completion_tolerance_m": descent_completion_tolerance_m,
+                                                "safety_time_s": descent_safety_s,
+                                                "stall_time_s": descent_stall_s,
+                                            }
+                                            if (
+                                                descent_actual_down_m
+                                                >= descent_distance_m - descent_completion_tolerance_m
+                                                or position_stream.is_target_reached()
+                                            ):
+                                                # Either the strict measured
+                                                # distance or the stream's own
+                                                # actual-arrival tolerance
+                                                # (5 mm) is satisfied; the
+                                                # latter absorbs joint-impedance
+                                                # steady-state following error.
+                                                descent_completed = True
+                                                break
+                                            if descent_actual_down_m > descent_progress_reference_m + 0.001:
+                                                descent_progress_reference_m = descent_actual_down_m
+                                                descent_progress_reference_at = progress_now
+                                            elif (
+                                                progress_now - descent_progress_reference_at
+                                                >= descent_stall_s
+                                            ):
+                                                descent_stalled = True
+                                                break
+                                        if progress_now >= descent_safety_deadline:
+                                            break
                                         _status, force_n = read_wrench_force(robot, contact_detector.parameters.frame_name)
                                         detected, delta_force_n, hits = contact_detector.update(force_n)
                                         latest_force_n = force_n
@@ -4409,6 +4535,7 @@ def run_left_cycle(*, services=None, argv=None) -> int:
                                                 contact_pose.position_m,
                                                 last_end_link_target.orientation_xyzw,
                                             )
+                                            position_stream.rebase_to_measured_pose()
                                             position_stream.update_target(contact_hold_target)
                                             last_end_link_target = contact_hold_target
                                             if delta_force_n <= contact_detector.parameters.relief_force_delta_threshold_n:
@@ -4443,6 +4570,7 @@ def run_left_cycle(*, services=None, argv=None) -> int:
                                                 "relief_speed_mm_s": relief_speed_mps * 1000.0,
                                                 "ratio": 0.5,
                                             }
+                                            position_stream.rebase_to_measured_pose()
                                             position_stream.update_target(relief_target)
                                             last_end_link_target = relief_target
                                             relief_deadline = time.monotonic() + (
@@ -4468,10 +4596,27 @@ def run_left_cycle(*, services=None, argv=None) -> int:
                                                         relief_hits = 0
                                                     if relief_hits >= contact_detector.parameters.relief_consecutive_samples:
                                                         relief_pose = measured_left_end_link_pose(controller)
-                                                        relief_hold_target = CartesianPoseTarget(
-                                                            relief_pose.position_m,
-                                                            last_end_link_target.orientation_xyzw,
+                                                        extra_lift_m = float(
+                                                            contact_detector.parameters.relief_extra_lift_m
                                                         )
+                                                        if extra_lift_m > 0.0:
+                                                            # Release force confirmed: add
+                                                            # the configured extra
+                                                            # clearance above the measured
+                                                            # release pose.
+                                                            relief_hold_target = CartesianPoseTarget(
+                                                                base_position_after_delta(
+                                                                    relief_pose.position_m,
+                                                                    np.asarray((0.0, 0.0, extra_lift_m)),
+                                                                ),
+                                                                last_end_link_target.orientation_xyzw,
+                                                            )
+                                                        else:
+                                                            relief_hold_target = CartesianPoseTarget(
+                                                                relief_pose.position_m,
+                                                                last_end_link_target.orientation_xyzw,
+                                                            )
+                                                        position_stream.rebase_to_measured_pose()
                                                         position_stream.update_target(relief_hold_target)
                                                         last_end_link_target = relief_hold_target
                                                         # This is a cancellation of
@@ -4507,6 +4652,36 @@ def run_left_cycle(*, services=None, argv=None) -> int:
                                                 "latest_delta_force_n": latest_relief_delta_force_n,
                                                 "consecutive_hits": relief_hits,
                                             }
+                                            if (
+                                                force_relief_completed
+                                                and contact_detector.parameters.relief_extra_lift_m > 0.0
+                                            ):
+                                                # Wait for the extra clearance to settle
+                                                # before allowing closure.  Not reaching
+                                                # it is recorded but not fatal: the force
+                                                # has already been released.
+                                                extra_settle_m = float(
+                                                    contact_detector.parameters.relief_extra_lift_m
+                                                )
+                                                extra_deadline = time.monotonic() + max(
+                                                    2.0,
+                                                    extra_settle_m / parameters.final_descent_speed_mps + 1.5,
+                                                )
+                                                extra_settled = False
+                                                while time.monotonic() < extra_deadline:
+                                                    position_stream.raise_if_failed()
+                                                    extra_delta = (
+                                                        np.asarray(
+                                                            measured_left_end_link_pose(controller).position_m
+                                                        )
+                                                        - np.asarray(last_end_link_target.position_m)
+                                                    )
+                                                    if float(np.linalg.norm(extra_delta)) <= 0.005:
+                                                        extra_settled = True
+                                                        break
+                                                    time.sleep(contact_detector.parameters.sample_period_s)
+                                                record["force_relief"]["extra_lift_m"] = extra_settle_m
+                                                record["force_relief"]["extra_lift_settled"] = extra_settled
                                             if not force_relief_completed:
                                                 # Return to the pre-descent height before
                                                 # permitting another visual alignment.
@@ -4519,24 +4694,46 @@ def run_left_cycle(*, services=None, argv=None) -> int:
                                                     (retry_pose.position_m[0], retry_pose.position_m[1], retry_z),
                                                     last_end_link_target.orientation_xyzw,
                                                 )
+                                                position_stream.rebase_to_measured_pose()
                                                 position_stream.update_target(retry_target)
                                                 last_end_link_target = retry_target
                                                 retry_deadline = time.monotonic() + (
                                                     (retry_z - retry_pose.position_m[2]) / parameters.final_descent_speed_mps + 3.0
                                                 )
                                                 retry_hits = 0
+                                                actual_retry = retry_pose
+                                                retry_arrived = False
+                                                retry_released = False
+                                                retry_delta_force_n: float | None = None
                                                 while time.monotonic() < retry_deadline:
                                                     position_stream.raise_if_failed()
                                                     actual_retry = measured_left_end_link_pose(controller)
                                                     _, retry_force = read_wrench_force(robot, contact_detector.parameters.frame_name)
+                                                    retry_delta_force_n = float(np.linalg.norm(retry_force - contact_detector.baseline_force_n))
                                                     arrived = np.linalg.norm(np.asarray(actual_retry.position_m) - retry_target.position_m) <= 0.005
-                                                    released = np.linalg.norm(retry_force - contact_detector.baseline_force_n) <= contact_detector.parameters.relief_force_delta_threshold_n
+                                                    released = retry_delta_force_n <= contact_detector.parameters.relief_force_delta_threshold_n
+                                                    retry_arrived, retry_released = arrived, released
                                                     retry_hits = retry_hits + 1 if arrived and released else 0
                                                     if retry_hits >= contact_detector.parameters.relief_consecutive_samples:
                                                         break
                                                     time.sleep(contact_detector.parameters.sample_period_s)
                                                 else:
-                                                    raise SafetyError("抓取失败后撤回未到位或仍持续受力；停止且不重新下探")
+                                                    record["force_relief"].update({
+                                                        "retract_target_base_link": list(retry_target.position_m),
+                                                        "retract_actual_base_link": list(actual_retry.position_m),
+                                                        "retract_arrived": retry_arrived,
+                                                        "retract_released": retry_released,
+                                                        "retract_latest_delta_force_n": retry_delta_force_n,
+                                                        "retract_hits": retry_hits,
+                                                    })
+                                                    raise SafetyError(
+                                                        "抓取失败后撤回未到位或仍持续受力；停止且不重新下探"
+                                                        f"（撤回目标 {list(retry_target.position_m)}，"
+                                                        f"实测 {list(actual_retry.position_m)}，"
+                                                        f"到位={retry_arrived}，力已释放={retry_released}，"
+                                                        f"残余力差={retry_delta_force_n} N，"
+                                                        f"释放阈值={contact_detector.parameters.relief_force_delta_threshold_n} N）"
+                                                    )
                                                 final_descent_retry_reason = "force_relief_failed_retracted_retry"
                                             break
                                         # Force is the primary guard.  Do not
@@ -4566,6 +4763,7 @@ def run_left_cycle(*, services=None, argv=None) -> int:
                                                         hold_pose.position_m,
                                                         last_end_link_target.orientation_xyzw,
                                                     )
+                                                    position_stream.rebase_to_measured_pose()
                                                     position_stream.update_target(hold_target)
                                                     last_end_link_target = hold_target
                                                     final_descent_retry_reason = str(correction.get("reason", "locked_target_lost"))
@@ -4635,6 +4833,7 @@ def run_left_cycle(*, services=None, argv=None) -> int:
                                                             hold_pose.position_m,
                                                             last_end_link_target.orientation_xyzw,
                                                         )
+                                                        position_stream.rebase_to_measured_pose()
                                                         position_stream.update_target(hold_target)
                                                         last_end_link_target = hold_target
                                                         final_descent_retry_reason = "visual_horizontal_limit"
@@ -4700,7 +4899,7 @@ def run_left_cycle(*, services=None, argv=None) -> int:
                                         force_preview_stop = force_preview_thread = None
                                         force_preview_phase = None
                                         if services is not None and services.get('vlm_gripper_monitor') is not None:
-                                            services.get('vlm_gripper_monitor').set_phase('pre_grasp')
+                                            services.get('vlm_gripper_monitor').set_phase('idle')
                                         position_stream, last_end_link_target, recovery = recover_for_visual_regrasp(
                                             controller,
                                             position_stream,
@@ -4731,8 +4930,38 @@ def run_left_cycle(*, services=None, argv=None) -> int:
                                         print_compact_record(record)
                                         continue
                                     if not force_contact_detected and args.stop_after != "descend":
+                                        if descent_completed:
+                                            termination = "distance_reached_without_contact"
+                                        elif descent_stalled:
+                                            termination = "stalled_before_configured_distance"
+                                        else:
+                                            termination = "safety_timeout_before_configured_distance"
+                                        record["final_descent_termination"] = termination
+                                        record["actual_base_delta_m"] = [
+                                            float(value) for value in descent_actual_delta_m
+                                        ]
+                                        progress_detail = (
+                                            f"（目标 {descent_distance_m * 1000:.1f} mm，"
+                                            f"实测 {descent_actual_down_m * 1000:.1f} mm，"
+                                            f"横向 {descent_actual_lateral_m * 1000:.1f} mm）"
+                                        )
+                                        if descent_completed:
+                                            raise SafetyError(
+                                                "最终下探实测已走完配置行程"
+                                                + progress_detail
+                                                + "仍未检测到铰链平面接触；已停止且不闭爪"
+                                            )
+                                        if descent_stalled:
+                                            raise SafetyError(
+                                                "最终下探在安全时限内停止前进"
+                                                + progress_detail
+                                                + f"，连续 {descent_stall_s:.1f} s 无有效位移且未检测到接触；"
+                                                "已停止且不闭爪（位姿流未按实测跟进而冻结）"
+                                            )
                                         raise SafetyError(
-                                            "最终下探达到已配置的最大行程但未检测到铰链平面接触；已停止且不闭爪"
+                                            "最终下探在安全时限内未走完配置行程"
+                                            + progress_detail
+                                            + f"，安全时限 {descent_safety_s:.1f} s 且未检测到接触；已停止且不闭爪"
                                         )
                                     if force_contact_detected and force_preview_phase is not None:
                                         # Keep the same model/camera worker
@@ -4753,8 +4982,12 @@ def run_left_cycle(*, services=None, argv=None) -> int:
                                         # the dedicated 20 mm held-part verification.
                                         active_regrasp_mailbox = None
                                         active_regrasp_mailbox_sequence = visual_mailbox_sequence
-                                elif not position_stream.wait_until_target(step.motion_duration_s + 0.25):
-                                    raise SafetyError("定时下探未在规定时间内发送到最终 GDK 末端目标；拒绝闭爪")
+                                elif not position_stream.wait_until_target(
+                                    max(15.0, step.motion_duration_s * 3.0 + 5.0)
+                                ):
+                                    raise SafetyError(
+                                        "定时下探未在安全时限内发送到最终 GDK 末端目标；拒绝闭爪"
+                                    )
                                 time.sleep(0.10)
                                 actual_end_link = measured_left_end_link_pose(controller)
                                 actual_base_delta = np.asarray(actual_end_link.position_m) - np.asarray(record["end_link_target_before_base_link"])
@@ -4787,11 +5020,25 @@ def run_left_cycle(*, services=None, argv=None) -> int:
                             and args.stop_after == "descend"
                             and step.is_final_descent
                         ):
-                            record["test_stop"] = (
-                                "force_contact_detected_before_gripper_close"
-                                if contact_detector is not None and force_contact_detected
-                                else "max_final_descent_reached_without_contact_before_gripper_close"
-                            )
+                            if contact_detector is not None and force_contact_detected:
+                                test_stop_reason = "force_contact_detected_before_gripper_close"
+                            elif contact_detector is not None and descent_completed:
+                                test_stop_reason = (
+                                    "configured_final_descent_distance_reached_without_contact_before_gripper_close"
+                                )
+                            elif contact_detector is not None and descent_stalled:
+                                test_stop_reason = (
+                                    "final_descent_stalled_without_contact_before_gripper_close"
+                                )
+                            elif contact_detector is not None:
+                                test_stop_reason = (
+                                    "final_descent_safety_timeout_without_contact_before_gripper_close"
+                                )
+                            else:
+                                test_stop_reason = (
+                                    "max_final_descent_reached_without_contact_before_gripper_close"
+                                )
+                            record["test_stop"] = test_stop_reason
                             json_record(log, record)
                             print_compact_record(record)
                             print("受看护定时下探测试完成：已停止且未闭爪。")
@@ -4974,7 +5221,7 @@ def run_left_cycle(*, services=None, argv=None) -> int:
                                     force_preview_stop = force_preview_thread = None
                                     force_preview_phase = None
                                     if services is not None and services.get('vlm_gripper_monitor') is not None:
-                                        services.get('vlm_gripper_monitor').set_phase('pre_grasp')
+                                        services.get('vlm_gripper_monitor').set_phase('idle')
                                     position_stream, last_end_link_target, recovery = recover_for_visual_regrasp(
                                         controller,
                                         position_stream,
@@ -5066,10 +5313,18 @@ def run_left_cycle(*, services=None, argv=None) -> int:
                                     ),
                                     last_end_link_target.orientation_xyzw,
                                 )
+                                # After contact and closure the internal
+                                # commanded point can still be far below the
+                                # measured pose, which freezes the slew and
+                                # makes this +Z verification lift time out
+                                # (seen repeatedly as
+                                # post_grasp_verify_lift_target_not_reached).
+                                # Rebase so the lift starts from the real arm.
+                                position_stream.rebase_to_measured_pose()
                                 position_stream.update_target(verify_target)
                                 verify_timeout_s = max(
-                                    1.0,
-                                    args.post_grasp_verify_lift_m / parameters.final_descent_speed_mps + 0.5,
+                                    1.5,
+                                    args.post_grasp_verify_lift_m / parameters.final_descent_speed_mps + 1.0,
                                 )
                                 post_grasp_verify_motion = {
                                     "target": verify_target,
@@ -5122,7 +5377,7 @@ def run_left_cycle(*, services=None, argv=None) -> int:
                                 assert position_stream is not None
                                 # The first transport motion is not a blind,
                                 # blocking helper call.  Keep the existing
-                                # 50-Hz mode-1 stream alive and inspect every
+                                # 50-Hz mode-3 stream alive and inspect every
                                 # fresh same-target SAM3 observation while it
                                 # raises 150 mm.  A dropped hinge is therefore
                                 # a regrasp event, never permission to request
@@ -5135,6 +5390,7 @@ def run_left_cycle(*, services=None, argv=None) -> int:
                                     ),
                                     last_end_link_target.orientation_xyzw,
                                 )
+                                position_stream.rebase_to_measured_pose()
                                 position_stream.update_target(lift_target)
                                 json_record(log, {
                                     "event": "post_grasp_monitored_lift_start",
@@ -5180,7 +5436,15 @@ def run_left_cycle(*, services=None, argv=None) -> int:
                                     "max_area_spread_fraction": 0.0,
                                     "area_instability": None,
                                     "area_unstable_streak": 0,
-                                    "deadline": time.monotonic() + PRE_P4_LIFT_M / parameters.final_descent_speed_mps + 1.0,
+                                    # Distance is the goal; time is only a runaway
+                                    # guard.  The +1 s margin over the nominal
+                                    # travel was too tight: the stream paces
+                                    # itself to measured feedback, so a
+                                    # compliant arm legitimately needs more.
+                                    "deadline": time.monotonic() + max(
+                                        10.0,
+                                        3.0 * PRE_P4_LIFT_M / parameters.final_descent_speed_mps + 5.0,
+                                    ),
                                 }
                                 # The next main-loop ticks poll this target;
                                 # do not wait here.
@@ -5194,7 +5458,7 @@ def run_left_cycle(*, services=None, argv=None) -> int:
                             force_preview_stop = force_preview_thread = None
                             force_preview_phase = None
                             if services is not None and services.get('vlm_gripper_monitor') is not None:
-                                services.get('vlm_gripper_monitor').set_phase('pre_grasp')
+                                services.get('vlm_gripper_monitor').set_phase('idle')
                             position_stream, last_end_link_target, recovery = recover_for_visual_regrasp(
                                 controller,
                                 position_stream,

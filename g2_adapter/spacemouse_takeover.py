@@ -510,9 +510,7 @@ class SpaceMouseTakeoverWorker:
         self.active_side = side
         self._session = self._new_session(side)
         with self.controller.manual_motion():
-            status = self.controller.motion_status_summary()
-            if status["control_mode"] != 1:
-                self.controller.set_control_mode(1)
+            self.controller.prepare_joint_impedance_control((side,))
             self._session.tick(self._without_consumed_buttons(frame, consumed), now)
 
     def _deactivate(self, *, resume: bool) -> None:

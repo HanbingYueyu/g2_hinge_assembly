@@ -15,7 +15,7 @@ from spacemouse_takeover import (
     SpaceMouseGestureState,
     TakeoverEvent,
 )
-from control import G2Controller
+from control import G2Controller, STANDARD_JOINT_IMPEDANCE_KP
 from safety import SafetyError
 from spacemouse_teleop import TeleopConfig, TransientGDKReadTimeout
 from dianpi_runner import DianpiTriggerResult
@@ -318,6 +318,31 @@ class MotionPauseGateTests(unittest.TestCase):
 
 
 class WorkerTests(unittest.TestCase):
+    def test_activation_prepares_selected_arm_with_standard_joint_impedance(self):
+        for side, group in (("left", 0), ("right", 1)):
+            with self.subTest(side=side):
+                robot = BilateralRobot()
+                robot.control_mode = 1
+                gate = MotionPauseGate()
+                controller = G2Controller(FakeGdk, robot, allow_motion=True, motion_gate=gate)
+                worker = SpaceMouseTakeoverWorker(
+                    controller,
+                    gate,
+                    device=None,
+                    config=TeleopConfig(side=side, axis_map=(1, 2, 3, 4, 5, 6)),
+                    clock=lambda: 1.0,
+                )
+
+                worker._activate(side, frame(1.0), 1.0, ())
+
+                self.assertEqual(robot.control_mode, 3)
+                self.assertEqual([configured_group for _, configured_group in robot.joint_impedance_calls], [group])
+                self.assertEqual(
+                    [item.kp for item in robot.joint_impedance_calls[0][0]],
+                    list(STANDARD_JOINT_IMPEDANCE_KP),
+                )
+                self.assertTrue(gate.is_paused())
+
     def test_worker_routes_left_hold_right_press_to_dianpi_without_takeover(self):
         robot = BilateralRobot()
         gate = MotionPauseGate()

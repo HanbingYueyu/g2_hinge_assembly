@@ -21,6 +21,7 @@ except ImportError:
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
+# Historical log/config provenance identifier; not a live control-mode check.
 CONTROLLER = "gdk_mode1_end_effector_pose_control"
 
 
@@ -48,7 +49,7 @@ def result_from_log(path: Path) -> dict:
         raise RuntimeError(f"{path} 必须且只能包含一个 result 记录，实际为 {len(records)}")
     result = records[0]
     if result.get("controller") != CONTROLLER or result.get("frame") != "arm_l_end_link":
-        raise RuntimeError(f"{path} 不是 GDK mode-1 arm_l_end_link 标定日志")
+        raise RuntimeError(f"{path} 不是历史 GDK 末端位姿 arm_l_end_link 标定日志")
     for key in ("actual_end_link_base_delta_m", "pixel_delta_post_minus_pre_px"):
         if key not in result:
             raise RuntimeError(f"{path} 缺少 {key}")

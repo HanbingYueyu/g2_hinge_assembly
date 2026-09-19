@@ -123,8 +123,8 @@ class TeleopSession:
     def _healthy(self):
         self.controller.checked_arm_state()
         status = self.controller.motion_status_summary()
-        if status['mode'] not in {0, 1} or status['control_mode'] != 1 or status['error_code'] != 0:
-            raise SafetyError(f'遥操作需要 mode=0/1、control_mode=1 且无故障: {status}')
+        if status['mode'] not in {0, 1} or status['control_mode'] != 3 or status['error_code'] != 0:
+            raise SafetyError(f'遥操作需要 mode=0/1、control_mode=3 且无故障: {status}')
 
     def _actual(self):
         return self.controller.read_end_effector_pose('arm_l_end_link' if self.side == 'left' else 'arm_r_end_link')
@@ -385,7 +385,7 @@ class PreviewController:
         return ()
 
     def motion_status_summary(self):
-        return {'mode': 1, 'control_mode': 1, 'error_code': 0}
+        return {'mode': 1, 'control_mode': 3, 'error_code': 0}
 
     def read_end_effector_pose(self, frame):
         return self.poses['left' if frame == 'arm_l_end_link' else 'right']

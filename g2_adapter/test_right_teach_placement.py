@@ -69,6 +69,12 @@ class RightPlacementTests(unittest.TestCase):
                 result = replay_right_placement(SimpleNamespace(robot=robot, gdk=FakeGdk(), gate=None), args)
         self.assertEqual(result["sent"], 3)
         self.assertEqual(robot.positions, [.2]*7 + [.1]*7)
+        self.assertEqual(robot.control_modes, [3])
+        self.assertEqual(robot.impedance_calls[0][1], 1)
+        self.assertEqual(
+            tuple(item.kp for item in robot.impedance_calls[0][0]),
+            (400, 400, 400, 500, 300, 200, 200),
+        )
 
 
 if __name__ == "__main__":

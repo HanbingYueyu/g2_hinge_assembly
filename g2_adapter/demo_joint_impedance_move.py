@@ -51,14 +51,13 @@ def move_joint_impedance(controller, args, *, clock=time.monotonic, sleep=time.s
     validate_args(args)
     target = target_for_args(controller, args)
     offset = 0 if args.side == 'left' else 7
-    group = 0 if args.side == 'left' else 1
     entered = False
     try:
         controller.set_control_mode(3)
         entered = True
-        controller.robot.set_joint_impedance([controller.gdk.Impedance(kp=v) for v in args.kp], group)
         controller.move_preset(args.side, target, velocity_rad_s=args.velocity_rad_s,
-                               life_time_s=30., detail='joint impedance demo')
+                               life_time_s=30., detail='joint impedance demo',
+                               joint_impedance_kp=args.kp)
         deadline = clock() + 30.
         stable = 0
         while True:
@@ -72,10 +71,10 @@ def move_joint_impedance(controller, args, *, clock=time.monotonic, sleep=time.s
     finally:
         if entered:
             actual = controller.checked_arm_state()[offset:offset+7]
-            # Replace the old destination before returning to position mode.
-            # A failed hold deliberately prevents the mode switch.
-            controller.robot.move_arm_joint_servo(list(actual), .01, group, False)
-            controller.set_control_mode(1)
+            # Replace the old destination before restoring standard stiffness.
+            # A failed hold deliberately prevents the stiffness increase.
+            controller.hold_joint_positions(args.side, actual)
+            controller.prepare_joint_impedance_control((args.side,))
 
 
 def main(argv=None):
@@ -98,7 +97,7 @@ def main(argv=None):
             return 0
         print('开始关节阻抗移动；请确认末端负载正确，且没有其他控制脚本同时运行。', flush=True)
         actual = move_joint_impedance(controller, args)
-        print(f'移动完成，已回到位控；实测角度(度)：{[round(math.degrees(v), 2) for v in actual]}', flush=True)
+        print(f'移动完成，已恢复标准关节刚度并保持模式 3；实测角度(度)：{[round(math.degrees(v), 2) for v in actual]}', flush=True)
         return 0
     except KeyboardInterrupt:
         print('已由操作者中断。', file=sys.stderr)

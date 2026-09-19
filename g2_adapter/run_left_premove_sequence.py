@@ -131,6 +131,7 @@ def main() -> int:
         if not args.allow_motion:
             print("只读预检完成：未发送运动或夹爪命令。")
             return 0
+        controller.prepare_joint_impedance_control(("left",))
         with log_path.open("a", encoding="utf-8") as log:
             write_log(log, {"event": "start", "utc": datetime.now(timezone.utc).isoformat(), "presets": [name for name, _ in presets]})
             if args.handoff:

@@ -658,7 +658,7 @@ def main() -> int:
         robot = gdk.Robot()
         time.sleep(1.0)
         controller = G2Controller(gdk, robot, allow_motion=True)
-        controller.set_control_mode(1)
+        controller.prepare_joint_impedance_control(("left",))
         current = controller.read_end_effector_pose(LEFT_END_LINK)
         if args.orientation_only:
             orientation_target = CartesianPoseTarget(
@@ -728,7 +728,7 @@ def main() -> int:
                 detail="head YOLO leftmost hinge grasp orientation",
             )
             wait_preset(controller, preset)
-            controller.set_control_mode(1)
+            controller.prepare_joint_impedance_control(("left",))
             current = controller.read_end_effector_pose(LEFT_END_LINK)
         target = gripper_end_target(hinge_base, current.orientation_xyzw, tcp_end_m, args.above_mm / 1000.0)
         travel_mm = float(np.linalg.norm(np.asarray(target.position_m)-np.asarray(current.position_m))*1000.0)

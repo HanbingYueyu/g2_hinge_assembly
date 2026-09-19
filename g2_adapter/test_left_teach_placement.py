@@ -51,6 +51,8 @@ class PlacementTests(unittest.TestCase):
         self.assertEqual(result["sent"], 3)
         self.assertEqual(robot.positions, [.1]*7 + [.2]*7)
         self.assertTrue(all(len(command[0]) == 7 for command in robot.servo_commands))
+        self.assertEqual(robot.control_modes, [3])
+        self.assertEqual(robot.impedance_calls[0][1], 0)
 
     def test_right_trajectory_is_rejected(self):
         from teach_trajectory import build_trajectory, trajectory_document
@@ -66,6 +68,8 @@ class PlacementTests(unittest.TestCase):
         class Robot:
             def set_control_mode(self, mode):
                 writes.append(("mode", mode))
+            def set_joint_impedance(self, impedances, group):
+                writes.append(("impedance", tuple(item.kp for item in impedances), group))
             def move_arm_joint_servo(self, *args):
                 writes.append(("servo", args))
         class Gate:
@@ -80,7 +84,11 @@ class PlacementTests(unittest.TestCase):
             def replay(self, trajectory, **kwargs):
                 if self.assert_side != "left" or kwargs["speed_scale"] != .5:
                     raise AssertionError("wrong replay settings")
-                self.robot.set_control_mode(1)
+                self.robot.set_control_mode(3)
+                self.robot.set_joint_impedance(
+                    [SimpleNamespace(kp=value) for value in (400, 400, 400, 500, 300, 200, 200)],
+                    0,
+                )
                 self.robot.move_arm_joint_servo([0]*7, .01, 0, False)
                 return 1
             def _wait_for_start(self, target):
@@ -93,7 +101,12 @@ class PlacementTests(unittest.TestCase):
             with patch("left_teach_placement.G2TrajectorySession", Session):
                 record = replay_left_placement(services, args)
         self.assertEqual(record["sent"], 1)
-        self.assertEqual([item[0] for item in writes], ["lock", "mode", "lock", "servo"])
+        self.assertEqual(
+            [item[0] for item in writes],
+            ["lock", "mode", "lock", "impedance", "lock", "servo"],
+        )
+        self.assertEqual(writes[1], ("mode", 3))
+        self.assertEqual(writes[3][1:], ((400, 400, 400, 500, 300, 200, 200), 0))
 
 
 if __name__ == "__main__":

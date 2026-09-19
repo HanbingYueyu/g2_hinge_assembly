@@ -16,6 +16,7 @@ from collections.abc import Callable, Sequence
 from pathlib import Path
 
 try:
+    from .control import G2Controller, STANDARD_JOINT_IMPEDANCE_KP
     from .safety import (
         ARM_JOINT_NAMES,
         LEFT_ARM_JOINT_NAMES,
@@ -32,6 +33,7 @@ try:
         trim_leading_stationary,
     )
 except ImportError:
+    from control import G2Controller, STANDARD_JOINT_IMPEDANCE_KP
     from safety import (
         ARM_JOINT_NAMES,
         LEFT_ARM_JOINT_NAMES,
@@ -63,6 +65,7 @@ class G2TrajectorySession:
         robot,
         side: str,
         *,
+        controller: G2Controller | None = None,
         sleep_fn: Callable[[float], None] = time.sleep,
         monotonic_ns_fn: Callable[[], int] = time.monotonic_ns,
         monotonic_fn: Callable[[], float] = time.monotonic,
@@ -73,6 +76,12 @@ class G2TrajectorySession:
         self.gdk = gdk
         self.robot = robot
         self.side = side
+        # All mode and impedance writes go through the single verified
+        # controller boundary.  Production callers pass the orchestrator's
+        # controller; a standalone caller gets one built over the same robot.
+        self.controller = (
+            controller if controller is not None else G2Controller(gdk, robot, allow_motion=True)
+        )
         self._sleep = sleep_fn
         self._monotonic_ns = monotonic_ns_fn
         self._monotonic = monotonic_fn
@@ -115,9 +124,8 @@ class G2TrajectorySession:
         period_ns = int(round(1_000_000_000 / rate_hz))
         duration_ns = None if duration_s is None else int(round(duration_s * 1_000_000_000))
         raw_samples: list[tuple[int, tuple[float, ...]]] = []
-        self.robot.set_control_mode(3)
+        self.controller.set_joint_impedance(self.side, values)
         try:
-            self.robot.set_joint_impedance([self.gdk.Impedance(kp=value) for value in values], self._impedance_group)
             self._plan_to_start(self._selected_state(), velocity_rad_s=0.05)
             started_ns = self._monotonic_ns()
             next_sample_ns = started_ns
@@ -136,7 +144,7 @@ class G2TrajectorySession:
         except KeyboardInterrupt:
             pass
         finally:
-            self.robot.set_control_mode(1)
+            self.controller.set_joint_impedance(self.side, STANDARD_JOINT_IMPEDANCE_KP)
         return build_trajectory(self.side, raw_samples)
 
     def _plan_to_start(self, target: Sequence[float], *, velocity_rad_s: float) -> None:
@@ -172,7 +180,8 @@ class G2TrajectorySession:
             raise ValueError("speed_scale must be positive and finite")
         if not math.isfinite(start_velocity_rad_s) or start_velocity_rad_s <= 0.0:
             raise ValueError("start_velocity_rad_s must be positive and finite")
-        self.robot.set_control_mode(1)
+        self.controller.prepare_joint_impedance_control((self.side,))
+        self.controller._require_joint_impedance_mode("teach trajectory replay start")
         initial = trajectory.samples[0].joint_positions_rad
         self._event_sink(f"正在移动到录制起点（{self.side} 臂）…")
         self._plan_to_start(initial, velocity_rad_s=start_velocity_rad_s)
@@ -186,6 +195,7 @@ class G2TrajectorySession:
             f"起点已到达；开始以 {REPLAY_RATE_HZ:.0f} Hz 慢放，预计 {replay_duration_s:.1f} 秒。"
         )
         deadline = self._monotonic()
+        last_health_check = deadline
         sent = 0
         next_progress_percent = 0
         for target in targets:
@@ -195,6 +205,10 @@ class G2TrajectorySession:
                 else stationary_other_arm + target.joint_positions_rad
             )
             validated = validate_arm_target(complete)
+            now = self._monotonic()
+            if now - last_health_check >= 0.1:
+                self.controller._require_joint_impedance_mode("teach trajectory replay")
+                last_health_check = now
             self.robot.move_arm_joint_servo(
                 list(validated[self._offset : self._offset + 7]),
                 REPLAY_CONTROL_PERIOD_S,
@@ -300,8 +314,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     gdk = None
     try:
         gdk, robot = _open_gdk()
+        controller = G2Controller(gdk, robot, allow_motion=True)
         if args.command == "teach":
-            session = G2TrajectorySession(gdk, robot, args.side)
+            session = G2TrajectorySession(gdk, robot, args.side, controller=controller)
             print("已进入示教准备：确认末端负载参数正确后可拖动手臂；按 Ctrl+C 结束记录。", flush=True)
             trajectory = session.record(duration_s=args.duration_s, rate_hz=args.rate_hz)
             raw_samples = len(trajectory.samples)
@@ -319,6 +334,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             gdk,
             robot,
             trajectory.side,
+            controller=controller,
             event_sink=lambda message: print(message, flush=True),
         )
         sent = session.replay(
