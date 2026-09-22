@@ -51,6 +51,7 @@ POSE_NAMES = (
     # Staged bilateral flow presets, named "<stage><arm><index>" and recorded
     # for one arm only.
     "LR1",
+    "LR2",
     "LL1",
     "LL2",
     "RR1",
@@ -62,6 +63,7 @@ POSE_NAMES = (
 # ``--side`` must agree with.
 POSE_SIDES = {
     "LR1": "right",
+    "LR2": "right",
     "RR1": "right",
     "RR2": "right",
     "LL1": "left",

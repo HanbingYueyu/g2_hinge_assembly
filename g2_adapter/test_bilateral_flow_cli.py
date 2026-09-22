@@ -6,7 +6,7 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import left_grasp_gdk
 import right_apriltag_grasp_gdk
@@ -18,7 +18,7 @@ from bilateral_stages import DEFAULT_PLAN, Stage, stage_names
 def write_poses(path: Path, *, complete: bool) -> Path:
     poses = {"workflow_home": {"side": "both", "joint_names": None, "joint_positions_rad": [0.0] * 14}}
     if complete:
-        for name, side in (("LR1", "right"), ("RR1", "right"), ("RR2", "right"), ("LL1", "left"), ("LL2", "left")):
+        for name, side in (("LR1", "right"), ("LR2", "right"), ("RR1", "right"), ("RR2", "right"), ("LL1", "left"), ("LL2", "left")):
             poses[name] = {"side": side, "joint_positions_rad": [0.0] * 7}
     path.write_text(json.dumps({"schema_version": 1, "poses": poses}), encoding="utf-8")
     return path
@@ -169,7 +169,7 @@ class DryRunTests(unittest.TestCase):
         self.assertEqual(code, 1)
         text = buffer.getvalue()
         self.assertIn("missing_presets", text)
-        for name in ("LR1", "RR1", "LL1", "LL2"):
+        for name in ("LR1", "LR2", "RR1", "LL1", "LL2"):
             self.assertIn(name, text)
 
     def test_complete_preset_file_passes_the_dry_run(self):
@@ -390,6 +390,9 @@ class DispatchTests(unittest.TestCase):
                 self.advances: list[str] = []
                 self.left_gripper_opens = 0
                 self.left_presets: list[tuple[str, ...]] = []
+                self.right_presets: list[str] = []
+                self.right_preset_loads: list[str] = []
+                self.sleep_calls: list[float] = []
 
             def emit(self, event, **fields):
                 self.events.append((event, fields))
@@ -413,6 +416,17 @@ class DispatchTests(unittest.TestCase):
             def move_left_presets(self, names, **_kwargs):
                 self.left_presets.append(tuple(names))
                 return [{"preset": name} for name in names]
+
+            def move_right_preset(self, name, **_kwargs):
+                self.right_presets.append(str(name))
+                return {"event": "right_preset_arrived", "preset": str(name)}
+
+            def load_right_preset(self, name):
+                self.right_preset_loads.append(str(name))
+                return [0.0] * 7
+
+            def sleep(self, seconds):
+                self.sleep_calls.append(float(seconds))
 
             def open_all_grippers(self, **_kwargs):
                 return {"event": "all_grippers_opened"}
@@ -458,6 +472,49 @@ class DispatchTests(unittest.TestCase):
         self.assertEqual(len(warnings), 1)
         self.assertTrue(warnings[0]["read_only"])
         self.assertEqual(warnings[0]["action"], "continue_release")
+
+    def test_right_lr2_cycle_closes_holds_one_second_then_opens(self):
+        context, runtime = self.make_context()
+        context.services.put("right_config", {
+            "gripper": {"closed_rad": 0.0, "open_rad": -0.785, "close_settle_s": 0.8},
+        })
+        context.services.controller = Mock()
+        stream = Mock()
+        context.services.controller.start_right_end_effector_position_stream = lambda *a, **k: stream
+        target_pose = object()
+        with patch("right_hole_motion.right_preset_end_pose", return_value=target_pose) as pose, \
+             patch("right_hole_motion.move_right_via_vertical_clearance", return_value={
+            "event": "right_lr2_clearance_round_trip", "clearance_mm": 50.0,
+        }) as clearance, \
+             patch("right_apriltag_grasp_gdk.close_right_gripper_on_pose_stream", return_value={
+                 "target_rad": 0.0,
+                 "actual_position_rad": -0.16667076388888893,
+                 "close_state": "blocked_before_target",
+             }) as close, \
+             patch("right_apriltag_grasp_gdk.move_right_gripper_on_pose_stream", return_value={
+                 "target_rad": -0.785,
+             }) as open:
+            result = flow.stage_right_to_lr2_and_gripper_cycle(context)
+
+        self.assertEqual(runtime.right_presets, [])
+        self.assertEqual(runtime.right_preset_loads, ["LR2"])
+        pose.assert_called_once_with(context.services.controller, [0.0] * 7)
+        clearance.assert_called_once_with(
+            context.services.controller,
+            target_pose=target_pose,
+            clearance_mm=50.0,
+            speed_mm_s=context.args.auto_speed_mm_s,
+        )
+        close.assert_called_once_with(
+            context.services.controller, stream, 0.0, settle_s=0.8,
+        )
+        open.assert_called_once_with(
+            context.services.controller, stream, -0.785,
+            tolerance_rad=0.05, timeout_s=3.0,
+        )
+        self.assertEqual(runtime.sleep_calls, [1.0])
+        self.assertEqual(result["preset"], "LR2")
+        self.assertEqual(result["gripper_cycle"], "closed_held_opened")
 
     def test_finish_does_not_check_after_right_return(self):
         context, runtime = self.make_context()
@@ -560,13 +617,13 @@ class DispatchTests(unittest.TestCase):
             code = flow._drive(context, flow.parse_args([]))
         self.assertEqual(code, 0)
         self.assertEqual(handled, [s.stage.value for s in DEFAULT_PLAN if not s.waits_for_advance])
-        self.assertEqual(runtime.advances, ["gate_left", "gate_right"])
+        self.assertEqual(runtime.advances, ["gate_left", "gate_right_pre_grasp", "gate_right"])
         completed = [fields["stage"] for event, fields in runtime.events if event == "stage_complete"]
         self.assertEqual(completed, [s.stage.value for s in DEFAULT_PLAN])
         self.assertIn("bilateral_flow_complete", [event for event, _ in runtime.events])
 
     def test_the_gate_sequence_is_identical_with_or_without_a_hole(self):
-        # A missing hole only removes the hole move; both SpaceMouse gates and
+        # A missing hole only removes the hole move; all SpaceMouse gates and
         # everything else stay exactly the same.
         for hole_detected in (True, False):
             with self.subTest(hole_detected=hole_detected):
@@ -583,7 +640,7 @@ class DispatchTests(unittest.TestCase):
                 with patch.dict(flow.STAGE_HANDLERS, table, clear=True):
                     code = flow._drive(context, flow.parse_args([]))
                 self.assertEqual(code, 0)
-                self.assertEqual(runtime.advances, ["gate_left", "gate_right"])
+                self.assertEqual(runtime.advances, ["gate_left", "gate_right_pre_grasp", "gate_right"])
                 self.assertNotIn("gate_skipped", [event for event, _ in runtime.events])
                 # Gate 1 only confirms; the immediately following stage owns release.
                 self.assertEqual(runtime.left_gripper_opens, 0)

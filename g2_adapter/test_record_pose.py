@@ -19,7 +19,7 @@ class RecordPoseTests(unittest.TestCase):
         self.assertTrue(args.both_arms)
 
     def test_staged_flow_pose_names_accept_an_explicit_side(self):
-        for name, side in (("LR1", "right"), ("RR1", "right"), ("RR2", "right"), ("LL1", "left"), ("LL2", "left")):
+        for name, side in (("LR1", "right"), ("LR2", "right"), ("RR1", "right"), ("RR2", "right"), ("LL1", "left"), ("LL2", "left")):
             with self.subTest(name=name):
                 with patch.object(sys, "argv", ["record_pose.py", "--name", name, "--side", side]):
                     args = record_pose.parse_args()
@@ -30,6 +30,7 @@ class RecordPoseTests(unittest.TestCase):
         self.assertEqual(record_pose.pose_side("LL1"), "left")
         self.assertEqual(record_pose.pose_side("LL2"), "left")
         self.assertEqual(record_pose.pose_side("LR1"), "right")
+        self.assertEqual(record_pose.pose_side("LR2"), "right")
         self.assertEqual(record_pose.pose_side("RR1"), "right")
         self.assertEqual(record_pose.pose_side("RR2"), "right")
         self.assertEqual(record_pose.pose_side("left_p3"), "left")

@@ -68,13 +68,20 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--rate-hz", type=float, default=100.0)
     parser.add_argument("--position-tolerance-mm", type=float, default=1.0)
     parser.add_argument("--orientation-tolerance-deg", type=float, default=1.0)
-    parser.add_argument("--jitter-position-mm", type=float, default=0.2)
-    parser.add_argument("--jitter-orientation-deg", type=float, default=0.2)
+    parser.add_argument("--jitter-position-mm", type=float, default=2.0,
+                        help="中值平滑允许修正的局部位置抖动，默认 2 mm")
+    parser.add_argument("--jitter-orientation-deg", type=float, default=1.0,
+                        help="中值平滑允许修正的局部姿态抖动，默认 1 deg")
+    parser.add_argument("--outlier-position-mm", type=float, default=8.0,
+                        help="孤立大位移尖峰的修复阈值，默认 8 mm")
+    parser.add_argument("--outlier-orientation-deg", type=float, default=5.0,
+                        help="孤立大姿态尖峰的修复阈值，默认 5 deg")
     parser.add_argument("--pause-position-mm", type=float, default=0.01,
                         help="小于此位移的采样间隔视为停顿并压缩")
     parser.add_argument("--pause-orientation-deg", type=float, default=0.01,
                         help="小于此旋转的采样间隔视为停顿并压缩")
-    parser.add_argument("--median-window", type=int, default=5)
+    parser.add_argument("--median-window", type=int, default=7,
+                        help="中值平滑窗口，必须为奇数，默认 7")
     parser.add_argument("--max-velocity-rad-s", type=float, default=1.0)
     parser.add_argument("--max-acceleration-rad-s2", type=float, default=15.0)
     return parser
@@ -96,6 +103,8 @@ def main(argv=None) -> int:
             median_window=args.median_window,
             pause_position_m=args.pause_position_mm/1000.0,
             pause_orientation_rad=math.radians(args.pause_orientation_deg),
+            outlier_position_m=args.outlier_position_mm/1000.0,
+            outlier_orientation_rad=math.radians(args.outlier_orientation_deg),
         )
         resampled = resample_cartesian_trajectory(optimized, rate_hz=args.rate_hz)
         limits = ARM_POSITION_LIMITS[:7] if raw.side == "left" else ARM_POSITION_LIMITS[7:]
@@ -118,7 +127,8 @@ def main(argv=None) -> int:
             f"末端轨迹优化：{optimization['original_samples']} 点 → "
             f"{optimization['keyframes']} 个关键点；"
             f"{optimization['original_duration_s']:.2f}s → "
-            f"{optimization['optimized_duration_s']:.2f}s。",
+            f"{optimization['optimized_duration_s']:.2f}s；"
+            f"修复孤立尖峰 {optimization['isolated_outliers_repaired']} 个。",
             flush=True,
         )
         print(f"整轨 IK：{len(solved.points)} 点；replay_ready={report.replay_ready}")

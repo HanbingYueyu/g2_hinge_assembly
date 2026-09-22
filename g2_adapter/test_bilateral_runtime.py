@@ -208,6 +208,7 @@ def write_poses(path: Path) -> Path:
             "LL1": {"side": "left", "joint_positions_rad": [0.1] * 7},
             "LL2": {"side": "left", "joint_positions_rad": [0.2] * 7},
             "LR1": {"side": "right", "joint_positions_rad": [0.3] * 7},
+            "LR2": {"side": "right", "joint_positions_rad": [0.35] * 7},
             "RR1": {"side": "right", "joint_positions_rad": [0.4] * 7},
             "RR2": {"side": "right", "joint_positions_rad": [0.5] * 7},
         },
@@ -334,6 +335,9 @@ class PresetTests(RuntimeFixture):
         self.assertEqual(record["event"], "RR1_arrived")
         self.assertEqual(mocked.call_args[0][1], [0.4] * 7)
         self.assertEqual(mocked.call_args[1]["preset_name"], "RR1")
+
+    def test_load_right_preset_uses_the_recorded_right_arm_values(self):
+        self.assertEqual(self.runtime.load_right_preset("LR2"), [0.35] * 7)
 
     def test_load_preset_rejects_a_name_outside_the_staged_flow(self):
         with self.assertRaises(ValueError):

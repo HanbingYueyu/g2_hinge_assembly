@@ -345,10 +345,11 @@ scripts/run_gdk_python.sh g2_adapter/record_pose.py --name right_pr2 --save
 
 `run_bilateral_flow_gdk.py` 把左右手整条流程收进**一个进程**：一次 `gdk_init`，一个 `G2Controller`、一个 `MotionPauseGate`、一个 SpaceMouse worker、三路相机，并在启动时预加载头部 YOLO（2 类 hinge+hole）、左手 D405 YOLO 与右手 AprilTag 检测器常驻；**不加载 SAM3**（日志会打印 `"sam3": "not_loaded"`）。
 
-- 阶段计划与两道 SpaceMouse 门定义在 `bilateral_stages.py`（`--list-stages` 可打印，`--dry-run` 只读校验 5 个预设与 `workflow_home`）。
+- 阶段计划与三道 SpaceMouse 门定义在 `bilateral_stages.py`（`--list-stages` 可打印，`--dry-run` 只读校验 5 个流程预设与 `workflow_home`）。
+- 左手放件并离开后，右臂先到 `LR2` 上方 50 mm，再下降到 `LR2`，闭合右夹爪保持 1 秒再张开；`gate_right_pre_grasp` 等待 SpaceMouse 右键长按 2 秒或键盘 Enter，确认后才进入右手电批抓取。键盘空格触发一次电批周期。
 - 单进程运行时与门控在 `bilateral_runtime.py`；跨阶段注入契约在 `bilateral_services.py`；三相机网页在 `bilateral_web.py`。
 - 两个既有 demo 仍是独立可用的 CLI：`main()` 为薄壳，实体在 `run_left_cycle(services=...)` / `run_right_grasp_stage(services=...)`，由主程序注入已建好的 GDK/控制器/worker/相机/模型。
-- 新增参数：左手 `--skip-workflow-home`、`--move-above-hole`、`--hole-*`；右手 `--stop-after-transport`、`--premove-pose`、`--post-grasp-pose`；`record_pose.py` 新增 `--side` 与 `LR1/LL1/LL2/RR1/RR2`。
+- 新增参数：左手 `--skip-workflow-home`、`--move-above-hole`、`--hole-*`；右手 `--stop-after-transport`、`--premove-pose`、`--post-grasp-pose`；`record_pose.py` 新增 `--side` 与 `LR1/LR2/LL1/LL2/RR1/RR2`。
 - 网页 `http://<ip>:<web-port>` 一页显示三路相机：第一行头部 RGB，第二行左手 D405 与右手 AprilTag 并排；三路常显（阶段叠加图优先，其余时间显示该相机原画面），无隐藏开关。SpaceMouse 全程可接管，右键长按 2 秒为"下一阶段"。
 
 完整命令与录制步骤见仓库根目录 `常用命令.md` 的「分阶段双臂流程（单进程，推荐）」。

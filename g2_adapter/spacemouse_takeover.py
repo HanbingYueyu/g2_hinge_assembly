@@ -401,6 +401,7 @@ class SpaceMouseTakeoverWorker:
         self._session = None
         self._advance_requested = False
         self._keyboard_advance = threading.Event()
+        self._keyboard_dianpi = threading.Event()
         self._failed: BaseException | None = None
         self._connected = False
         self._last_disconnect: str | None = None
@@ -418,6 +419,10 @@ class SpaceMouseTakeoverWorker:
         if self.allow_advance_right:
             self._keyboard_advance.set()
 
+    def request_keyboard_dianpi(self) -> None:
+        """Queue one electric-screwdriver cycle from the keyboard Space key."""
+        self._keyboard_dianpi.set()
+
     def _process_keyboard_advance(self) -> bool:
         if not self._keyboard_advance.is_set():
             return False
@@ -429,6 +434,49 @@ class SpaceMouseTakeoverWorker:
         self.gate.request_advance()
         self._advance_requested = True
         return True
+
+    def _process_keyboard_dianpi(self) -> bool:
+        if not self._keyboard_dianpi.is_set():
+            return False
+        self._keyboard_dianpi.clear()
+        self._trigger_dianpi()
+        return True
+
+    def _trigger_dianpi(self) -> None:
+        if self.dianpi_runner is None:
+            self._emit_dianpi({
+                "event": "dianpi_trigger_result",
+                "result": "ignored",
+                "action": "no_dianpi_runner",
+            })
+            return
+        try:
+            outcome = self.dianpi_runner.trigger()
+            self._last_dianpi_result = outcome
+            self._dianpi_error = None
+            value = getattr(outcome, "value", None) or str(outcome)
+            self._emit_dianpi({
+                "event": "dianpi_trigger_result",
+                "result": value,
+                "action": (
+                    "cycle_started"
+                    if value == "started"
+                    else "ignored_previous_cycle_still_running"
+                    if value == "busy"
+                    else "hardware_error"
+                ),
+            })
+        except BaseException as exc:
+            # The supplied runner is expected to swallow hardware failures;
+            # keep this boundary defensive so a logging or test runner can
+            # never abort G2 motion.
+            self._dianpi_error = exc
+            self._emit_dianpi({
+                "event": "dianpi_trigger_result",
+                "result": "raised",
+                "action": "hardware_error",
+                "error": str(exc),
+            })
 
     def consume_advance(self) -> None:
         """Consume one pending advance request and let automatic motion resume."""
@@ -540,43 +588,15 @@ class SpaceMouseTakeoverWorker:
 
     def step(self, frame: InputFrame, now: float) -> GestureResult:
         result = self.gestures.update(frame, now)
+        if self._process_keyboard_dianpi():
+            if self._session is not None:
+                with self.controller.manual_motion():
+                    self._session.tick(self._neutral_frame(now), now)
+            return result
         if self._process_keyboard_advance():
             return result
         if TakeoverEvent.START_DIANPI in result.events:
-            if self.dianpi_runner is None:
-                self._emit_dianpi({
-                    "event": "dianpi_trigger_result",
-                    "result": "ignored",
-                    "action": "no_dianpi_runner",
-                })
-            else:
-                try:
-                    outcome = self.dianpi_runner.trigger()
-                    self._last_dianpi_result = outcome
-                    self._dianpi_error = None
-                    value = getattr(outcome, "value", None) or str(outcome)
-                    self._emit_dianpi({
-                        "event": "dianpi_trigger_result",
-                        "result": value,
-                        "action": (
-                            "cycle_started"
-                            if value == "started"
-                            else "ignored_previous_cycle_still_running"
-                            if value == "busy"
-                            else "hardware_error"
-                        ),
-                    })
-                except BaseException as exc:
-                    # The supplied runner is expected to swallow hardware
-                    # failures; keep this boundary defensive so a logging or
-                    # test runner can never abort G2 motion.
-                    self._dianpi_error = exc
-                    self._emit_dianpi({
-                        "event": "dianpi_trigger_result",
-                        "result": "raised",
-                        "action": "hardware_error",
-                        "error": str(exc),
-                    })
+            self._trigger_dianpi()
             if self._session is not None:
                 # The chord owns both buttons and must not feed stale axes or
                 # click state into TeleopSession.  A neutral tick bases the
@@ -631,6 +651,7 @@ class SpaceMouseTakeoverWorker:
                 except ImportError:
                     from spacemouse_input import InputError
             while not self._stop.is_set():
+                self._process_keyboard_dianpi()
                 self._process_keyboard_advance()
                 try:
                     with hid_factory(self.device) as source:

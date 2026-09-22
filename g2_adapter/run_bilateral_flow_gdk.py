@@ -6,7 +6,7 @@ One process owns exactly one GDK session, one ``G2Controller``, one
 models (head hinge+hole YOLO, left D405 YOLO, right AprilTag detector).  SAM3 is
 never imported or loaded here.
 
-The stage order and the two SpaceMouse "next stage" gates live in
+The stage order and the three SpaceMouse "next stage" gates live in
 ``bilateral_stages.DEFAULT_PLAN``; ``--list-stages`` prints them and ``--dry-run``
 validates every recorded preset without touching the robot.
 """
@@ -730,6 +730,85 @@ def stage_right_to_lr1(ctx: FlowContext) -> dict:
     return {"preset": record["preset"]}
 
 
+def stage_right_to_lr2_and_gripper_cycle(ctx: FlowContext) -> dict:
+    """Approach LR2 from 50 mm above, exercise the gripper, then leave it open.
+
+    This is intentionally a separate operator stage before the AprilTag
+    screwdriver grasp.  The one-second hold is a real pause after feedback
+    confirms the close command has taken effect; it is not folded into the next gate, so a
+    gate takeover cannot interrupt the close/open cycle halfway through.
+    """
+    try:
+        from .right_apriltag_grasp_gdk import (
+            require_mapping,
+            close_right_gripper_on_pose_stream,
+            move_right_gripper_on_pose_stream,
+        )
+        from .right_hole_motion import move_right_via_vertical_clearance, right_preset_end_pose
+    except ImportError:
+        from right_apriltag_grasp_gdk import (
+            require_mapping,
+            close_right_gripper_on_pose_stream,
+            move_right_gripper_on_pose_stream,
+        )
+        from right_hole_motion import move_right_via_vertical_clearance, right_preset_end_pose
+    config = ctx.services.get("right_config")
+    if config is None:
+        config = require_mapping(
+            json.loads(Path(ctx.args.right_config).expanduser().read_text(encoding="utf-8")), "config",
+        )
+    gripper = require_mapping(config.get("gripper"), "gripper")
+    target_joints = ctx.runtime.load_right_preset("LR2")
+    target_pose = right_preset_end_pose(ctx.services.controller, target_joints)
+    clearance = move_right_via_vertical_clearance(
+        ctx.services.controller,
+        target_pose=target_pose,
+        clearance_mm=50.0,
+        speed_mm_s=ctx.args.auto_speed_mm_s,
+    )
+    ctx.runtime.emit_event(clearance)
+    close_target = float(gripper.get("closed_rad", 0.0))
+    open_target = float(gripper.get("open_rad", -0.785))
+    # Closing against a workpiece is expected to stop before the empty-tool
+    # target.  Use the dedicated close helper, which accepts a mechanically
+    # blocked jaw after confirming that it moved toward the target, instead of
+    # requiring the feedback to equal ``closed_rad`` exactly.
+    current = ctx.services.controller.read_end_effector_pose("arm_r_end_link")
+    stream = ctx.services.controller.start_right_end_effector_position_stream(
+        current,
+        rate_hz=50.0,
+        life_time_s=0.10,
+        max_translation_velocity_mps=ctx.args.auto_speed_mm_s / 1000.0,
+    )
+    try:
+        close_record = close_right_gripper_on_pose_stream(
+            ctx.services.controller,
+            stream,
+            close_target,
+            settle_s=float(gripper.get("close_settle_s", 0.8)),
+        )
+        ctx.runtime.sleep(1.0)
+        open_record = move_right_gripper_on_pose_stream(
+            ctx.services.controller,
+            stream,
+            open_target,
+            tolerance_rad=float(gripper.get("open_tolerance_rad", 0.05)),
+            timeout_s=float(gripper.get("open_timeout_s", 3.0)),
+        )
+    finally:
+        stream.stop()
+    cycle = ctx.runtime.emit_event({
+        "event": "right_lr2_gripper_cycle",
+        "preset": "LR2",
+        "hold_s": 1.0,
+        "close_target_rad": close_target,
+        "open_target_rad": open_target,
+        "close": close_record,
+        "open": open_record,
+    })
+    return {"preset": "LR2", "gripper_cycle": "closed_held_opened", "cycle_event": cycle["event"]}
+
+
 def _vlm_client(ctx: FlowContext):
     if not vlm_enabled(ctx.args):
         return None
@@ -845,7 +924,7 @@ def stage_right_grasp(ctx: FlowContext) -> dict:
         raise SafetyError(f"右手抓取阶段返回 {code}")
     fixture_vlm = _one_shot_right_fixture_check(ctx, phase="right_grasp")
     if ctx.services.get("right_saved_grasp_pose") is None:
-        raise SafetyError("右手抓取阶段没有保存抓取位姿；无法在门2后回位")
+        raise SafetyError("右手抓取阶段没有保存抓取位姿；无法在门3后回位")
     workpiece = ctx.services.get("right_saved_workpiece_pose")
     if workpiece is None:
         raise SafetyError("右手抓取阶段没有保存电批工件位姿；无法定位批头轴线")
@@ -944,6 +1023,7 @@ STAGE_HANDLERS = {
     Stage.LEFT_TO_LL1_AND_SEAT: stage_left_to_ll1_and_seat,
     Stage.LEFT_RELEASE_LIFT_TO_LL2: stage_left_release_lift_to_ll2,
     Stage.VLM_ASSEMBLY_CHECK: stage_vlm_assembly_check,
+    Stage.RIGHT_TO_LR2_AND_GRIPPER_CYCLE: stage_right_to_lr2_and_gripper_cycle,
     Stage.RIGHT_GRASP: stage_right_grasp,
     Stage.RIGHT_RETURN: stage_right_return,
     Stage.FINISH: stage_finish,

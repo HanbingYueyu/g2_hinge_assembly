@@ -1028,6 +1028,52 @@ def close_right_gripper_on_pose_stream(
     }
 
 
+def move_right_gripper_on_pose_stream(
+    controller: G2Controller,
+    stream,
+    target_rad: float,
+    *,
+    tolerance_rad: float = 0.04,
+    timeout_s: float = 6.0,
+) -> dict:
+    """Move the right Omnipicker through an already-running pose stream.
+
+    A standalone ``right_tool`` command can be ignored immediately after a
+    Cartesian pose stream.  Use the same ``EndEffectorPose`` lease for the
+    LR2 cycle's opening command as for its closing command.
+    """
+    if not 0.0 < tolerance_rad <= 0.20 or not 0.1 <= timeout_s <= 15.0:
+        raise ValueError("right gripper stream feedback limits are invalid")
+    before = controller.read_gripper_position("right")
+    if before is None:
+        raise RuntimeError("右夹爪张开前没有有效位置反馈；停止并判定操作失败")
+    stream.set_right_gripper_target(target_rad)
+    deadline = time.monotonic() + float(timeout_s)
+    latest = before
+    samples = 0
+    while True:
+        stream.raise_if_failed()
+        latest = controller.read_gripper_position("right")
+        samples += 1
+        if latest is not None and abs(latest - target_rad) <= tolerance_rad:
+            return {
+                "target_rad": float(target_rad),
+                "before_position_rad": before,
+                "actual_position_rad": latest,
+                "tolerance_rad": float(tolerance_rad),
+                "timeout_s": float(timeout_s),
+                "command_path": "right_end_effector_pose_stream",
+                "feedback_samples": samples,
+            }
+        remaining = deadline - time.monotonic()
+        if remaining <= 0.0:
+            raise RuntimeError(
+                f"右夹爪未在 {timeout_s:.1f} s 内通过位姿流到达目标；"
+                f"target={target_rad:.4f} rad, actual={latest}；停止后续机械臂动作"
+            )
+        time.sleep(min(0.10, remaining))
+
+
 def bounded_pose_waypoints(
     start: CartesianPoseTarget,
     target: CartesianPoseTarget,

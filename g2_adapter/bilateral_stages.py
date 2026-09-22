@@ -15,10 +15,11 @@ Step mapping (operator spec):
 4. right arm to ``LR1``
 5. left arm to ``LL1`` -> force-guarded descent -> SpaceMouse gate 1 -> release
    -> lift 100 mm -> ``LL2``
-6. right arm to ``RR1`` -> AprilTag grasp of the electric screwdriver
-7. lift 100 mm -> fixed downward orientation above detected ``hole``
-8. SpaceMouse gate 2 -> right arm returns to the saved grasp pose
-9. open all grippers -> both arms to ``workflow_home``
+6. after the left arm leaves, right arm clears 50 mm above ``LR2`` -> descends to ``LR2`` -> close for 1 s -> open -> SpaceMouse gate
+7. right arm to ``RR1`` -> AprilTag grasp of the electric screwdriver
+8. lift 100 mm -> fixed downward orientation above detected ``hole``
+9. SpaceMouse gate 2 -> right arm returns to the saved grasp pose
+10. open all grippers -> both arms to ``workflow_home``
 """
 
 from __future__ import annotations
@@ -37,6 +38,8 @@ class Stage(str, Enum):
     LEFT_TO_LL1_AND_SEAT = "left_to_ll1_and_seat"
     LEFT_RELEASE_LIFT_TO_LL2 = "left_release_lift_to_ll2"
     VLM_ASSEMBLY_CHECK = "vlm_assembly_check"
+    RIGHT_TO_LR2_AND_GRIPPER_CYCLE = "right_to_lr2_and_gripper_cycle"
+    GATE_RIGHT_PRE_GRASP = "gate_right_pre_grasp"
     RIGHT_GRASP = "right_grasp"
     GATE_RIGHT = "gate_right"
     RIGHT_RETURN = "right_return"
@@ -63,12 +66,14 @@ DEFAULT_PLAN: tuple[StageSpec, ...] = (
     StageSpec(Stage.GATE_LEFT, "等待 SpaceMouse 下一阶段指令（门1）", "5", waits_for_advance=True),
     StageSpec(Stage.LEFT_RELEASE_LIFT_TO_LL2, "张开左爪、上抬 100 mm 并移动到 LL2", "5"),
     StageSpec(Stage.VLM_ASSEMBLY_CHECK, "VLM 只读检查凸轴 B 与明显 C 孔外漏", "5"),
+    StageSpec(Stage.RIGHT_TO_LR2_AND_GRIPPER_CYCLE, "右臂先到 LR2 上方 50 mm 再下降到 LR2、闭合夹爪保持 1 秒后张开", "6"),
+    StageSpec(Stage.GATE_RIGHT_PRE_GRASP, "等待 SpaceMouse 下一阶段指令（门2，右手抓取电批前）", "6", waits_for_advance=True),
     StageSpec(
         Stage.RIGHT_GRASP,
         "右臂移动到 RR1、AprilTag 抓取电批、上抬 100 mm 并移动到 hole XYZ 偏移位置",
         "6-7", camera_pane="right",
     ),
-    StageSpec(Stage.GATE_RIGHT, "等待 SpaceMouse 下一阶段指令（门2）", "8", waits_for_advance=True),
+    StageSpec(Stage.GATE_RIGHT, "等待 SpaceMouse 下一阶段指令（门3）", "8", waits_for_advance=True),
     # The return stage takes a fresh right-camera VLM snapshot before moving
     # back, so the raw feed must remain live instead of being paused by the
     # stage scheduler.

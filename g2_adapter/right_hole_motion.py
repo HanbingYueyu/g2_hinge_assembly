@@ -3,17 +3,28 @@
 from __future__ import annotations
 
 import math
+from pathlib import Path
 
 import numpy as np
 
 try:
     from .arm_orientation import fixed_forward_down_orientation
+    from .cartesian_teach import matrix_to_quaternion
     from .control import CartesianPoseTarget, quaternion_angle_deg
+    from .g2_kinematics import UrdfKinematics
     from .right_post_grasp_sequence import lift_after_grasp
+    from .safety import RIGHT_ARM_JOINT_NAMES
 except ImportError:
     from arm_orientation import fixed_forward_down_orientation
+    from cartesian_teach import matrix_to_quaternion
     from control import CartesianPoseTarget, quaternion_angle_deg
+    from g2_kinematics import UrdfKinematics
     from right_post_grasp_sequence import lift_after_grasp
+    from safety import RIGHT_ARM_JOINT_NAMES
+
+
+BODY_JOINT_NAMES = tuple(f"idx0{i}_body_joint{i}" for i in range(1, 6))
+DEFAULT_URDF = Path(__file__).resolve().parents[1] / "robot_description/G2_t2v2_crsB_omnipicker.urdf"
 
 
 def _rotation_from_quaternion(quaternion_xyzw) -> np.ndarray:
@@ -94,6 +105,109 @@ def lift_right_before_return(controller, *, speed_mm_s: float, distance_mm: floa
     finally:
         stream.stop()
     return {"event": "right_return_lift_complete", "distance_mm": float(distance_mm)}
+
+
+def right_preset_end_pose(
+    controller,
+    target_joints,
+    *,
+    urdf_path: str | Path = DEFAULT_URDF,
+) -> CartesianPoseTarget:
+    """Compute the Cartesian end-link pose represented by a right preset.
+
+    The target preset must not be sent as a first motion command: LR2 can be
+    below the safe approach height.  Its pose is therefore calculated offline
+    from the current body joints and the recorded right-arm joints, then used
+    as the target of a Cartesian clearance approach.
+    """
+    target = tuple(float(value) for value in target_joints)
+    if len(target) != len(RIGHT_ARM_JOINT_NAMES) or not all(math.isfinite(value) for value in target):
+        raise ValueError("right preset must contain seven finite joint positions")
+    states = controller.robot.get_joint_states().get("states", ())
+    joint_map: dict[str, float] = {}
+    for item in states:
+        if not isinstance(item, dict) or not item.get("name"):
+            continue
+        try:
+            value = float(item.get("motor_position"))
+        except (TypeError, ValueError):
+            continue
+        if math.isfinite(value):
+            joint_map[str(item["name"])] = value
+    required = (*BODY_JOINT_NAMES, *RIGHT_ARM_JOINT_NAMES)
+    missing = [name for name in required if name not in joint_map]
+    if missing:
+        raise RuntimeError(f"GDK joint state is missing for LR2 pose calculation: {missing}")
+    joint_map.update(zip(RIGHT_ARM_JOINT_NAMES, target))
+    matrix = UrdfKinematics(urdf_path).forward("base_link", "arm_r_end_link", joint_map)
+    return CartesianPoseTarget(
+        tuple(float(value) for value in matrix[:3, 3]),
+        matrix_to_quaternion(matrix[:3, :3]),
+    )
+
+
+def move_right_via_vertical_clearance(
+    controller, *, target_pose: CartesianPoseTarget, clearance_mm: float, speed_mm_s: float,
+) -> dict:
+    """Move up from the current right-arm pose, then return vertically.
+
+    ``target_pose`` is the Cartesian pose represented by the recorded LR2
+    joints.  The arm starts from its current pose and enters a low LR2 point
+    only after clearing the surrounding appliance by the requested amount.
+    """
+    if not math.isfinite(clearance_mm) or not 0.0 < clearance_mm <= 200.0:
+        raise ValueError("clearance_mm must be in (0, 200]")
+    if not math.isfinite(speed_mm_s) or not 0.0 < speed_mm_s <= 50.0:
+        raise ValueError("speed_mm_s must be in (0, 50]")
+    current = controller.read_end_effector_pose("arm_r_end_link")
+    if not isinstance(target_pose, CartesianPoseTarget):
+        raise TypeError("target_pose must be a CartesianPoseTarget")
+    upper = CartesianPoseTarget(
+        (target_pose.position_m[0], target_pose.position_m[1], target_pose.position_m[2] + clearance_mm / 1000.0),
+        target_pose.orientation_xyzw,
+    )
+    stream = controller.start_right_end_effector_position_stream(
+        current,
+        rate_hz=50.0,
+        life_time_s=0.10,
+        max_translation_velocity_mps=speed_mm_s / 1000.0,
+        allow_orientation_change=True,
+        max_angular_velocity_rad_s=math.radians(20.0),
+    )
+    distance_m = float(np.linalg.norm(np.asarray(upper.position_m) - np.asarray(current.position_m)))
+    timeout_s = distance_m / (speed_mm_s / 1000.0) + quaternion_angle_deg(
+        current.orientation_xyzw, upper.orientation_xyzw,
+    ) / 20.0 + 5.0
+    try:
+        stream.update_target(upper)
+        actual_upper = stream.wait_until_actual_target(
+            upper,
+            timeout_s,
+            position_tolerance_m=0.005,
+            orientation_tolerance_deg=0.5,
+            stable_samples=3,
+        )
+        if actual_upper is None:
+            raise RuntimeError(f"右臂上方安全点未在限定时间内到位；clearance={clearance_mm:g} mm")
+        stream.update_target(target_pose)
+        actual_origin = stream.wait_until_actual_target(
+            target_pose,
+            timeout_s,
+            position_tolerance_m=0.005,
+            orientation_tolerance_deg=0.5,
+            stable_samples=3,
+        )
+        if actual_origin is None:
+            raise RuntimeError("右臂从上方安全点下降回 LR2 原位未在限定时间内到位")
+    finally:
+        stream.stop()
+    return {
+        "event": "right_lr2_clearance_round_trip",
+        "clearance_mm": float(clearance_mm),
+        "speed_mm_s": float(speed_mm_s),
+        "upper_target_base_link": list(upper.position_m),
+        "return_target_base_link": list(target_pose.position_m),
+    }
 
 
 def move_right_tool_above_hole(

@@ -372,6 +372,27 @@ class WorkerTests(unittest.TestCase):
         self.assertEqual(runner.calls, 1)
         self.assertIsNone(worker.active_side)
 
+    def test_keyboard_space_routes_to_dianpi_without_stage_advance(self):
+        robot = BilateralRobot()
+        gate = MotionPauseGate()
+        controller = G2Controller(FakeGdk, robot, allow_motion=True, motion_gate=gate)
+        runner = FakeDianpiRunner()
+        worker = SpaceMouseTakeoverWorker(
+            controller,
+            gate,
+            device=None,
+            config=TeleopConfig(side="left", axis_map=(1, 2, 3, 4, 5, 6)),
+            allow_advance_right=True,
+            dianpi_runner=runner,
+        )
+
+        worker.request_keyboard_dianpi()
+        result = worker.step(frame(1.00), 1.00)
+
+        self.assertEqual(result.events, ())
+        self.assertEqual(runner.calls, 1)
+        self.assertFalse(worker.advance_requested)
+
     def test_busy_dianpi_trigger_does_not_fail_worker(self):
         robot = BilateralRobot()
         gate = MotionPauseGate()

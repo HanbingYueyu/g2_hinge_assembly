@@ -80,6 +80,32 @@ class CartesianOptimizationTests(unittest.TestCase):
         self.assertEqual(len(result.samples), 3)
         self.assertEqual(result.samples[1].position_m, samples[1].position_m)
 
+    def test_repairs_an_isolated_large_position_spike_before_simplifying(self):
+        samples = tuple(
+            CartesianSample(
+                index * 100_000_000,
+                position,
+                (0.0, 0.0, 0.0, 1.0),
+                (0.01 * index,) * 7,
+            )
+            for index, position in enumerate(((0.00, 0.0, 0.0), (0.01, 0.0, 0.0),
+                                               (0.20, 0.0, 0.0), (0.03, 0.0, 0.0),
+                                               (0.04, 0.0, 0.0)))
+        )
+        result, report = optimize_cartesian_trajectory(
+            self._trajectory(samples),
+            position_tolerance_m=0.001,
+            orientation_tolerance_rad=math.radians(0.5),
+            jitter_position_m=0.001,
+            jitter_orientation_rad=math.radians(0.5),
+            median_window=3,
+            outlier_position_m=0.02,
+            outlier_orientation_rad=math.radians(3.0),
+        )
+
+        self.assertLess(max(sample.position_m[0] for sample in result.samples), 0.1)
+        self.assertEqual(report["isolated_outliers_repaired"], 1)
+
 
 class CombinedOptimizationSolveCliTests(unittest.TestCase):
     def test_cli_optimizes_raw_cartesian_and_writes_solved_document(self):

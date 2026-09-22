@@ -26,6 +26,7 @@ def _validate_parameters(
     *, position_tolerance_m: float, orientation_tolerance_rad: float,
     jitter_position_m: float, jitter_orientation_rad: float, median_window: int,
     pause_position_m: float, pause_orientation_rad: float,
+    outlier_position_m: float, outlier_orientation_rad: float,
 ) -> None:
     for value, label in (
         (position_tolerance_m, "position_tolerance_m"),
@@ -38,6 +39,8 @@ def _validate_parameters(
         (jitter_orientation_rad, "jitter_orientation_rad"),
         (pause_position_m, "pause_position_m"),
         (pause_orientation_rad, "pause_orientation_rad"),
+        (outlier_position_m, "outlier_position_m"),
+        (outlier_orientation_rad, "outlier_orientation_rad"),
     ):
         if not math.isfinite(value) or value < 0.0:
             raise ValueError(f"{label} must be non-negative and finite")
@@ -65,6 +68,55 @@ def _median_quaternion(values: Iterable[Iterable[float]], reference: Iterable[fl
 
 def _position_distance(first: Iterable[float], second: Iterable[float]) -> float:
     return math.sqrt(sum((a-b) ** 2 for a, b in zip(first, second)))
+
+
+def _interpolate_sample(before: CartesianSample, after: CartesianSample, current: CartesianSample) -> CartesianSample:
+    duration = after.t_ns - before.t_ns
+    fraction = 0.5 if duration <= 0 else (current.t_ns - before.t_ns) / duration
+    fraction = min(1.0, max(0.0, fraction))
+    position = tuple(a + fraction * (b - a) for a, b in zip(before.position_m, after.position_m))
+    orientation = _slerp(before.orientation_xyzw, after.orientation_xyzw, fraction)
+    joints = tuple(
+        a + fraction * (b - a)
+        for a, b in zip(before.reference_joint_positions_rad, after.reference_joint_positions_rad)
+    )
+    return CartesianSample(current.t_ns, position, orientation, joints)
+
+
+def _repair_isolated_outliers(
+    trajectory: CartesianTrajectory, *, outlier_position_m: float,
+    outlier_orientation_rad: float,
+) -> tuple[tuple[CartesianSample, ...], int]:
+    """Replace isolated tracking spikes with interpolation between neighbours."""
+    samples = list(trajectory.samples)
+    repaired = 0
+    for index in range(1, len(samples) - 1):
+        before, current, after = samples[index - 1:index + 2]
+        expected = _interpolate_sample(before, after, current)
+        position_error = _position_distance(current.position_m, expected.position_m)
+        orientation_error = _quaternion_distance(current.orientation_xyzw, expected.orientation_xyzw)
+        bridge_position = _position_distance(before.position_m, after.position_m)
+        spike_position = max(
+            _position_distance(before.position_m, current.position_m),
+            _position_distance(current.position_m, after.position_m),
+        )
+        bridge_orientation = _quaternion_distance(before.orientation_xyzw, after.orientation_xyzw)
+        spike_orientation = max(
+            _quaternion_distance(before.orientation_xyzw, current.orientation_xyzw),
+            _quaternion_distance(current.orientation_xyzw, after.orientation_xyzw),
+        )
+        position_spike = (
+            position_error > outlier_position_m
+            and bridge_position < max(outlier_position_m, spike_position * 0.5)
+        )
+        orientation_spike = (
+            orientation_error > outlier_orientation_rad
+            and bridge_orientation < max(outlier_orientation_rad, spike_orientation * 0.5)
+        )
+        if position_spike or orientation_spike:
+            samples[index] = expected
+            repaired += 1
+    return tuple(samples), repaired
 
 
 def _median_filter(
@@ -185,11 +237,13 @@ def _retime_keyframes(
 def optimize_cartesian_trajectory(
     trajectory: CartesianTrajectory, *, position_tolerance_m: float = 0.001,
     orientation_tolerance_rad: float = math.radians(1.0),
-    jitter_position_m: float = 0.0002,
-    jitter_orientation_rad: float = math.radians(0.2),
-    median_window: int = 5,
+    jitter_position_m: float = 0.002,
+    jitter_orientation_rad: float = math.radians(1.0),
+    median_window: int = 7,
     pause_position_m: float = 0.00001,
     pause_orientation_rad: float = math.radians(0.01),
+    outlier_position_m: float = 0.008,
+    outlier_orientation_rad: float = math.radians(5.0),
 ) -> tuple[CartesianTrajectory, dict]:
     """Simplify a Cartesian path while preserving its absolute endpoints.
 
@@ -204,11 +258,22 @@ def optimize_cartesian_trajectory(
         median_window=median_window,
         pause_position_m=pause_position_m,
         pause_orientation_rad=pause_orientation_rad,
+        outlier_position_m=outlier_position_m,
+        outlier_orientation_rad=outlier_orientation_rad,
     )
     if not trajectory.samples:
         raise ValueError("Cartesian trajectory is empty")
+    repaired, repaired_count = _repair_isolated_outliers(
+        trajectory,
+        outlier_position_m=outlier_position_m,
+        outlier_orientation_rad=outlier_orientation_rad,
+    )
+    repaired_trajectory = CartesianTrajectory(
+        trajectory.side, trajectory.base_frame, trajectory.tip_frame,
+        trajectory.joint_names, trajectory.fixed_joint_positions, repaired,
+    )
     filtered = _median_filter(
-        trajectory, median_window=median_window,
+        repaired_trajectory, median_window=median_window,
         jitter_position_m=jitter_position_m,
         jitter_orientation_rad=jitter_orientation_rad,
     )
@@ -243,5 +308,8 @@ def optimize_cartesian_trajectory(
         "max_simplification_position_error_mm": max_position_error*1000.0,
         "max_simplification_orientation_error_deg": math.degrees(max_orientation_error),
         "stationary_intervals_removed": True,
+        "isolated_outliers_repaired": repaired_count,
+        "outlier_position_mm": outlier_position_m*1000.0,
+        "outlier_orientation_deg": math.degrees(outlier_orientation_rad),
     }
     return result, report

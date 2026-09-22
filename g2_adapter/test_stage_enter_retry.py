@@ -15,6 +15,7 @@ from spacemouse_takeover import MotionPauseGate, SpaceMouseTakeoverWorker
 from spacemouse_teleop import TeleopConfig
 from test_spacemouse_takeover import frame
 from keyboard_stage_advance import KeyboardStageAdvance
+import keyboard_stage_advance
 from left_teach_placement import replay_left_placement
 from right_teach_placement import replay_right_placement
 from teach_trajectory import build_trajectory, trajectory_document
@@ -78,6 +79,22 @@ class StageEnterRetryTests(unittest.TestCase):
             finally:
                 listener.stop()
                 os.close(write_fd)
+
+    def test_terminal_space_requests_dianpi_immediately(self):
+        read_fd, write_fd = os.pipe()
+        received = threading.Event()
+        worker = SimpleNamespace(request_keyboard_dianpi=received.set)
+        with os.fdopen(read_fd, 'r') as stream:
+            with patch.object(keyboard_stage_advance.termios, 'tcgetattr', return_value=[]), \
+                 patch.object(keyboard_stage_advance.tty, 'setcbreak'):
+                listener = KeyboardStageAdvance(worker, stream)
+                listener.start()
+                try:
+                    os.write(write_fd, b' ')
+                    self.assertTrue(received.wait(1))
+                finally:
+                    listener.stop()
+                    os.close(write_fd)
 
     def test_replay_enables_confirmation_only_inside_segment(self):
         worker = SimpleNamespace(allow_advance_right=False)

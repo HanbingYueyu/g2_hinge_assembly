@@ -42,6 +42,8 @@ def console_event_summary(record: dict) -> str | None:
         return f"[到位] {record.get('preset')}"
     if event == "right_preset_arrived":
         return f"[到位] {record.get('preset')}"
+    if event == "right_lr2_gripper_cycle":
+        return "[右夹爪] LR2 已闭合保持 1 秒并张开"
     if event == "left_seat_descent_complete":
         reason = {"force_threshold": "力阈值", "max_distance": "最大距离"}.get(
             record.get("stop_reason"), record.get("stop_reason"),
@@ -53,7 +55,7 @@ def console_event_summary(record: dict) -> str | None:
     if event == "left_release_lift_complete":
         return f"[上抬完成] {record.get('distance_mm')} mm"
     if event == "stage_waiting_for_advance":
-        return f"[等待确认] {record.get('stage')}：SpaceMouse 右按钮长按2秒或键盘 Enter"
+        return f"[等待确认] {record.get('stage')}：SpaceMouse 右按钮长按2秒，或键盘 Enter"
     if event == "stage_advance_received":
         return f"[确认收到] {record.get('stage')}"
     if event == "bilateral_flow_stopped_at_stage":
@@ -108,6 +110,7 @@ def append_jsonl_record(path: Path, record: dict) -> None:
 # Presets owned by the staged flow, with the arm each one must be recorded for.
 STAGED_PRESETS: dict[str, str] = {
     "LR1": "right",
+    "LR2": "right",
     "RR1": "right",
     "LL1": "left",
     "LL2": "left",
@@ -176,6 +179,10 @@ class BilateralRuntime:
         [(_, values)] = load_presets(self.poses_path, (str(name),))
         return list(values)
 
+    def load_right_preset(self, name: str) -> list[float]:
+        """Load one recorded seven-joint preset for the right arm."""
+        return list(load_right_pose(self.poses_path, str(name)))
+
     def load_preset(self, name: str) -> tuple[str, list[float]]:
         """Load one staged preset and confirm it was recorded for its own arm."""
         expected = STAGED_PRESETS.get(str(name))
@@ -184,7 +191,7 @@ class BilateralRuntime:
         if expected == "left":
             values = self.load_left_preset(name)
         else:
-            values = list(load_right_pose(self.poses_path, str(name)))
+            values = self.load_right_preset(name)
         return expected, values
 
     def validate_plan_assets(self) -> dict:
