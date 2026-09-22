@@ -157,6 +157,37 @@ def _snapshot_sequence(web, name: str, *, count: int = 4, interval_s: float = .2
     return frames, statuses
 
 
+def _fixture_sequence_board_jpeg(frames: list[bytes]) -> bytes:
+    """Build the V32 four-panel sequence while retaining raw frames on disk."""
+    if len(frames) != 4:
+        raise ValueError("fixture sequence board requires four frames")
+    tiles = []
+    for frame in frames:
+        image = cv2.imdecode(np.frombuffer(frame, np.uint8), cv2.IMREAD_COLOR)
+        if image is None:
+            raise ValueError("fixture sequence contains an undecodable JPEG")
+        tiles.append(cv2.resize(image, (510, 428), interpolation=cv2.INTER_AREA))
+    board = np.zeros((856, 1020, 3), dtype=np.uint8)
+    for index, tile in enumerate(tiles):
+        x = (index % 2) * 510
+        y = (index // 2) * 428
+        board[y:y + 428, x:x + 510] = tile
+        cv2.putText(
+            board,
+            f"frame {index + 1}",
+            (x + 12, y + 30),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            .7,
+            (0, 255, 0),
+            2,
+            cv2.LINE_AA,
+        )
+    ok, encoded = cv2.imencode(".jpg", board, [cv2.IMWRITE_JPEG_QUALITY, 92])
+    if not ok:
+        raise RuntimeError("failed to encode right-fixture sequence board")
+    return encoded.tobytes()
+
+
 def run_gripper_check(web, client, crop_xyxy=None, clock=time.monotonic, *, reference=None, frames_override=None) -> dict:
     try:
         frames, statuses = frames_override if frames_override is not None else _snapshots(web, ("left",))
@@ -243,14 +274,18 @@ def run_right_fixture_grasp_check(web, client, clock=time.monotonic, *, frames_o
             raise ValueError("right-fixture-grasp VLM check requires four frames")
         if client is None:
             raise RuntimeError("VLM client is unavailable")
+        sequence_board = _fixture_sequence_board_jpeg(images)
     except Exception as exc:
         return _warning("right-fixture-grasp", exc, locals().get("statuses", {}))
     _save_inputs(
         "vlm_right_fixture_grasp_check",
-        {f"right_frame{index}": frame for index, frame in enumerate(images, 1)},
+        {
+            **{f"right_frame{index}": frame for index, frame in enumerate(images, 1)},
+            "right_sequence_board": sequence_board,
+        },
         statuses,
     )
-    return _safe_check(client, "right-fixture-grasp", images, statuses, clock)
+    return _safe_check(client, "right-fixture-grasp", [sequence_board], statuses, clock)
 
 
 def run_assembly_review(web, client, emit, *, sleep=time.sleep, include_convex: bool = False):

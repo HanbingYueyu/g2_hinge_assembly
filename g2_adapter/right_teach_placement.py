@@ -1,6 +1,5 @@
 """Right-arm taught continuation after the original hole-offset transport."""
 
-import json
 import math
 from copy import copy
 from pathlib import Path
@@ -8,11 +7,11 @@ from types import SimpleNamespace
 
 try:
     from .left_teach_placement import _GatedRobot, end_on_takeover
-    from .teach_trajectory import load_trajectory
+    from .teach_placement import load_teach_spec, replay_solved_trajectory
     from .teach_trajectory_gdk import G2TrajectorySession
 except ImportError:
     from left_teach_placement import _GatedRobot, end_on_takeover
-    from teach_trajectory import load_trajectory
+    from teach_placement import load_teach_spec, replay_solved_trajectory
     from teach_trajectory_gdk import G2TrajectorySession
 
 
@@ -30,14 +29,11 @@ def right_trajectory_paths(args):
 def validate_right_teach_args(args):
     trajectories = []
     for path in right_trajectory_paths(args):
-        trajectory = load_trajectory(json.loads(Path(path).expanduser().read_text(encoding="utf-8")))
-        if trajectory.side != "right":
-            raise ValueError(f"右手示教轨迹必须是右臂：{path}")
-        trajectories.append(trajectory)
+        trajectories.append(load_teach_spec(path, "right"))
     for value in (args.right_teach_speed_scale, args.right_teach_start_velocity_rad_s):
         if not math.isfinite(value) or value <= 0:
             raise ValueError("示教倍率和起点速度必须为正有限值")
-    return trajectories[0]
+    return trajectories
 
 
 def run_right_teach_sequence(services, args, runtime):
@@ -59,8 +55,34 @@ def run_right_teach_sequence(services, args, runtime):
 
 
 def replay_right_placement(services, args):
-    trajectory = validate_right_teach_args(args)
-    robot = _GatedRobot(services.robot, services.gate, stop_on_takeover=True)
+    specs = validate_right_teach_args(args)
+    spec = specs[0]
+    robot = _GatedRobot(
+        services.robot,
+        services.gate,
+        stop_on_takeover=True,
+        automatic_guard=getattr(getattr(services, "controller", None), "check_automatic_guard", None),
+    )
+    if spec.kind == "cartesian_solved":
+        result = {
+            "method": "teach",
+            "trajectory_type": "cartesian_solved",
+            "trajectory": str(spec.path),
+            "speed_scale": args.right_teach_speed_scale,
+        }
+        with end_on_takeover(result, robot, "右手", getattr(services, "worker", None)):
+            result["sent"] = replay_solved_trajectory(
+                services.gdk,
+                robot,
+                spec,
+                speed_scale=args.right_teach_speed_scale,
+                start_velocity_rad_s=args.right_teach_start_velocity_rad_s,
+                max_velocity_rad_s=getattr(args, "teach_max_velocity_rad_s", 1.0),
+                max_acceleration_rad_s2=getattr(args, "teach_max_acceleration_rad_s2", 15.0),
+            )
+            print(f"右手末端示教回放完成：发送 {result['sent']} 个关节目标。", flush=True)
+        return result
+    trajectory = spec.trajectory
     session = G2TrajectorySession(
         services.gdk,
         robot,
@@ -69,7 +91,7 @@ def replay_right_placement(services, args):
         monotonic_fn=robot.clock,
         event_sink=print,
     )
-    result = {"method": "teach", "trajectory": str(Path(args.right_teach_trajectory).expanduser().resolve()), "speed_scale": args.right_teach_speed_scale}
+    result = {"method": "teach", "trajectory": str(spec.path), "speed_scale": args.right_teach_speed_scale}
     with end_on_takeover(result, robot, "右手", getattr(services, "worker", None)):
         result["sent"] = session.replay(trajectory, speed_scale=args.right_teach_speed_scale, start_velocity_rad_s=args.right_teach_start_velocity_rad_s)
         session._wait_for_start(trajectory.samples[-1].joint_positions_rad)

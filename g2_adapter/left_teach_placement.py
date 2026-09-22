@@ -1,19 +1,18 @@
 """Borrow the flow's robot session to replay a taught left-arm placement."""
 
-import json
 import math
 import time
 from contextlib import contextmanager
 from pathlib import Path
 
 try:
-    from .teach_trajectory import load_trajectory
     from .teach_trajectory_gdk import G2TrajectorySession
+    from .teach_placement import load_teach_spec, replay_solved_trajectory
     from .spacemouse_takeover import TeachReplayTakenOver
     from .safety import AdvanceRightRequested
 except ImportError:
-    from teach_trajectory import load_trajectory
     from teach_trajectory_gdk import G2TrajectorySession
+    from teach_placement import load_teach_spec, replay_solved_trajectory
     from spacemouse_takeover import TeachReplayTakenOver
     from safety import AdvanceRightRequested
 
@@ -21,10 +20,7 @@ except ImportError:
 def read_left_trajectory(path):
     if path is None:
         raise ValueError("teach 模式需要 --left-teach-trajectory")
-    trajectory = load_trajectory(json.loads(Path(path).expanduser().read_text(encoding="utf-8")))
-    if trajectory.side != "left":
-        raise ValueError("放置示教轨迹必须是左臂")
-    return trajectory
+    return load_teach_spec(path, "left")
 
 
 def validate_teach_args(args):
@@ -92,9 +88,29 @@ def end_on_takeover(result, robot, label, worker=None):
 
 
 def replay_left_placement(services, args):
-    trajectory = validate_teach_args(args)
+    spec = validate_teach_args(args)
     robot = _GatedRobot(services.robot, services.gate, stop_on_takeover=True,
                         automatic_guard=getattr(getattr(services, 'controller', None), 'check_automatic_guard', None))
+    if spec.kind == "cartesian_solved":
+        result = {
+            "method": "teach",
+            "trajectory_type": "cartesian_solved",
+            "trajectory": str(spec.path),
+            "speed_scale": args.left_teach_speed_scale,
+        }
+        with end_on_takeover(result, robot, "左手", getattr(services, "worker", None)):
+            result["sent"] = replay_solved_trajectory(
+                services.gdk,
+                robot,
+                spec,
+                speed_scale=args.left_teach_speed_scale,
+                start_velocity_rad_s=args.left_teach_start_velocity_rad_s,
+                max_velocity_rad_s=getattr(args, "teach_max_velocity_rad_s", 1.0),
+                max_acceleration_rad_s2=getattr(args, "teach_max_acceleration_rad_s2", 15.0),
+            )
+            print(f"左手末端示教放置完成：发送 {result['sent']} 个关节目标。", flush=True)
+        return result
+    trajectory = spec.trajectory
     session = G2TrajectorySession(
         services.gdk,
         robot,
@@ -103,7 +119,7 @@ def replay_left_placement(services, args):
         monotonic_fn=robot.clock,
         event_sink=print,
     )
-    result = {"method": "teach", "trajectory": str(Path(args.left_teach_trajectory).expanduser().resolve()), "speed_scale": args.left_teach_speed_scale}
+    result = {"method": "teach", "trajectory": str(spec.path), "speed_scale": args.left_teach_speed_scale}
     with end_on_takeover(result, robot, "左手", getattr(services, "worker", None)):
         result["sent"] = session.replay(trajectory, speed_scale=args.left_teach_speed_scale, start_velocity_rad_s=args.left_teach_start_velocity_rad_s)
         session._wait_for_start(trajectory.samples[-1].joint_positions_rad)

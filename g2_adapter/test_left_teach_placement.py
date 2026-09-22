@@ -7,9 +7,57 @@ from unittest.mock import patch
 from contextlib import contextmanager
 
 from left_teach_placement import _GatedRobot, read_left_trajectory, replay_left_placement
+from cartesian_teach import JointTrajectory, JointTrajectoryPoint, ValidationReport, joint_document
+from safety import LEFT_ARM_JOINT_NAMES
 
 
 class PlacementTests(unittest.TestCase):
+    def _write_solved(self, path, *, kind="g2_solved_absolute_joint_trajectory", ready=True):
+        trajectory = JointTrajectory(
+            side="left",
+            joint_names=LEFT_ARM_JOINT_NAMES,
+            fixed_joint_positions={f"idx0{i}_body_joint{i}": 0.0 for i in range(1, 6)},
+            source_sha256="0" * 64,
+            urdf_sha256="1" * 64,
+            points=(JointTrajectoryPoint(0, (0.0,) * 7, 0.0, 0.0),),
+        )
+        document = joint_document(trajectory, ValidationReport(ready, (), 0.0, 0.0, 0.0, 0.0))
+        document["kind"] = kind
+        path.write_text(json.dumps(document), encoding="utf-8")
+
+    def test_left_accepts_an_offline_solved_cartesian_teach_document(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "left_cartesian_solved.json"
+            self._write_solved(path)
+            spec = read_left_trajectory(path)
+        self.assertEqual(spec.kind, "cartesian_solved")
+        self.assertEqual(spec.trajectory.side, "left")
+
+    def test_left_rejects_an_unsolved_absolute_cartesian_document(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "left_cartesian_raw.json"
+            self._write_solved(path, kind="g2_absolute_cartesian_trajectory")
+            with self.assertRaisesRegex(ValueError, "先.*solve"):
+                read_left_trajectory(path)
+
+    def test_left_solved_document_uses_position_replay_dispatch(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "left_cartesian_solved.json"
+            self._write_solved(path)
+            args = SimpleNamespace(
+                left_teach_trajectory=path,
+                left_teach_speed_scale=.5,
+                left_teach_start_velocity_rad_s=.05,
+                teach_max_velocity_rad_s=1.0,
+                teach_max_acceleration_rad_s2=15.0,
+            )
+            services = SimpleNamespace(gdk=object(), robot=object(), gate=None)
+            with patch("left_teach_placement.replay_solved_trajectory", return_value=7) as replay:
+                result = replay_left_placement(services, args)
+        replay.assert_called_once()
+        self.assertEqual(result["trajectory_type"], "cartesian_solved")
+        self.assertEqual(result["sent"], 7)
+
     def test_arrival_wait_excludes_long_spacemouse_pause(self):
         from teach_trajectory_gdk import G2TrajectorySession
         from test_teach_trajectory_gdk import FakeGdk, FakeRobot

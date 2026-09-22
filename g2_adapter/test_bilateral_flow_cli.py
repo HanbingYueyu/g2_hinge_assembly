@@ -25,20 +25,33 @@ def write_poses(path: Path, *, complete: bool) -> Path:
 
 
 class OrchestratorCliTests(unittest.TestCase):
-    def test_right_teach_defaults_to_original_and_requires_file(self):
-        self.assertEqual(flow.parse_args([]).right_placement_method, "original")
-        args = flow.parse_args(["--device", "/dev/test", "--right-placement-method", "teach"])
+    def test_features_are_explicitly_disabled_by_default(self):
+        args = flow.parse_args([])
+        self.assertFalse(args.vlm_enable)
+        self.assertFalse(args.teach_enable)
+
+    def test_feature_switches_accept_explicit_boolean_values(self):
+        args = flow.parse_args(["--vlm-enable", "true", "--teach-enable", "false"])
+        self.assertTrue(args.vlm_enable)
+        self.assertFalse(args.teach_enable)
+
+        args = flow.parse_args(["--vlm-enable", "false", "--teach-enable", "true"])
+        self.assertFalse(args.vlm_enable)
+        self.assertTrue(args.teach_enable)
+
+    def test_teach_enable_requires_right_files(self):
+        args = flow.parse_args(["--device", "/dev/test", "--teach-enable"])
         with contextlib.redirect_stderr(io.StringIO()):
             self.assertEqual(flow.validate_args(args), 2)
 
     def test_four_right_trajectory_arguments_preserve_file_order(self):
         files = ["right1.json", "right2.json", "right3.json", "right4.json"]
-        args = flow.parse_args(["--right-placement-method", "teach", "--right-teach-trajectories", *files])
+        args = flow.parse_args(["--teach-enable", "--right-teach-trajectories", *files])
         self.assertEqual(args.right_teach_trajectories, [Path(path) for path in files])
         self.assertIsNone(args.right_teach_trajectory)
 
     def test_teach_placement_preserves_original_hole_transport(self):
-        args = flow.parse_args(["--left-placement-method", "teach", "--left-teach-trajectory", "demo.json", "--left-teach-speed-scale", "0.5"])
+        args = flow.parse_args(["--teach-enable", "--left-teach-trajectory", "demo.json", "--left-teach-speed-scale", "0.5"])
         argv = flow.StageSettings(args).left_argv()
         original = flow.StageSettings(flow.parse_args([])).left_argv()
         self.assertEqual(argv, original)
@@ -47,17 +60,17 @@ class OrchestratorCliTests(unittest.TestCase):
 
     def test_original_placement_is_default(self):
         args = flow.parse_args([])
-        self.assertEqual(args.left_placement_method, "original")
+        self.assertFalse(args.teach_enable)
         self.assertNotIn("--stop-before-hole-transfer", flow.StageSettings(args).left_argv())
 
     def test_teach_requires_trajectory_before_robot_start(self):
-        args = flow.parse_args(["--device", "/dev/test", "--left-placement-method", "teach"])
+        args = flow.parse_args(["--device", "/dev/test", "--teach-enable"])
         with contextlib.redirect_stderr(io.StringIO()):
             self.assertEqual(flow.validate_args(args), 2)
 
     def test_teach_stage_does_not_execute_ll1_or_force_descent(self):
         from types import SimpleNamespace
-        ctx = SimpleNamespace(args=flow.parse_args(["--left-placement-method", "teach", "--left-teach-trajectory", "demo.json"]), services=object())
+        ctx = SimpleNamespace(args=flow.parse_args(["--teach-enable", "--left-teach-trajectory", "demo.json"]), services=StageServices())
         with patch("left_teach_placement.replay_left_placement", return_value={"method": "teach", "sent": 5}) as replay:
             self.assertEqual(flow.stage_left_to_ll1_and_seat(ctx), {"method": "teach", "sent": 5})
         replay.assert_called_once()
@@ -131,11 +144,20 @@ class DryRunTests(unittest.TestCase):
             poses.write_text(json.dumps(document))
             trajectory = Path(directory) / "left.json"
             trajectory.write_text(json.dumps(trajectory_document(build_trajectory("left", [(0, [0]*7)]))))
+            right_trajectories = []
+            for index in range(4):
+                right = Path(directory) / f"right{index}.json"
+                right.write_text(json.dumps(trajectory_document(build_trajectory("right", [(0, [0]*7)]))))
+                right_trajectories.append(str(right))
             with contextlib.redirect_stdout(io.StringIO()):
-                code = flow.main(["--dry-run", "--poses", str(poses), "--left-placement-method", "teach", "--left-teach-trajectory", str(trajectory)])
+                code = flow.main([
+                    "--dry-run", "--poses", str(poses), "--teach-enable",
+                    "--left-teach-trajectory", str(trajectory),
+                    "--right-teach-trajectories", *right_trajectories,
+                ])
             self.assertEqual(code, 0)
             with contextlib.redirect_stderr(io.StringIO()):
-                code = flow.main(["--dry-run", "--poses", str(poses), "--left-placement-method", "teach"])
+                code = flow.main(["--dry-run", "--poses", str(poses), "--teach-enable"])
             self.assertEqual(code, 2)
 
     def test_missing_staged_presets_are_reported_with_exit_1(self):
@@ -339,10 +361,10 @@ class DispatchTests(unittest.TestCase):
 
     def test_left_motion_stages_keep_live_feed_in_both_placement_modes(self):
         from bilateral_web import BilateralWeb, RawPaneFeed
-        for method in ("original", "teach"):
-            with self.subTest(method=method):
+        for teach_enabled in (False, True):
+            with self.subTest(teach_enabled=teach_enabled):
                 context, _runtime = self.make_context()
-                context.args.left_placement_method = method
+                context.args.teach_enable = teach_enabled
                 web = BilateralWeb(host="127.0.0.1", port=0)
                 feed = RawPaneFeed("left", lambda: b"current-left-frame", web, hold_s=0)
                 context.feeds["left"] = feed
@@ -437,22 +459,13 @@ class DispatchTests(unittest.TestCase):
         self.assertTrue(warnings[0]["read_only"])
         self.assertEqual(warnings[0]["action"], "continue_release")
 
-    def test_finish_runs_read_only_assembly_check_before_closing(self):
+    def test_finish_does_not_check_after_right_return(self):
         context, runtime = self.make_context()
-        records = [
-            {"event": "vlm_pin_result", "task": "pin", "ok": True,
-             "result": {"state": "not_inserted", "confidence": 0.9}},
-            {"event": "vlm_c_hole_result", "task": "c-hole", "ok": True,
-             "result": {"obvious_c_leak": True, "confidence": 0.8}},
-        ]
-        with patch("run_bilateral_flow_gdk._one_shot_assembly_check", return_value=records):
+        with patch("run_bilateral_flow_gdk._one_shot_assembly_check") as check:
             result = flow.stage_finish(context)
         self.assertEqual(result["grippers"], "all_grippers_opened")
-        self.assertEqual(result["final_vlm"]["pin"]["state"], "not_inserted")
-        self.assertTrue(result["final_vlm"]["c-hole"]["obvious_c_leak"])
-        warnings = [record for name, record in runtime.events if name == "vlm_finish_warning"]
-        self.assertEqual(len(warnings), 1)
-        self.assertTrue(warnings[0]["read_only"])
+        self.assertNotIn("final_vlm", result)
+        check.assert_not_called()
 
     def test_handler_table_covers_every_non_gate_stage(self):
         expected = {spec.stage for spec in DEFAULT_PLAN if not spec.waits_for_advance}
@@ -503,7 +516,7 @@ class DispatchTests(unittest.TestCase):
         from bilateral_web import BilateralWeb, RawPaneFeed
         import numpy as np
         context, _runtime = self.make_context()
-        context.args.right_placement_method = "teach"
+        context.args.teach_enable = True
         context.args.right_teach_trajectory = Path("right_demo.json")
         context.services.controller = object()
         context.services.put("head_targets", {"hole": {"position_base_link_m": [0.5, .15, .79]}})

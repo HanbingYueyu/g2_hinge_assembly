@@ -36,12 +36,21 @@ def load_module():
 
 
 class PackageTests(unittest.TestCase):
+    def test_lan_v1_base_url_is_normalized_to_chat_completions(self):
+        module = load_module()
+        self.assertEqual(
+            module.normalize_api_url("http://192.168.30.12:8000/v1"),
+            "http://192.168.30.12:8000/v1/chat/completions",
+        )
+        full = "http://192.168.30.12:8000/v1/chat/completions"
+        self.assertEqual(module.normalize_api_url(full), full)
+
     def test_required_runtime_files_exist(self):
         self.assertEqual([name for name in REQUIRED if not (ROOT / name).is_file()], [])
 
     def test_example_does_not_contain_a_real_key(self):
         text = (ROOT / "config/vlm.env.example").read_text(encoding="utf-8")
-        self.assertIn("sk-your-beijing-dashscope-key", text)
+        self.assertIn("replace-with-the-same-random-key-as-the-LAN-server", text)
 
     def test_build_payload_contract(self):
         module = load_module()
@@ -73,6 +82,50 @@ class PackageTests(unittest.TestCase):
         content = post.call_args.kwargs["json"]["messages"][0]["content"]
         urls = [item for item in content if item["type"] == "image_url"]
         self.assertEqual(len(urls), 5)
+
+    def test_lan_api_key_is_used_without_exposing_it_in_the_payload(self):
+        module = load_module()
+        response = Mock()
+        response.raise_for_status.return_value = None
+        response.json.return_value = {
+            "choices": [{"message": {"content": '{"decision":"unknown"}'}}],
+        }
+        with patch.dict(
+            module.os.environ,
+            {"VLM_LAN_API_KEY": "lan-secret", "DASHSCOPE_API_KEY": ""},
+            clear=False,
+        ), patch.object(module.requests.Session, "post", return_value=response) as post:
+            client = module.VlmClient(
+                ROOT / "config" / "missing.env",
+                "qwen3.8-flash", "http://192.168.30.12:8000/v1", 10.0,
+            )
+            client.run_bytes("four-screws", [b"f1", b"f2", b"f3", b"f4"])
+        self.assertEqual(post.call_args.args[0], "http://192.168.30.12:8000/v1/chat/completions")
+        self.assertEqual(post.call_args.kwargs["headers"]["Authorization"], "Bearer lan-secret")
+        self.assertNotIn("lan-secret", repr(post.call_args.kwargs["json"]))
+
+    def test_standalone_fixture_task_collapses_four_live_images_to_one_board(self):
+        module = load_module()
+        response = Mock()
+        response.raise_for_status.return_value = None
+        response.json.return_value = {
+            "choices": [{"message": {"content": '{"decision":"unknown"}'}}],
+        }
+        images = [
+            ROOT / "references" / "right_fixture" / "positive_board.jpg",
+            ROOT / "references" / "right_fixture" / "negative_board.jpg",
+            ROOT / "references" / "convex_inserted" / "ref_inserted.jpg",
+            ROOT / "references" / "convex_inserted" / "ref_not_inserted_side.jpg",
+        ]
+        with patch.dict(module.os.environ, {"VLM_LAN_API_KEY": "lan-secret"}), patch.object(
+            module.requests, "post", return_value=response,
+        ) as post:
+            module.run_check(
+                "right-fixture-grasp", images, "qwen3-vl-8b-local", "http://192.168.30.12:8000/v1", 10.0,
+            )
+        content = post.call_args.kwargs["json"]["messages"][0]["content"]
+        urls = [item for item in content if item["type"] == "image_url"]
+        self.assertEqual(len(urls), 3)
 
     def test_migrated_api_tasks_are_registered_with_expected_reference_counts(self):
         module = load_module()

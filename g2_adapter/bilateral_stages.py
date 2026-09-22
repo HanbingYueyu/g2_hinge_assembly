@@ -69,7 +69,10 @@ DEFAULT_PLAN: tuple[StageSpec, ...] = (
         "6-7", camera_pane="right",
     ),
     StageSpec(Stage.GATE_RIGHT, "等待 SpaceMouse 下一阶段指令（门2）", "8", waits_for_advance=True),
-    StageSpec(Stage.RIGHT_RETURN, "右臂回到抓取成功时保存的位姿", "8", camera_pane="right"),
+    # The return stage takes a fresh right-camera VLM snapshot before moving
+    # back, so the raw feed must remain live instead of being paused by the
+    # stage scheduler.
+    StageSpec(Stage.RIGHT_RETURN, "右臂回到抓取成功时保存的位姿", "8"),
     StageSpec(Stage.FINISH, "张开全部夹爪并双臂回到 workflow_home", "9"),
 )
 

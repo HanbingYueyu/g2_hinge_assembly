@@ -11,7 +11,7 @@ import os
 import sys
 import tempfile
 import time
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -194,17 +194,26 @@ def iter_scaled_joint_targets(
         yield _joint_at(trajectory, min(trajectory.points[-1].t_ns, int(round(replay_t_ns*speed_scale))))
 
 
+def _scaled_target_count(trajectory: JointTrajectory, *, speed_scale: float, rate_hz: float = 100.0) -> int:
+    interval = int(round(1e9/rate_hz))
+    duration = int(round(trajectory.points[-1].t_ns/speed_scale))
+    return len(range(0, duration, interval)) + 1
+
+
 def replay_trajectory(
     gdk, robot, trajectory: JointTrajectory, report: ValidationReport, *, speed_scale: float,
     start_velocity_rad_s: float = 0.05, fixed_joint_tolerance_rad: float = 0.01,
     max_velocity_rad_s: float = 0.5, max_acceleration_rad_s2: float = 1.0,
     sleep_fn=time.sleep, monotonic_fn=time.monotonic,
+    progress_sink: Callable[[str], None] | None = None,
 ) -> int:
     ensure_replayable(trajectory, report)
     if not math.isfinite(speed_scale) or speed_scale <= 0.0:
         raise ValueError("speed_scale must be positive and finite")
     if not math.isfinite(start_velocity_rad_s) or start_velocity_rad_s <= 0.0:
         raise ValueError("start_velocity_rad_s must be positive and finite")
+    if progress_sink is None:
+        progress_sink = lambda message: print(message, flush=True)
     limits = ARM_POSITION_LIMITS[:7] if trajectory.side == "left" else ARM_POSITION_LIMITS[7:]
     local_report = validate_joint_trajectory(
         trajectory,
@@ -240,12 +249,19 @@ def replay_trajectory(
     group = 0 if trajectory.side == "left" else 1
     send_deadline = monotonic_fn()
     sent = 0
+    total_targets = _scaled_target_count(trajectory, speed_scale=speed_scale, rate_hz=100.0)
+    next_progress_percent = 0
     for target in iter_scaled_joint_targets(trajectory, speed_scale=speed_scale, rate_hz=100.0):
         status = robot.get_motion_control_status()
         if int(status.control_mode) != 1 or int(status.error_code) != 0:
             raise RuntimeError("position control became unhealthy during replay")
         robot.move_arm_joint_servo(list(target), 0.01, group, False)
         sent += 1
+        completed = min(sent-1, max(0, total_targets-1))
+        progress_percent = 100 if total_targets <= 1 else int(100*completed/(total_targets-1))
+        if progress_percent >= next_progress_percent:
+            progress_sink(f"回放点进度：{min(progress_percent, 100)}%")
+            next_progress_percent = (progress_percent//10+1)*10
         send_deadline += 0.01
         remaining = send_deadline-monotonic_fn()
         if remaining > 0:
@@ -293,6 +309,10 @@ def _parser() -> argparse.ArgumentParser:
     record.add_argument("--rate-hz", type=float, default=100.0)
     record.add_argument("--duration-s", type=float)
     record.add_argument("--urdf", type=Path, default=DEFAULT_URDF)
+    record.add_argument("--leading-motion-mm", type=float, default=0.5,
+                        help="保留首个明显移动点之前的姿态；默认移动超过0.5mm")
+    record.add_argument("--leading-motion-deg", type=float, default=0.5,
+                        help="保留首个明显移动点之前的姿态；默认旋转超过0.5度")
     record.add_argument("--allow-motion", action="store_true", help="确认允许切换到 control_mode=1；录制不发送运动目标")
     solve = commands.add_parser("solve", help="离线把整条绝对末端轨迹解算成连续关节轨迹")
     solve.add_argument("--input", type=Path, required=True)
@@ -374,15 +394,25 @@ def main(argv=None) -> int:
         gdk, robot = _open_gdk()
         if args.command == "record":
             urdf = args.urdf.expanduser().resolve()
+            if (
+                not math.isfinite(args.leading_motion_mm) or args.leading_motion_mm < 0.0
+                or not math.isfinite(args.leading_motion_deg) or args.leading_motion_deg < 0.0
+            ):
+                raise ValueError("leading motion thresholds must be non-negative and finite")
             print("已切换到位控录制；请按住机械臂自身拖动按钮进行示教，Ctrl+C 结束。", flush=True)
             trajectory = record_trajectory(robot, args.side, rate_hz=args.rate_hz, duration_s=args.duration_s)
             original_samples = len(trajectory.samples)
-            trajectory, removed = trim_leading_stationary(trajectory)
+            trajectory, removed = trim_leading_stationary(
+                trajectory,
+                translation_threshold_m=args.leading_motion_mm/1000.0,
+                rotation_threshold_rad=math.radians(args.leading_motion_deg),
+            )
             _atomic_json(args.output.expanduser().resolve(), cartesian_document(
                 trajectory, urdf_sha256=_sha256(urdf), recorded_at_utc=datetime.now(timezone.utc).isoformat(),
                 sample_rate_hz=args.rate_hz,
                 leading_stationary_trim={"removed_samples": removed, "original_samples": original_samples,
-                                         "translation_threshold_m": 0.0005, "rotation_threshold_deg": 0.5},
+                                         "translation_threshold_m": args.leading_motion_mm/1000.0,
+                                         "rotation_threshold_deg": args.leading_motion_deg},
             ))
             print(f"已删除开头静止 {removed} 点；保存 {len(trajectory.samples)} 个绝对末端位姿点：{args.output}")
             return 0

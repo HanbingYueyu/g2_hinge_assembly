@@ -20,8 +20,8 @@ import requests
 
 
 ROOT = Path(__file__).resolve().parents[1]
-DEFAULT_API_URL = "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions"
-DEFAULT_MODEL = "qwen3.8-flash"
+DEFAULT_API_URL = os.environ.get("VLM_API_URL", "http://192.168.30.12:8000/v1")
+DEFAULT_MODEL = os.environ.get("VLM_MODEL", "qwen3-vl-8b-local")
 
 TASKS = {
     "pin": {
@@ -64,6 +64,21 @@ TASKS = {
 }
 
 
+def normalize_api_url(url: str) -> str:
+    """Accept either an OpenAI-compatible ``/v1`` base or full endpoint."""
+    value = str(url).strip().rstrip("/")
+    if value.endswith("/chat/completions"):
+        return value
+    if value.endswith("/v1"):
+        return value + "/chat/completions"
+    return value + "/chat/completions"
+
+
+def api_key_from_environment() -> str:
+    """Use the LAN key first, while retaining DashScope compatibility."""
+    return os.environ.get("VLM_LAN_API_KEY", "").strip() or os.environ.get("DASHSCOPE_API_KEY", "").strip()
+
+
 def load_env_file(path: Path) -> None:
     if not path.is_file():
         return
@@ -88,6 +103,32 @@ def image_bytes_data_url(data: bytes, mime: str = "image/jpeg") -> str:
         raise ValueError("image bytes are empty")
     encoded = base64.b64encode(data).decode("ascii")
     return f"data:{mime};base64,{encoded}"
+
+
+def fixture_sequence_board_bytes(images: list[Path]) -> bytes:
+    """Encode four source images as the V32 2x2 temporal board."""
+    if len(images) != 4:
+        raise ValueError("right-fixture-grasp requires four live images")
+    import cv2
+    import numpy as np
+
+    tiles = []
+    for path in images:
+        image = cv2.imread(str(path), cv2.IMREAD_COLOR)
+        if image is None:
+            raise ValueError(f"unable to decode fixture image: {path}")
+        tiles.append(cv2.resize(image, (510, 428), interpolation=cv2.INTER_AREA))
+    board = np.zeros((856, 1020, 3), dtype=np.uint8)
+    for index, tile in enumerate(tiles):
+        x = (index % 2) * 510
+        y = (index // 2) * 428
+        board[y:y + 428, x:x + 510] = tile
+        cv2.putText(board, f"frame {index + 1}", (x + 12, y + 30), cv2.FONT_HERSHEY_SIMPLEX,
+                    .7, (0, 255, 0), 2, cv2.LINE_AA)
+    ok, encoded = cv2.imencode(".jpg", board, [cv2.IMWRITE_JPEG_QUALITY, 92])
+    if not ok:
+        raise RuntimeError("failed to encode right-fixture sequence board")
+    return encoded.tobytes()
 
 
 def build_payload(model: str, prompt: str, image_data_urls: Iterable[str]) -> dict[str, Any]:
@@ -138,7 +179,7 @@ class VlmClient:
     def __init__(self, env_file: Path, model: str, api_url: str, timeout_s: float) -> None:
         load_env_file(Path(env_file))
         self.model = str(model)
-        self.api_url = str(api_url)
+        self.api_url = normalize_api_url(api_url)
         self.timeout_s = float(timeout_s)
         self.session = requests.Session()
 
@@ -149,9 +190,9 @@ class VlmClient:
         prompt = cfg["prompt"].read_text(encoding="utf-8")
         urls = [image_data_url(Path(path)) for path in cfg["references"]]
         urls.extend(image_bytes_data_url(image) for image in images)
-        key = os.environ.get("DASHSCOPE_API_KEY", "").strip()
+        key = api_key_from_environment()
         if not key:
-            raise RuntimeError("DASHSCOPE_API_KEY is missing; check config/vlm.env")
+            raise RuntimeError("VLM_LAN_API_KEY or DASHSCOPE_API_KEY is missing; check config/vlm.env")
         response = self.session.post(
             self.api_url,
             headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
@@ -165,14 +206,18 @@ class VlmClient:
 def run_check(task: str, images: list[Path], model: str, api_url: str, timeout: float) -> dict[str, Any]:
     cfg = TASKS[task]
     prompt = cfg["prompt"].read_text(encoding="utf-8")
-    ordered = [*cfg["references"], *images]
-    urls = [image_data_url(Path(path)) for path in ordered]
+    if task == "right-fixture-grasp" and len(images) == 4:
+        urls = [image_data_url(Path(path)) for path in cfg["references"]]
+        urls.append(image_bytes_data_url(fixture_sequence_board_bytes(images)))
+    else:
+        ordered = [*cfg["references"], *images]
+        urls = [image_data_url(Path(path)) for path in ordered]
     payload = build_payload(model, prompt, urls)
-    key = os.environ.get("DASHSCOPE_API_KEY", "").strip()
+    key = api_key_from_environment()
     if not key:
-        raise RuntimeError("DASHSCOPE_API_KEY is missing; check config/vlm.env")
+        raise RuntimeError("VLM_LAN_API_KEY or DASHSCOPE_API_KEY is missing; check config/vlm.env")
     response = requests.post(
-        api_url,
+        normalize_api_url(api_url),
         headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
         json=payload,
         timeout=timeout,

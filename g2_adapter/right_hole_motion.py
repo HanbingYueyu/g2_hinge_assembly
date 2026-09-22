@@ -68,11 +68,13 @@ def end_target_for_tool_axis(
     )
 
 
-def lift_right_before_return(controller, *, speed_mm_s: float) -> dict:
+def lift_right_before_return(controller, *, speed_mm_s: float, distance_mm: float = 20.0) -> dict:
     """Clear the taught endpoint along base +Z, without changing orientation."""
+    if not math.isfinite(distance_mm) or distance_mm <= 0.0:
+        raise ValueError("distance_mm must be positive and finite")
     current = controller.read_end_effector_pose("arm_r_end_link")
     target = CartesianPoseTarget(
-        (current.position_m[0], current.position_m[1], current.position_m[2] + 0.020),
+        (current.position_m[0], current.position_m[1], current.position_m[2] + distance_mm / 1000.0),
         current.orientation_xyzw,
     )
     speed_mps = speed_mm_s / 1000.0
@@ -83,15 +85,15 @@ def lift_right_before_return(controller, *, speed_mm_s: float) -> dict:
     try:
         stream.update_target(target)
         actual = stream.wait_until_actual_target(
-            target, 0.020 / speed_mps + 5.0,
+            target, distance_mm / 1000.0 / speed_mps + 5.0,
             position_tolerance_m=0.002,
             orientation_tolerance_deg=0.5, stable_samples=3,
         )
         if actual is None:
-            raise RuntimeError("右手归位前上抬 20 mm 未到位；停止且不松爪")
+            raise RuntimeError(f"右手归位前上抬 {distance_mm:g} mm 未到位；停止且不松爪")
     finally:
         stream.stop()
-    return {"event": "right_return_lift_complete", "distance_mm": 20.0}
+    return {"event": "right_return_lift_complete", "distance_mm": float(distance_mm)}
 
 
 def move_right_tool_above_hole(

@@ -192,7 +192,7 @@ class BilateralRuntime:
         report: dict[str, Any] = {}
         missing: list[str] = []
         for name, side in STAGED_PRESETS.items():
-            if name == "LL1" and getattr(self.args, "left_placement_method", "original") == "teach":
+            if name == "LL1" and getattr(self.args, "teach_enable", False):
                 continue
             try:
                 self.load_preset(name)

@@ -95,14 +95,14 @@ VLM 不直接读取 GDK 相机，也不暂停 Web 原画面线程。`BilateralWe
 
 全流程增加参数：
 
-- `--disable-vlm-checks`：显式关闭全部 VLM 判别；
+- `--vlm-enable`：显式启用全部 VLM 判别；未指定时跳过 VLM；
 - `--vlm-env-file`：默认 `vlm_checks/config/vlm.env`；
 - `--vlm-model`：默认 `qwen3.8-flash`；
 - `--vlm-api-url`：默认北京 DashScope OpenAI-compatible 地址；
 - `--vlm-timeout-s`：默认 60 秒；
 - `--vlm-gripper-crop`：默认 `80,120,560,480`。
 
-VLM 默认启用。密钥缺失、配置错误或 `requests` 不可用时，阶段输出警告并继续，不把依赖问题升级为机械臂流程失败。
+VLM 只有在显式指定 `--vlm-enable` 时启用。密钥缺失、配置错误或 `requests` 不可用时，阶段输出警告并继续，不把依赖问题升级为机械臂流程失败。
 
 ## 输出与日志
 

@@ -31,7 +31,9 @@ class BilateralStagePlanTests(unittest.TestCase):
             Stage.LEFT_RELEASE_LIFT_TO_LL2: None,
             Stage.RIGHT_TO_LR1: "right",
             Stage.RIGHT_GRASP: "right",
-            Stage.RIGHT_RETURN: "right",
+            # right_return runs the pre-return VLM check from the live raw
+            # feed; it must not pause that feed as a camera-owning stage.
+            Stage.RIGHT_RETURN: None,
         }
         for spec in DEFAULT_PLAN:
             if spec.waits_for_advance:

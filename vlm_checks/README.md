@@ -2,12 +2,12 @@
 
 ## 文件与迁移来源
 
-必要提示词、参考图和人工核对资料来自历史迁移包，运行时只使用本目录，不调用下载目录或 ROS 工作区。当前所有任务都通过配置的 DashScope/OpenAI-compatible HTTP API 调用，暂不部署本地视觉模型。
+必要提示词、参考图和人工核对资料来自历史迁移包，运行时只使用本目录，不调用下载目录或 ROS 工作区。当前所有任务都通过局域网 OpenAI-compatible HTTP API 调用，暂不部署本地视觉模型。
 
 - `references/pin/`：凸轴 B 目标说明与插入/未插入状态参考，`pin` 请求自动发送这两张参考图，再发送待测原图。
 - `references/c_hole/`：C/D 孔定义与状态参考，`c-hole` 请求自动发送这两张参考图，再发送待测原图。
 - `references/convex_inserted/`：凸轴完全插入方案的三张严格参考图，`convex-inserted` 请求自动发送后再发送一张右相机原图。
-- `references/right_fixture/`：右手夹具 V32 正/负参考板，`right-fixture-grasp` 请求自动发送后再发送四张连续右相机原图。
+- `references/right_fixture/`：右手夹具 V32 正/负参考板，`right-fixture-grasp` 请求自动发送后再发送一张由四张连续右相机原图组成的时序四宫格；四张原图仍单独保存。
 - `prompts/four_screws.txt`：四颗螺丝 V4 保守遮挡判别提示词；该任务不使用静态参考图，只发送四张连续右相机原图。
 - `references/review_all/`：完整人工核对卡，供人回看；不把所有卡片塞进每次请求，也不把它们当作夹爪成功参考。
 - `docs/verified_results.json`：原包八段现场标签；不代表当前相机和实时任务的准确率。
@@ -19,7 +19,7 @@
 
 ## API 调用与离线图片测试
 
-北京 DashScope Chat Completions，默认 `qwen3.8-flash`；`temperature=0`、`seed=42`、`enable_thinking=false`、`max_tokens=256`。图片以 Base64 Data URL 上传，解析 `choices[0].message.content` 的 JSON。随机种子不保证绝对可复现，远程请求也不是实时安全控制。
+默认局域网服务基址为 `http://192.168.30.12:8000/v1`，程序会自动请求其 `/chat/completions`；当前服务端模型名为 `qwen3-vl-8b-local`。认证优先读取 `VLM_LAN_API_KEY`，兼容旧的 `DASHSCOPE_API_KEY`。`temperature=0`、`seed=42`、`enable_thinking=false`、`max_tokens=256`。图片以 Base64 Data URL 上传，解析 `choices[0].message.content` 的 JSON。随机种子不保证绝对可复现，远程请求也不是实时安全控制。
 
 ```bash
 cd /home/flyfuture/g2_hinge_assembly
@@ -48,7 +48,7 @@ bash vlm_checks/run.sh right-fixture-grasp \
 
 ## 密钥与故障排查
 
-真实密钥只用本地 `config/vlm.env`，维持权限 `600` 和 Git 忽略；不要上传、打印或写日志。北京密钥与北京接口配套，不混用国际站地域。缺少 Key 检查文件配置；401 检查密钥和地域；429 检查限流/额度；超时可延长等待但不要判为掉件；JSON 解析失败检查模型输出。原始 HTTP 错误也应审查后再分享，避免泄露敏感信息。
+真实密钥只用本地 `config/vlm.env`，维持权限 `600` 和 Git 忽略；不要上传、打印或写日志。服务端和客户端的 `VLM_LAN_API_KEY` 必须一致；缺少 Key 检查文件配置；401 检查局域网地址和密钥；429 检查服务限流；超时可延长等待但不要判为掉件；JSON 解析失败检查模型输出。原始 HTTP 错误也应审查后再分享，避免泄露敏感信息。
 
 无需请求 API 的检查：
 
@@ -58,18 +58,20 @@ bash vlm_checks/run.sh right-fixture-grasp \
 
 本目录提供六个只读语义判别：左夹爪是否仍夹持铰链、凸轴 B 是否插入、是否存在明显 C 孔外漏、凸轴严格完全插入、四颗螺丝是否完成、右手是否抓住白色三二维码夹具。
 
-默认使用北京 DashScope OpenAI-compatible 接口和 `qwen3.8-flash`。真实密钥仅保存在被 Git 忽略的 `config/vlm.env`，不得打印、提交或写入流程日志。
+默认使用 `http://192.168.30.12:8000/v1` 局域网 OpenAI-compatible 接口和 `qwen3-vl-8b-local`。真实密钥仅保存在被 Git 忽略的 `config/vlm.env`，不得打印、提交或写入流程日志。
+
+主流程用 `--vlm-enable` 显式打开 VLM；不带此参数时不创建 VLM 客户端，也不会发送判别请求。主流程示教统一用 `--teach-enable` 打开，并同时提供左臂轨迹和右臂轨迹参数；不带此参数时使用原来的 LL1/下探及右手原流程。
 
 夹持判别在 `post_grasp` 阶段连续两次为 `not_attached` 或 `dropped`（允许混合）时，向主控制线程请求重新夹取。后台 VLM 线程不下发运动。主线程结束当前左手动作，保持实测关节目标，然后重新执行 `left_grasp`，使用本次缓存的头部铰链定位及原预接近姿态/高度回盘，不在运输位置原地张爪重抓。重新进入抓取前阶段清空投票和请求；松爪前检查未处理的失败请求，主动释放后停用夹持监视。unknown、网络错误、抓取前未夹住都不会触发重抓。定位或回盘失败停止报告，不继续盲夹。
 
-凸轴 B、凸轴严格完全插入、C 孔、四颗螺丝和右手夹具判别均仅输出终端结果并写日志，不影响动作；右手夹具检查在右手抓取动作返回后执行，四颗螺丝检查在收尾阶段执行。
+凸轴 B、凸轴严格完全插入、C 孔、四颗螺丝和右手夹具判别均仅输出终端结果并写日志，不影响动作；右手夹具检查在右手抓取动作返回后执行，四颗螺丝检查在右手最后一段示教结束后、右手归位前执行。检查前（示教模式）右手先沿 Z 轴上抬 30 mm，避免电批遮挡安装面。
 
 全流程阶段：
 
 - `left_grasp` 开始进入抓取前监视；夹爪闭合保持后、上抬前进入 `post_grasp`，仅使用新鲜当前图。后续在运输、放置及门1等待期间持续检查。`vlm_gripper_check` 保留阶段入口，但不阻塞等待远程响应；松爪阶段开始停止夹持检查。
-- `vlm_assembly_check`：左手释放并到达 LL2 后检查 3 轮，每轮从原图缓存重新取右、左、头图，轮间等待 1 秒；`pin`、`c-hole` 和严格 `convex-inserted` 每轮输出结果。既有静态判别参考图不变，不把检查变成动作开关。
+- `vlm_assembly_check`：左手释放并到达 LL2 后检查 3 轮，每轮从原图缓存重新取右、左、头图，轮间等待 1 秒；`pin`、`c-hole` 和严格 `convex-inserted` 每轮输出结果。既有静态判别参考图不变，不把检查变成动作开关。`finish` 不再在右手归位后重复检查 C 孔。
 
-VLM 只调用独立的线程安全原图缓存，不读取页面叠加图、不暂停页面、不直接读取 GDK 相机。缓存无新鲜原图时短暂等待，仍不可用则输出警告，不以叠加图替代。可用 `--disable-vlm-checks` 临时关闭。
+VLM 只调用独立的线程安全原图缓存，不读取页面叠加图、不暂停页面、不直接读取 GDK 相机。缓存无新鲜原图时短暂等待，仍不可用则输出警告，不以叠加图替代。主流程通过 `--vlm-enable` 显式启用，未指定时跳过全部 VLM 检查。
 
 ## 独立实时测试
 

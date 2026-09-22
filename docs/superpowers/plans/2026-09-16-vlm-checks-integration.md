@@ -422,7 +422,7 @@ Place the first immediately after `LEFT_GRASP` and the second immediately after 
 Add exact flags:
 
 ```python
---disable-vlm-checks
+--vlm-enable
 --vlm-env-file Path(PROJECT_ROOT / "vlm_checks/config/vlm.env")
 --vlm-model qwen3.8-flash
 --vlm-api-url https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions
@@ -503,7 +503,7 @@ Add these flags to `常用命令.md`:
 --vlm-timeout-s 60 \
 ```
 
-Document `--disable-vlm-checks` directly below the command. Do not include the key value.
+Document `--vlm-enable` directly in the command. Do not include the key value.
 
 - [ ] **Step 2: Document observable stage behavior**
 

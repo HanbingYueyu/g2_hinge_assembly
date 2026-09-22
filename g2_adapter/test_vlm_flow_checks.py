@@ -238,13 +238,15 @@ class VlmFlowChecksTests(unittest.TestCase):
             def run_bytes(self, task, images):
                 calls.append((task, images))
                 return {"latest_decision": "unknown"} if task == "four-screws" else {"decision": "unknown"}
-        frames = [b"frame-1", b"frame-2", b"frame-3", b"frame-4"]
+        frames = [jpeg() for _ in range(4)]
         screws = run_four_screws_check(FakeWeb({"right": frames[-1]}), Client(), frames_override=frames)
         fixture = run_right_fixture_grasp_check(FakeWeb({"right": frames[-1]}), Client(), frames_override=frames)
         self.assertTrue(screws["ok"])
         self.assertTrue(fixture["ok"])
         self.assertEqual(calls[0], ("four-screws", frames))
-        self.assertEqual(calls[1], ("right-fixture-grasp", frames))
+        self.assertEqual(calls[1][0], "right-fixture-grasp")
+        self.assertEqual(len(calls[1][1]), 1)
+        self.assertNotEqual(calls[1][1][0], frames[0])
 
     def test_keyboard_interrupt_propagates(self):
         class Client:

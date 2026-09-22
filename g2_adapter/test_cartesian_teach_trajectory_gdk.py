@@ -23,6 +23,7 @@ from cartesian_teach_trajectory_gdk import (
     record_trajectory,
     replay_trajectory,
     main,
+    _parser,
     verify_live_model,
 )
 
@@ -277,8 +278,56 @@ class ReplayTests(unittest.TestCase):
             with self.subTest(kwargs=kwargs), self.assertRaisesRegex(ValueError, "positive and finite"):
                 replay_trajectory(SimpleNamespace(), Robot(), trajectory, report, **kwargs)
 
+    def test_replay_reports_progress_in_ten_percent_steps(self):
+        names = tuple(f"idx6{i}_arm_r_joint{i}" for i in range(1, 8))
+        trajectory = JointTrajectory(
+            "right", names, {name: 0.0 for name in BODY_JOINT_NAMES}, "0" * 64, "1" * 64,
+            tuple(
+                JointTrajectoryPoint(index * 100_000_000, (index * 0.01,) * 7, 0.0, 0.0)
+                for index in range(11)
+            ),
+        )
+        report = ValidationReport(True, (), 0.1, 0.0, 0.0, 0.0)
+
+        class Robot:
+            def __init__(self):
+                self.values = {name: 0.0 for name in (*BODY_JOINT_NAMES, *(f"idx2{i}_arm_l_joint{i}" for i in range(1, 8)), *names)}
+
+            def get_motion_control_status(self):
+                return SimpleNamespace(control_mode=1, error_code=0, error_msg="")
+
+            def get_joint_states(self):
+                return {"states": [{"name": name, "motor_position": value, "error_code": 0}
+                                    for name, value in self.values.items()]}
+
+            def joint_control_request(self, request):
+                for name, value in zip(request.joint_names, request.joint_positions):
+                    self.values[name] = value
+
+            def move_arm_joint_servo(self, positions, _timestep, _group, _low_latency):
+                for name, value in zip(names, positions):
+                    self.values[name] = value
+
+        progress = []
+        replay_trajectory(
+            SimpleNamespace(JointControlReq=type("Request", (), {})), Robot(), trajectory, report,
+            speed_scale=1.0, sleep_fn=lambda _: None, monotonic_fn=lambda: 0.0,
+            progress_sink=progress.append,
+        )
+
+        self.assertEqual(progress, [f"回放点进度：{value}%" for value in range(0, 101, 10)])
+
 
 class OfflineCliTests(unittest.TestCase):
+    def test_record_parser_exposes_leading_motion_thresholds(self):
+        args = _parser().parse_args([
+            "record", "--side", "left", "--output", "record.json",
+            "--leading-motion-mm", "1.2", "--leading-motion-deg", "2.3",
+        ])
+
+        self.assertAlmostEqual(args.leading_motion_mm, 1.2)
+        self.assertAlmostEqual(args.leading_motion_deg, 2.3)
+
     def test_solve_command_writes_a_replay_ready_joint_file_without_gdk(self):
         root = Path(__file__).resolve().parents[1]
         urdf = root / "robot_description/G2_t2v2_crsB_omnipicker.urdf"

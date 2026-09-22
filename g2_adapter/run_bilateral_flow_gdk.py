@@ -17,6 +17,7 @@ import argparse
 import contextlib
 import json
 import math
+import os
 import sys
 import time
 from dataclasses import dataclass
@@ -173,6 +174,17 @@ class FlowContext:
         return self.settings.args
 
 
+def _parse_bool(value: str | bool) -> bool:
+    if isinstance(value, bool):
+        return value
+    normalized = str(value).strip().lower()
+    if normalized in {"true", "1", "yes", "on"}:
+        return True
+    if normalized in {"false", "0", "no", "off"}:
+        return False
+    raise argparse.ArgumentTypeError("布尔参数必须是 true/false")
+
+
 def parse_args(argv=None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--device", default=None, help="SpaceMouse Compact 的 /dev/hidrawN 路径或 udev 固定别名")
@@ -210,8 +222,11 @@ def parse_args(argv=None) -> argparse.Namespace:
     parser.add_argument("--approach-roll-deg", type=float, default=180.0, help="到铰链上方时的滚转角，默认 180。")
     parser.add_argument("--approach-above-mm", type=float, default=100.0, help="铰链上方距离，默认 100 mm。")
     parser.add_argument("--left-hole-x-mm", type=float, default=0.0, help="左手相对 hole 的 base_link X 偏移，默认 0 mm。")
-    parser.add_argument("--left-placement-method", choices=("original", "teach"), default="original", help="到达左手 hole 偏移点后，使用原 LL1/下压方法或示教轨迹。")
-    parser.add_argument("--left-teach-trajectory", type=Path, help="从左手 hole 偏移点之后开始、不含松爪的左臂示教 JSON。")
+    parser.add_argument(
+        "--teach-enable", nargs="?", const=True, default=False, type=_parse_bool,
+        help="统一启用左右手示教轨迹，可写 true/false；不指定时使用原流程。",
+    )
+    parser.add_argument("--left-teach-trajectory", type=Path, help="左臂示教 JSON；支持旧关节轨迹或已 solve 的 *_cartesian_solved.json。")
     parser.add_argument("--left-teach-speed-scale", type=float, default=0.2)
     parser.add_argument("--left-teach-start-velocity-rad-s", type=float, default=0.05)
     parser.add_argument("--left-hole-y-mm", type=float, default=0.0, help="左手相对 hole 的 base_link Y 偏移，默认 0 mm。")
@@ -220,12 +235,19 @@ def parse_args(argv=None) -> argparse.Namespace:
     parser.add_argument("--left-hole-pitch-deg", type=float, default=42.0)
     parser.add_argument("--left-hole-roll-deg", type=float, default=180.0)
     parser.add_argument("--right-hole-x-mm", type=float, default=0.0, help="右手批头相对 hole 的 base_link X 偏移，默认 0 mm。")
-    parser.add_argument("--right-placement-method", choices=("original", "teach"), default="original", help="到右手 hole 偏移点后，保持原流程或执行示教轨迹。")
     right_teach_files = parser.add_mutually_exclusive_group()
-    right_teach_files.add_argument("--right-teach-trajectory", type=Path, help="单段右臂示教 JSON（保留原用法）。")
-    right_teach_files.add_argument("--right-teach-trajectories", type=Path, nargs=4, metavar="JSON", help="按顺序指定4段右臂轨迹，第一段自动开始，后续右键长按2秒开始。")
+    right_teach_files.add_argument("--right-teach-trajectory", type=Path, help="单段右臂示教 JSON；支持旧关节轨迹或已 solve 的末端轨迹。")
+    right_teach_files.add_argument("--right-teach-trajectories", type=Path, nargs=4, metavar="JSON", help="按顺序指定4个旧关节或 *_cartesian_solved.json 轨迹文件；第一段自动开始，后续右键长按2秒开始。")
     parser.add_argument("--right-teach-speed-scale", type=float, default=0.2)
     parser.add_argument("--right-teach-start-velocity-rad-s", type=float, default=0.05)
+    parser.add_argument(
+        "--teach-max-velocity-rad-s", type=float, default=1.0,
+        help="末端示教回放的实际关节速度上限，默认 1.0 rad/s。",
+    )
+    parser.add_argument(
+        "--teach-max-acceleration-rad-s2", type=float, default=15.0,
+        help="末端示教回放的实际关节加速度上限，默认 15.0 rad/s²。",
+    )
     parser.add_argument("--right-hole-y-mm", type=float, default=20.0, help="右手批头相对 hole 的 base_link Y 偏移，默认 20 mm。")
     parser.add_argument("--right-hole-z-mm", type=float, default=200.0, help="右手批头相对 hole 的 base_link Z 偏移，默认 200 mm。")
     parser.add_argument("--right-hole-yaw-deg", type=float, default=20.0)
@@ -244,12 +266,22 @@ def parse_args(argv=None) -> argparse.Namespace:
         "--right-grasp-distance-mm", type=float, default=152.0,
         help="右手末端原点到电批红色抓取中心的距离，默认 152 mm。",
     )
-    parser.add_argument("--disable-vlm-checks", action="store_true")
+    parser.add_argument(
+        "--vlm-enable", nargs="?", const=True, default=False, type=_parse_bool,
+        help="启用全流程 VLM 判别，可写 true/false；不指定时跳过 VLM。",
+    )
+    # Kept as a hidden compatibility switch for old launch wrappers.  The
+    # public interface is now the positive --vlm-enable flag.
+    parser.add_argument("--disable-vlm-checks", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--vlm-env-file", type=Path, default=PROJECT_ROOT / "vlm_checks" / "config" / "vlm.env")
-    parser.add_argument("--vlm-model", default="qwen3.8-flash")
-    parser.add_argument("--vlm-api-url", default="https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions")
+    parser.add_argument("--vlm-model", default=os.environ.get("VLM_MODEL", "qwen3-vl-8b-local"))
+    parser.add_argument(
+        "--vlm-api-url",
+        default=os.environ.get("VLM_API_URL", "http://192.168.30.12:8000/v1"),
+        help="OpenAI-compatible VLM /v1 基地址或完整 /chat/completions 地址。",
+    )
     parser.add_argument("--vlm-timeout-s", type=float, default=60.0)
-    parser.add_argument("--vlm-gripper-crop", default=None, help="可选像素框 x0,y0,x1,y1；默认居中保留高度60%、宽度40%")
+    parser.add_argument("--vlm-gripper-crop", default=None, help="可选像素框 x0,y0,x1,y1；默认居中保留高度60%%、宽度40%%")
     parser.add_argument("--auto-speed-mm-s", type=float, default=10.0)
     parser.add_argument("--auto-preset-velocity-rad-s", type=float, default=0.08)
     parser.add_argument("--left-seat-max-descent-mm", type=float, default=10.0,
@@ -278,8 +310,18 @@ def print_stage_plan() -> None:
         print(f"{index:2d}. {spec.stage.value:14s} step {spec.user_step:4s}{gate}{pane}\n    {spec.title}")
 
 
+def teach_enabled(args: argparse.Namespace) -> bool:
+    return bool(getattr(args, "teach_enable", False))
+
+
+def vlm_enabled(args: argparse.Namespace) -> bool:
+    return bool(getattr(args, "vlm_enable", False)) and not bool(
+        getattr(args, "disable_vlm_checks", False)
+    )
+
+
 def run_dry_run(args: argparse.Namespace) -> int:
-    if args.right_placement_method == "teach":
+    if teach_enabled(args):
         try:
             try:
                 from .right_teach_placement import validate_right_teach_args
@@ -289,7 +331,7 @@ def run_dry_run(args: argparse.Namespace) -> int:
         except (ValueError, OSError) as exc:
             print(f"右手示教参数错误：{exc}", file=sys.stderr)
             return 2
-    if args.left_placement_method == "teach":
+    if teach_enabled(args):
         try:
             try:
                 from .left_teach_placement import validate_teach_args
@@ -324,7 +366,7 @@ def run_dry_run(args: argparse.Namespace) -> int:
 
 
 def validate_args(args: argparse.Namespace) -> int | None:
-    if args.right_placement_method == "teach":
+    if teach_enabled(args):
         try:
             try:
                 from .right_teach_placement import validate_right_teach_args
@@ -334,7 +376,7 @@ def validate_args(args: argparse.Namespace) -> int | None:
         except (ValueError, OSError) as exc:
             print(f"右手示教参数错误：{exc}", file=sys.stderr)
             return 2
-    if args.left_placement_method == "teach":
+    if teach_enabled(args):
         try:
             try:
                 from .left_teach_placement import validate_teach_args
@@ -344,6 +386,9 @@ def validate_args(args: argparse.Namespace) -> int | None:
         except (ValueError, OSError) as exc:
             print(f"左手示教参数错误：{exc}", file=sys.stderr)
             return 2
+    if args.vlm_enable and args.disable_vlm_checks:
+        print("--vlm-enable 与旧的 --disable-vlm-checks 不能同时指定。", file=sys.stderr)
+        return 2
     if args.device is None or not str(args.device).startswith("/dev/"):
         print("--device 必须是 /dev/hidrawN 路径或 udev 固定别名。", file=sys.stderr)
         return 2
@@ -367,6 +412,8 @@ def validate_args(args: argparse.Namespace) -> int | None:
         math.isfinite(args.right_hole_y_mm) and abs(args.right_hole_y_mm) <= 500,
         math.isfinite(args.right_hole_z_mm) and 0 < args.right_hole_z_mm <= 500,
         math.isfinite(args.right_grasp_distance_mm) and 10 <= args.right_grasp_distance_mm <= 300,
+        math.isfinite(args.teach_max_velocity_rad_s) and 0 < args.teach_max_velocity_rad_s <= 2.0,
+        math.isfinite(args.teach_max_acceleration_rad_s2) and 0 < args.teach_max_acceleration_rad_s2 <= 30.0,
         math.isfinite(args.vlm_timeout_s) and 1 <= args.vlm_timeout_s <= 300,
         math.isfinite(args.approach_above_mm) and 0 < args.approach_above_mm <= 500,
         1.0 <= args.spacemouse_speed_mm_s <= 30.0,
@@ -596,7 +643,7 @@ def stage_left_grasp(ctx: FlowContext) -> dict:
 def stage_left_to_ll1_and_seat(ctx: FlowContext) -> dict:
     monitor = ctx.services.get('vlm_gripper_monitor')
     try:
-        if ctx.args.left_placement_method == "teach":
+        if teach_enabled(ctx.args):
             try:
                 from .left_teach_placement import replay_left_placement
             except ImportError:
@@ -684,7 +731,7 @@ def stage_right_to_lr1(ctx: FlowContext) -> dict:
 
 
 def _vlm_client(ctx: FlowContext):
-    if ctx.args.disable_vlm_checks:
+    if not vlm_enabled(ctx.args):
         return None
     return ctx.services.get("vlm_client")
 
@@ -749,7 +796,7 @@ def _one_shot_four_screws_check(ctx: FlowContext, *, phase: str) -> dict:
 
 
 def stage_vlm_gripper_check(ctx: FlowContext) -> dict:
-    if ctx.args.disable_vlm_checks:
+    if not vlm_enabled(ctx.args):
         return {"skipped": True, "reason": "disabled"}
     monitor = ctx.services.get('vlm_gripper_monitor')
     if monitor is not None:
@@ -767,7 +814,7 @@ def stage_vlm_gripper_check(ctx: FlowContext) -> dict:
 
 
 def stage_vlm_assembly_check(ctx: FlowContext) -> dict:
-    if ctx.args.disable_vlm_checks:
+    if not vlm_enabled(ctx.args):
         return {"skipped": True, "reason": "disabled"}
     try:
         from .vlm_flow_checks import run_assembly_review
@@ -828,7 +875,7 @@ def stage_right_grasp(ctx: FlowContext) -> dict:
         "right_fixture_vlm": fixture_vlm,
         "transport": transport["event"],
     }
-    if ctx.args.right_placement_method == "teach":
+    if teach_enabled(ctx.args):
         try:
             from .right_teach_placement import run_right_teach_sequence
         except ImportError:
@@ -853,58 +900,27 @@ def stage_right_return(ctx: FlowContext) -> dict:
             json.loads(Path(ctx.args.right_config).expanduser().read_text(encoding="utf-8")), "config",
         )
     events: list[dict] = []
-    if getattr(ctx.args, "right_placement_method", "original") == "teach":
+    if teach_enabled(ctx.args):
         try:
             from .right_hole_motion import lift_right_before_return
         except ImportError:
             from right_hole_motion import lift_right_before_return
-        print("右手归位前先上抬 20 mm…", flush=True)
+        print("右手归位前先上抬 30 mm，随后检查四颗螺丝…", flush=True)
         ctx.runtime.emit_event(lift_right_before_return(
-            ctx.services.controller, speed_mm_s=ctx.args.auto_speed_mm_s,
+            ctx.services.controller, speed_mm_s=ctx.args.auto_speed_mm_s, distance_mm=30.0,
         ))
+    four_screws = _one_shot_four_screws_check(ctx, phase="before_right_return")
     return_screwdriver(
         ctx.services.controller, saved, config, events.append, release=False,
     )
-    return {"events": [event.get("event") for event in events], "released": False}
+    return {
+        "four_screws": four_screws,
+        "events": [event.get("event") for event in events],
+        "released": False,
+    }
 
 
 def stage_finish(ctx: FlowContext) -> dict:
-    # Read-only final assembly gate before the closing motion.  Re-check pin B
-    # insertion and obvious C-hole leak; it warns but never vetoes, because the
-    # closing action only opens the grippers and returns home.
-    final_records = _one_shot_assembly_check(ctx, phase="finish")
-    final_screws = _one_shot_four_screws_check(ctx, phase="finish")
-    final_summary: dict = {}
-    for record in final_records:
-        task = str(record.get("task"))
-        if not record.get("ok"):
-            final_summary[task] = {"ok": False, "error": record.get("error")}
-            continue
-        result = record.get("result") or {}
-        final_summary[task] = {
-            "ok": True,
-            "state": result.get("state"),
-            "obvious_c_leak": result.get("obvious_c_leak"),
-            "confidence": result.get("confidence"),
-        }
-    suspicious = [
-        task
-        for task, item in final_summary.items()
-        if (task == "pin" and item.get("state") == "not_inserted")
-        or (task == "c-hole" and item.get("obvious_c_leak") is True)
-    ]
-    if suspicious:
-        print(
-            f"[VLM 收尾] 只读告警：{'、'.join(suspicious)} 提示装配异常；不阻止收尾动作。",
-            flush=True,
-        )
-        ctx.runtime.emit_event({
-            "event": "vlm_finish_warning",
-            "tasks": suspicious,
-            "read_only": True,
-            "action": "continue_finish",
-            "note": "只读告警：不阻止收尾、不请求任何运动",
-        })
     opened = ctx.runtime.open_all_grippers()
     controller = ctx.services.controller
     if controller is not None:
@@ -916,12 +932,7 @@ def stage_finish(ctx: FlowContext) -> dict:
         arrival_tolerance_rad=ctx.args.preset_arrival_tolerance_rad,
         timeout_s=ctx.args.preset_timeout_s,
     )
-    final_summary["four-screws"] = {
-        "ok": bool(final_screws.get("ok")),
-        "latest_decision": (final_screws.get("result") or {}).get("latest_decision"),
-        "error": final_screws.get("error"),
-    }
-    return {"grippers": opened["event"], "home": home["event"], "final_vlm": final_summary}
+    return {"grippers": opened["event"], "home": home["event"]}
 
 
 STAGE_HANDLERS = {
@@ -1076,7 +1087,7 @@ def run_flow(args: argparse.Namespace) -> int:
             head_camera=head_camera, left_camera=left_camera, right_camera=right_camera,
             web=web,
         )
-        if not args.disable_vlm_checks:
+        if vlm_enabled(args):
             try:
                 from vlm_checks.src.vlm_three_checks import VlmClient
                 services.put("vlm_client", VlmClient(
@@ -1093,7 +1104,7 @@ def run_flow(args: argparse.Namespace) -> int:
         ctx = FlowContext(
             gdk=agibot_gdk, services=services, runtime=runtime, settings=settings, feeds=feeds,
         )
-        if not args.disable_vlm_checks and services.get('vlm_client') is not None:
+        if vlm_enabled(args) and services.get('vlm_client') is not None:
             try:
                 from .vlm_gripper_monitor import GripperMonitor
                 from .vlm_flow_checks import parse_crop_xyxy
