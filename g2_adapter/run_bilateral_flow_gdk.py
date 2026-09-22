@@ -720,6 +720,34 @@ def _one_shot_assembly_check(ctx: FlowContext, *, phase: str) -> list[dict]:
     return records
 
 
+def _one_shot_right_fixture_check(ctx: FlowContext, *, phase: str) -> dict:
+    """Read-only V32 right-fixture check; it never changes the motion path."""
+    client = _vlm_client(ctx)
+    if client is None:
+        return {"task": "right-fixture-grasp", "ok": False, "skipped": True, "reason": "disabled_or_unavailable"}
+    try:
+        from .vlm_flow_checks import run_right_fixture_grasp_check
+    except ImportError:
+        from vlm_flow_checks import run_right_fixture_grasp_check
+    record = {**run_right_fixture_grasp_check(ctx.services.web, client), "workflow_phase": phase}
+    ctx.runtime.emit_event(record)
+    return record
+
+
+def _one_shot_four_screws_check(ctx: FlowContext, *, phase: str) -> dict:
+    """Read-only four-screw check; it never gates the closing motion."""
+    client = _vlm_client(ctx)
+    if client is None:
+        return {"task": "four-screws", "ok": False, "skipped": True, "reason": "disabled_or_unavailable"}
+    try:
+        from .vlm_flow_checks import run_four_screws_check
+    except ImportError:
+        from vlm_flow_checks import run_four_screws_check
+    record = {**run_four_screws_check(ctx.services.web, client), "workflow_phase": phase}
+    ctx.runtime.emit_event(record)
+    return record
+
+
 def stage_vlm_gripper_check(ctx: FlowContext) -> dict:
     if ctx.args.disable_vlm_checks:
         return {"skipped": True, "reason": "disabled"}
@@ -745,7 +773,12 @@ def stage_vlm_assembly_check(ctx: FlowContext) -> dict:
         from .vlm_flow_checks import run_assembly_review
     except ImportError:
         from vlm_flow_checks import run_assembly_review
-    records = run_assembly_review(ctx.services.web, ctx.services.get("vlm_client"), ctx.runtime.emit_event)
+    records = run_assembly_review(
+        ctx.services.web,
+        ctx.services.get("vlm_client"),
+        ctx.runtime.emit_event,
+        include_convex=True,
+    )
     return {"tasks": [record["task"] for record in records], "ok": all(record["ok"] for record in records)}
 
 
@@ -763,6 +796,7 @@ def stage_right_grasp(ctx: FlowContext) -> dict:
         feed.resume()
     if code != 0:
         raise SafetyError(f"右手抓取阶段返回 {code}")
+    fixture_vlm = _one_shot_right_fixture_check(ctx, phase="right_grasp")
     if ctx.services.get("right_saved_grasp_pose") is None:
         raise SafetyError("右手抓取阶段没有保存抓取位姿；无法在门2后回位")
     workpiece = ctx.services.get("right_saved_workpiece_pose")
@@ -789,7 +823,11 @@ def stage_right_grasp(ctx: FlowContext) -> dict:
         speed_mm_s=ctx.args.auto_speed_mm_s,
     )
     ctx.runtime.emit_event(transport)
-    result = {"returncode": code, "transport": transport["event"]}
+    result = {
+        "returncode": code,
+        "right_fixture_vlm": fixture_vlm,
+        "transport": transport["event"],
+    }
     if ctx.args.right_placement_method == "teach":
         try:
             from .right_teach_placement import run_right_teach_sequence
@@ -835,6 +873,7 @@ def stage_finish(ctx: FlowContext) -> dict:
     # insertion and obvious C-hole leak; it warns but never vetoes, because the
     # closing action only opens the grippers and returns home.
     final_records = _one_shot_assembly_check(ctx, phase="finish")
+    final_screws = _one_shot_four_screws_check(ctx, phase="finish")
     final_summary: dict = {}
     for record in final_records:
         task = str(record.get("task"))
@@ -877,6 +916,11 @@ def stage_finish(ctx: FlowContext) -> dict:
         arrival_tolerance_rad=ctx.args.preset_arrival_tolerance_rad,
         timeout_s=ctx.args.preset_timeout_s,
     )
+    final_summary["four-screws"] = {
+        "ok": bool(final_screws.get("ok")),
+        "latest_decision": (final_screws.get("result") or {}).get("latest_decision"),
+        "error": final_screws.get("error"),
+    }
     return {"grippers": opened["event"], "home": home["event"], "final_vlm": final_summary}
 
 

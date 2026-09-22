@@ -13,7 +13,14 @@ import cv2
 import numpy as np
 
 
-RESULT_EVENTS = {"gripper": "vlm_gripper_result", "pin": "vlm_pin_result", "c-hole": "vlm_c_hole_result"}
+RESULT_EVENTS = {
+    "gripper": "vlm_gripper_result",
+    "pin": "vlm_pin_result",
+    "c-hole": "vlm_c_hole_result",
+    "convex-inserted": "vlm_convex_inserted_result",
+    "four-screws": "vlm_four_screws_result",
+    "right-fixture-grasp": "vlm_right_fixture_grasp_result",
+}
 OUTPUT_DIR = Path(__file__).resolve().parents[1] / "outputs" / "vlm"
 _RUN_NAME = None
 _RUN_LOCK = threading.RLock()
@@ -103,6 +110,12 @@ def _safe_check(client, task: str, images: list[bytes], statuses: dict, clock=ti
             raise ValueError("invalid pin VLM state")
         if task == "c-hole" and result.get("obvious_c_leak") not in {True, False, None}:
             raise ValueError("invalid c-hole VLM result")
+        if task == "convex-inserted" and result.get("decision") not in {"已插入", "未插入", "不确定", None}:
+            raise ValueError("invalid convex-inserted VLM decision")
+        if task == "four-screws" and result.get("latest_decision") not in {"yes", "no", "unknown", None}:
+            raise ValueError("invalid four-screws VLM decision")
+        if task == "right-fixture-grasp" and result.get("decision", result.get("latest_decision")) not in {"yes", "no", "unknown", None}:
+            raise ValueError("invalid right-fixture-grasp VLM decision")
         return {"event": RESULT_EVENTS[task], "task": task, "ok": True, "elapsed_s": round(clock() - started, 3), "input_status": statuses, "result": result}
     except Exception as exc:
         record = _warning(task, exc, statuses)
@@ -127,6 +140,21 @@ def _snapshots(web, names: tuple[str, ...]):
             missing = ', '.join(name for name in names if name not in frames)
             raise RuntimeError(f"Camera {missing} has no fresh original JPEG")
         time.sleep(.05)
+
+
+def _snapshot_sequence(web, name: str, *, count: int = 4, interval_s: float = .25):
+    """Collect a short original-JPEG sequence without touching processed panes."""
+    if count < 1:
+        raise ValueError("snapshot sequence count must be positive")
+    frames: list[bytes] = []
+    statuses: dict = {}
+    for index in range(count):
+        current, current_status = _snapshots(web, (name,))
+        frames.append(bytes(current[name]))
+        statuses = current_status
+        if index + 1 < count and interval_s > 0:
+            time.sleep(interval_s)
+    return frames, statuses
 
 
 def run_gripper_check(web, client, crop_xyxy=None, clock=time.monotonic, *, reference=None, frames_override=None) -> dict:
@@ -162,13 +190,81 @@ def run_assembly_checks(web, client, clock=time.monotonic) -> list[dict]:
         return [pin.result(), c_hole.result()]
 
 
-def run_assembly_review(web, client, emit, *, sleep=time.sleep):
+def run_convex_insert_check(web, client, clock=time.monotonic, *, frames_override=None) -> dict:
+    """Read-only strict convex-shaft insertion check using the original right view."""
+    try:
+        if frames_override is None:
+            frames, statuses = _snapshots(web, ("right",))
+            images = [frames["right"]]
+            saved = {"right": images[0]}
+        else:
+            images = [bytes(frames_override[-1])]
+            statuses = {"right": {"raw_age_s": 0.0}}
+            saved = {"right": images[0]}
+        if client is None:
+            raise RuntimeError("VLM client is unavailable")
+    except Exception as exc:
+        return _warning("convex-inserted", exc, locals().get("statuses", {}))
+    _save_inputs("vlm_convex_insert_check", saved, statuses)
+    return _safe_check(client, "convex-inserted", images, statuses, clock)
+
+
+def run_four_screws_check(web, client, clock=time.monotonic, *, frames_override=None) -> dict:
+    """Read-only four-screw check over four fresh original right-camera frames."""
+    try:
+        if frames_override is None:
+            images, statuses = _snapshot_sequence(web, "right")
+        else:
+            images = [bytes(frame) for frame in frames_override]
+            statuses = {"right": {"raw_age_s": 0.0}}
+        if len(images) != 4:
+            raise ValueError("four-screws VLM check requires four frames")
+        if client is None:
+            raise RuntimeError("VLM client is unavailable")
+    except Exception as exc:
+        return _warning("four-screws", exc, locals().get("statuses", {}))
+    _save_inputs(
+        "vlm_four_screws_check",
+        {f"right_frame{index}": frame for index, frame in enumerate(images, 1)},
+        statuses,
+    )
+    return _safe_check(client, "four-screws", images, statuses, clock)
+
+
+def run_right_fixture_grasp_check(web, client, clock=time.monotonic, *, frames_override=None) -> dict:
+    """Read-only V32 right-fixture check over four fresh original frames."""
+    try:
+        if frames_override is None:
+            images, statuses = _snapshot_sequence(web, "right")
+        else:
+            images = [bytes(frame) for frame in frames_override]
+            statuses = {"right": {"raw_age_s": 0.0}}
+        if len(images) != 4:
+            raise ValueError("right-fixture-grasp VLM check requires four frames")
+        if client is None:
+            raise RuntimeError("VLM client is unavailable")
+    except Exception as exc:
+        return _warning("right-fixture-grasp", exc, locals().get("statuses", {}))
+    _save_inputs(
+        "vlm_right_fixture_grasp_check",
+        {f"right_frame{index}": frame for index, frame in enumerate(images, 1)},
+        statuses,
+    )
+    return _safe_check(client, "right-fixture-grasp", images, statuses, clock)
+
+
+def run_assembly_review(web, client, emit, *, sleep=time.sleep, include_convex: bool = False):
     records = []
     for round_index in range(1,4):
         if round_index > 1:
             sleep(1.)
         for record in run_assembly_checks(web, client):
             record = dict(record)
+            record['review_round'] = round_index
+            records.append(record)
+            emit(record)
+        if include_convex:
+            record = dict(run_convex_insert_check(web, client))
             record['review_round'] = round_index
             records.append(record)
             emit(record)

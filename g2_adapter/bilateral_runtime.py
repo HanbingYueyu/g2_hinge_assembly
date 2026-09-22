@@ -64,16 +64,34 @@ def console_event_summary(record: dict) -> str | None:
         return "[初始化] 正在加载视觉模型…"
     if event == "bilateral_models_preloaded":
         return "[初始化] 视觉模型加载完成"
-    if event in {"vlm_gripper_result", "vlm_pin_result", "vlm_c_hole_result"}:
+    if event in {
+        "vlm_gripper_result", "vlm_pin_result", "vlm_c_hole_result",
+        "vlm_convex_inserted_result", "vlm_four_screws_result",
+        "vlm_right_fixture_grasp_result",
+    }:
         result = record.get("result") or {}
-        label = {"vlm_gripper_result": "夹持", "vlm_pin_result": "凸轴", "vlm_c_hole_result": "C孔"}[event]
+        label = {
+            "vlm_gripper_result": "夹持",
+            "vlm_pin_result": "凸轴",
+            "vlm_c_hole_result": "C孔",
+            "vlm_convex_inserted_result": "凸轴严格",
+            "vlm_four_screws_result": "四颗螺丝",
+            "vlm_right_fixture_grasp_result": "右手夹具",
+        }[event]
         value = result.get("state", result.get("obvious_c_leak"))
+        if event == "vlm_convex_inserted_result":
+            value = result.get("decision")
+        elif event == "vlm_four_screws_result":
+            value = result.get("latest_decision")
+        elif event == "vlm_right_fixture_grasp_result":
+            value = result.get("decision", result.get("latest_decision"))
         stable = f" stable={record['stable_state']}" if 'stable_state' in record else ''
         review = f" round={record['review_round']}/3" if 'review_round' in record else ''
         timing = ''
         if event == 'vlm_gripper_result':
             timing = f" image_time={record.get('input_status', {}).get('image_time', 'unknown')} elapsed={record.get('elapsed_s', 'unknown')}s"
-        return f"[VLM {label}] result={value}{stable}{review} confidence={result.get('confidence')} reason={result.get('reason')}{timing}"
+        reason = result.get("reason", result.get("evidence"))
+        return f"[VLM {label}] result={value}{stable}{review} confidence={result.get('confidence')} reason={reason}{timing}"
     if event == "vlm_check_warning":
         return f"[VLM 警告] task={record.get('task')} error={record.get('error')}"
     if record.get("level") == "warning":

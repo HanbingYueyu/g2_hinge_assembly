@@ -2,10 +2,13 @@
 
 ## 文件与迁移来源
 
-必要提示词、参考图和人工核对资料来自 `VLM三项判别迁移包_20260916`，运行时只使用本目录，不调用下载目录或 ROS 工作区。
+必要提示词、参考图和人工核对资料来自历史迁移包，运行时只使用本目录，不调用下载目录或 ROS 工作区。当前所有任务都通过配置的 DashScope/OpenAI-compatible HTTP API 调用，暂不部署本地视觉模型。
 
 - `references/pin/`：凸轴 B 目标说明与插入/未插入状态参考，`pin` 请求自动发送这两张参考图，再发送待测原图。
 - `references/c_hole/`：C/D 孔定义与状态参考，`c-hole` 请求自动发送这两张参考图，再发送待测原图。
+- `references/convex_inserted/`：凸轴完全插入方案的三张严格参考图，`convex-inserted` 请求自动发送后再发送一张右相机原图。
+- `references/right_fixture/`：右手夹具 V32 正/负参考板，`right-fixture-grasp` 请求自动发送后再发送四张连续右相机原图。
+- `prompts/four_screws.txt`：四颗螺丝 V4 保守遮挡判别提示词；该任务不使用静态参考图，只发送四张连续右相机原图。
 - `references/review_all/`：完整人工核对卡，供人回看；不把所有卡片塞进每次请求，也不把它们当作夹爪成功参考。
 - `docs/verified_results.json`：原包八段现场标签；不代表当前相机和实时任务的准确率。
 - [原迁移包运行说明](docs/原迁移包运行说明.md)：来源说明保留版；当前夹持输入已调整为两张当前图，不依赖 ROS。
@@ -30,6 +33,13 @@ bash vlm_checks/run.sh gripper \
   --image /path/to/current_left_raw.jpg \
   --image /path/to/current_gripper_crop.jpg \
   --image /path/to/post_grasp_reference.jpg
+bash vlm_checks/run.sh convex-inserted --image /path/to/right_raw.jpg
+bash vlm_checks/run.sh four-screws \
+  --image /path/to/right_frame_1.jpg --image /path/to/right_frame_2.jpg \
+  --image /path/to/right_frame_3.jpg --image /path/to/right_frame_4.jpg
+bash vlm_checks/run.sh right-fixture-grasp \
+  --image /path/to/right_frame_1.jpg --image /path/to/right_frame_2.jpg \
+  --image /path/to/right_frame_3.jpg --image /path/to/right_frame_4.jpg
 ```
 
 `--image` 可重复，顺序应与提示词一致；夹爪历史参考可省略，没有本次历史参考不能仅凭空夹爪判断抓后掉落。脚本优先使用项目 `.venv-sam3`，可通过 `VLM_PYTHON` 指定解释器；无需初始化 GDK。可覆盖 `--model`、`--api-url`、`--env-file`、`--timeout`，例如超时使用 `--timeout 120`。
@@ -46,18 +56,18 @@ bash vlm_checks/run.sh gripper \
 .venv-sam3/bin/python -m unittest vlm_checks.tests.test_package
 ```
 
-本目录提供三个只读语义判别：左夹爪是否仍夹持铰链、凸轴 B 是否插入、是否存在明显 C 孔外漏。
+本目录提供六个只读语义判别：左夹爪是否仍夹持铰链、凸轴 B 是否插入、是否存在明显 C 孔外漏、凸轴严格完全插入、四颗螺丝是否完成、右手是否抓住白色三二维码夹具。
 
 默认使用北京 DashScope OpenAI-compatible 接口和 `qwen3.8-flash`。真实密钥仅保存在被 Git 忽略的 `config/vlm.env`，不得打印、提交或写入流程日志。
 
 夹持判别在 `post_grasp` 阶段连续两次为 `not_attached` 或 `dropped`（允许混合）时，向主控制线程请求重新夹取。后台 VLM 线程不下发运动。主线程结束当前左手动作，保持实测关节目标，然后重新执行 `left_grasp`，使用本次缓存的头部铰链定位及原预接近姿态/高度回盘，不在运输位置原地张爪重抓。重新进入抓取前阶段清空投票和请求；松爪前检查未处理的失败请求，主动释放后停用夹持监视。unknown、网络错误、抓取前未夹住都不会触发重抓。定位或回盘失败停止报告，不继续盲夹。
 
-凸轴 B 与 C 孔判别仍仅输出终端结果并写日志，不影响动作。
+凸轴 B、凸轴严格完全插入、C 孔、四颗螺丝和右手夹具判别均仅输出终端结果并写日志，不影响动作；右手夹具检查在右手抓取动作返回后执行，四颗螺丝检查在收尾阶段执行。
 
 全流程阶段：
 
 - `left_grasp` 开始进入抓取前监视；夹爪闭合保持后、上抬前进入 `post_grasp`，仅使用新鲜当前图。后续在运输、放置及门1等待期间持续检查。`vlm_gripper_check` 保留阶段入口，但不阻塞等待远程响应；松爪阶段开始停止夹持检查。
-- `vlm_assembly_check`：左手释放并到达 LL2 后检查 3 轮，每轮从原图缓存重新取右、左、头图，轮间等待 1 秒；`pin` 与 `c-hole` 每轮并行请求，分别输出轮次结果。既有静态判别参考图不变，不把三轮检查变成动作开关。
+- `vlm_assembly_check`：左手释放并到达 LL2 后检查 3 轮，每轮从原图缓存重新取右、左、头图，轮间等待 1 秒；`pin`、`c-hole` 和严格 `convex-inserted` 每轮输出结果。既有静态判别参考图不变，不把检查变成动作开关。
 
 VLM 只调用独立的线程安全原图缓存，不读取页面叠加图、不暂停页面、不直接读取 GDK 相机。缓存无新鲜原图时短暂等待，仍不可用则输出警告，不以叠加图替代。可用 `--disable-vlm-checks` 临时关闭。
 

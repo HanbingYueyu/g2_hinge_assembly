@@ -7,7 +7,18 @@ from unittest.mock import patch
 import cv2
 import numpy as np
 
-from vlm_flow_checks import crop_jpeg, parse_crop_xyxy, run_assembly_checks, run_gripper_check, start_vlm_run, _save_inputs, run_assembly_review
+from vlm_flow_checks import (
+    crop_jpeg,
+    parse_crop_xyxy,
+    run_assembly_checks,
+    run_assembly_review,
+    run_convex_insert_check,
+    run_four_screws_check,
+    run_gripper_check,
+    run_right_fixture_grasp_check,
+    start_vlm_run,
+    _save_inputs,
+)
 
 
 def jpeg(width=640, height=480):
@@ -33,6 +44,15 @@ class VlmFlowChecksTests(unittest.TestCase):
         self.assertEqual(check.call_count, 3)
         self.assertEqual(emit.call_count, 6)
         self.assertEqual([r['review_round'] for r in records], [1,1,2,2,3,3])
+
+    def test_assembly_review_can_include_strict_convex_check_without_motion(self):
+        from unittest.mock import Mock
+        emit = Mock()
+        with patch('vlm_flow_checks.run_assembly_checks', return_value=[{'task': 'pin', 'ok': True}, {'task': 'c-hole', 'ok': True}]), \
+             patch('vlm_flow_checks.run_convex_insert_check', return_value={'task': 'convex-inserted', 'ok': True}) as convex:
+            records = run_assembly_review(None, None, emit, sleep=lambda _: None, include_convex=True)
+        self.assertEqual(convex.call_count, 3)
+        self.assertEqual([r['task'] for r in records], ['pin', 'c-hole', 'convex-inserted'] * 3)
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
@@ -201,6 +221,30 @@ class VlmFlowChecksTests(unittest.TestCase):
         failed = run_gripper_check(FakeWeb({"left": jpeg()}), Client(), (80, 120, 560, 480))
         self.assertEqual(missing["event"], "vlm_check_warning")
         self.assertEqual(failed["event"], "vlm_check_warning")
+
+    def test_convex_check_sends_one_fresh_original_right_frame(self):
+        calls = []
+        class Client:
+            def run_bytes(self, task, images):
+                calls.append((task, images))
+                return {"decision": "已插入"}
+        record = run_convex_insert_check(FakeWeb({"right": b"right-original"}), Client())
+        self.assertTrue(record["ok"])
+        self.assertEqual(calls, [("convex-inserted", [b"right-original"])])
+
+    def test_screws_and_fixture_checks_send_four_original_frames(self):
+        calls = []
+        class Client:
+            def run_bytes(self, task, images):
+                calls.append((task, images))
+                return {"latest_decision": "unknown"} if task == "four-screws" else {"decision": "unknown"}
+        frames = [b"frame-1", b"frame-2", b"frame-3", b"frame-4"]
+        screws = run_four_screws_check(FakeWeb({"right": frames[-1]}), Client(), frames_override=frames)
+        fixture = run_right_fixture_grasp_check(FakeWeb({"right": frames[-1]}), Client(), frames_override=frames)
+        self.assertTrue(screws["ok"])
+        self.assertTrue(fixture["ok"])
+        self.assertEqual(calls[0], ("four-screws", frames))
+        self.assertEqual(calls[1], ("right-fixture-grasp", frames))
 
     def test_keyboard_interrupt_propagates(self):
         class Client:

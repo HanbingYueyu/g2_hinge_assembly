@@ -256,6 +256,23 @@ class ConsoleSummaryTests(unittest.TestCase):
         )
         self.assertIsNone(console_event_summary({"event": "verbose_internal", "value": [1, 2, 3]}))
 
+    def test_migrated_vlm_events_have_short_operator_messages(self):
+        convex = console_event_summary({
+            "event": "vlm_convex_inserted_result",
+            "result": {"decision": "已插入", "confidence": 0.9, "evidence": "清晰"},
+        })
+        screws = console_event_summary({
+            "event": "vlm_four_screws_result",
+            "result": {"latest_decision": "yes", "confidence": 0.9, "reason": "四颗"},
+        })
+        fixture = console_event_summary({
+            "event": "vlm_right_fixture_grasp_result",
+            "result": {"latest_decision": "yes", "confidence": 0.9, "reason": "稳定"},
+        })
+        self.assertIn("凸轴", convex)
+        self.assertIn("螺丝", screws)
+        self.assertIn("夹具", fixture)
+
     def test_emit_writes_full_json_but_prints_only_summary(self):
         with tempfile.TemporaryDirectory() as directory:
             log = Path(directory) / "flow.jsonl"

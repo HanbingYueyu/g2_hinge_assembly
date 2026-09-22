@@ -42,6 +42,25 @@ TASKS = {
         "prompt": ROOT / "prompts" / "gripper_drop.txt",
         "references": [],
     },
+    "convex-inserted": {
+        "prompt": ROOT / "prompts" / "convex_inserted.txt",
+        "references": [
+            ROOT / "references" / "convex_inserted" / "ref_inserted.jpg",
+            ROOT / "references" / "convex_inserted" / "ref_not_inserted_side.jpg",
+            ROOT / "references" / "convex_inserted" / "ref_not_inserted_front.jpg",
+        ],
+    },
+    "four-screws": {
+        "prompt": ROOT / "prompts" / "four_screws.txt",
+        "references": [],
+    },
+    "right-fixture-grasp": {
+        "prompt": ROOT / "prompts" / "right_fixture_grasp.txt",
+        "references": [
+            ROOT / "references" / "right_fixture" / "positive_board.jpg",
+            ROOT / "references" / "right_fixture" / "negative_board.jpg",
+        ],
+    },
 }
 
 
@@ -163,7 +182,9 @@ def run_check(task: str, images: list[Path], model: str, api_url: str, timeout: 
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Portable VLM checks: pin, c-hole, gripper")
+    parser = argparse.ArgumentParser(
+        description="Portable API VLM checks: pin, c-hole, gripper, convex-inserted, four-screws, right-fixture-grasp",
+    )
     parser.add_argument("task", choices=sorted(TASKS))
     parser.add_argument("--image", action="append", required=True, help="Input JPEG/PNG; repeat in chronological/order sequence")
     parser.add_argument("--model", default=os.environ.get("VLM_MODEL", DEFAULT_MODEL))
