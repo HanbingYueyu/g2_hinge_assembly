@@ -129,6 +129,25 @@ def test_run_cycle_preserves_pulse_and_delayed_forward_timing():
     assert writes_for(io, 8, 1)[-1][0] == pytest.approx(12.05)
 
 
+def test_ok_signal_is_reported_once_across_idle_and_cycle_reads():
+    controller, io = opened_controller()
+    messages = []
+    controller._output_fn = messages.append
+    io.states[PIN_OK] = 0
+
+    controller._report_inputs(io.states)
+    controller.run_cycle()
+
+    assert messages.count(">>> [OK] 信号收到! <<<") == 1
+
+    io.states[PIN_OK] = 1
+    controller._report_inputs(io.states)
+    io.states[PIN_OK] = 0
+    controller._report_inputs(io.states)
+    assert messages.count(">>> [OK] 信号收到! <<<") == 2
+    controller.close()
+
+
 def test_second_cycle_is_rejected_while_first_cycle_is_running():
     io = FakeIO()
     io.block_reads = True

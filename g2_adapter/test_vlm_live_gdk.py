@@ -91,15 +91,19 @@ def main():
     parser.add_argument("task", choices=("gripper", "pin", "c-hole"))
     parser.add_argument("--web-url", default="http://127.0.0.1:8767", help="优先复用 Web；空字符串强制独立相机")
     parser.add_argument("--env-file", type=Path, default=ROOT / "vlm_checks/config/vlm.env")
-    parser.add_argument("--model", default="qwen3.8-flash")
+    parser.add_argument("--vlm-mode", choices=("online", "local"), default="local")
+    parser.add_argument("--model", default=None, help="覆盖所选 VLM 配置档模型")
+    parser.add_argument("--api-url", default=None, help="覆盖所选 VLM 配置档 API 地址")
     parser.add_argument("--timeout", type=float, default=60)
     parser.add_argument("--gripper-crop", default=None, help="可选像素框；默认居中保留高度60%、宽度40%")
     args = parser.parse_args()
     start_vlm_run()
     sys.path.insert(0, str(ROOT))
-    from vlm_checks.src.vlm_three_checks import VlmClient, DEFAULT_API_URL
+    from vlm_checks.src.vlm_three_checks import VlmClient
     try:
-        client = VlmClient(args.env_file, args.model, DEFAULT_API_URL, args.timeout)
+        client = VlmClient(
+            args.env_file, args.model, args.api_url, args.timeout, mode=args.vlm_mode,
+        )
         names = ("left",) if args.task == "gripper" else (("right", "left", "head") if args.task == "pin" else ("left", "right"))
         frames, source = acquire_frames(names, args.web_url)
         print(f"[取图] 来源={source}，相机={','.join(names)}；开始 {args.task} 判别")

@@ -2,7 +2,7 @@
 
 ## 文件与迁移来源
 
-必要提示词、参考图和人工核对资料来自历史迁移包，运行时只使用本目录，不调用下载目录或 ROS 工作区。当前所有任务都通过局域网 OpenAI-compatible HTTP API 调用，暂不部署本地视觉模型。
+必要提示词、参考图和人工核对资料来自历史迁移包，运行时只使用本目录，不调用下载目录或 ROS 工作区。视觉模型不在机器人本机部署；全流程可切换局域网 OpenAI-compatible API 或在线 API。
 
 - `references/pin/`：凸轴 B 目标说明与插入/未插入状态参考，`pin` 请求自动发送这两张参考图，再发送待测原图。
 - `references/c_hole/`：C/D 孔定义与状态参考，`c-hole` 请求自动发送这两张参考图，再发送待测原图。
@@ -19,7 +19,9 @@
 
 ## API 调用与离线图片测试
 
-默认局域网服务基址为 `http://192.168.30.12:8000/v1`，程序会自动请求其 `/chat/completions`；当前服务端模型名为 `qwen3-vl-8b-local`。认证优先读取 `VLM_LAN_API_KEY`，兼容旧的 `DASHSCOPE_API_KEY`。`temperature=0`、`seed=42`、`enable_thinking=false`、`max_tokens=256`。图片以 Base64 Data URL 上传，解析 `choices[0].message.content` 的 JSON。随机种子不保证绝对可复现，远程请求也不是实时安全控制。
+全流程可用 `--vlm-mode local|online` 选择 API 配置档，默认 `local`。配置档从 `config/vlm.env` 读取：local 使用 `VLM_LOCAL_API_URL`、`VLM_LOCAL_MODEL`、`VLM_LOCAL_API_KEY`；online 使用 `VLM_ONLINE_API_URL`、`VLM_ONLINE_MODEL`、`VLM_ONLINE_API_KEY`。在线档默认指向 DashScope-compatible API 和 `qwen3.8-flash`；局域网档默认指向 `http://192.168.30.12:8000/v1` 和 `qwen3-vl-8b-local`。旧变量 `VLM_API_URL`、`VLM_MODEL`、`VLM_LAN_API_KEY`、`DASHSCOPE_API_KEY` 继续兼容。CLI 的 `--vlm-api-url` 和 `--vlm-model` 若显式传入，会覆盖所选配置档。图片以 Base64 Data URL 上传，解析 `choices[0].message.content` 的 JSON；随机种子不保证绝对可复现，远程请求也不是实时安全控制。
+
+全流程增加 `--tts-enable true|false`（默认 `false`），用 GDK `Interaction.play_tts()` 以自然短句播报 VLM 结论，不播报理由或证据。例如“铰链已经夹稳了”“凸轴还没有插到位”。同一次运行中，同一检查的同一结果只排队播报一次；结论变化时会播报新结果。播报在后台队列执行，TTS 不可用时只输出警告，不改变机械臂流程。启用前需按 G2 语音服务说明启动 `agibot_voice` 和远程 GDK 桥接；API 密钥保存在被 Git 忽略的 `config/vlm.env`，不要提交或写入日志。
 
 ```bash
 cd /home/flyfuture/g2_hinge_assembly
@@ -42,13 +44,13 @@ bash vlm_checks/run.sh right-fixture-grasp \
   --image /path/to/right_frame_3.jpg --image /path/to/right_frame_4.jpg
 ```
 
-`--image` 可重复，顺序应与提示词一致；夹爪历史参考可省略，没有本次历史参考不能仅凭空夹爪判断抓后掉落。脚本优先使用项目 `.venv-sam3`，可通过 `VLM_PYTHON` 指定解释器；无需初始化 GDK。可覆盖 `--model`、`--api-url`、`--env-file`、`--timeout`，例如超时使用 `--timeout 120`。
+`--image` 可重复，顺序应与提示词一致；夹爪历史参考可省略，没有本次历史参考不能仅凭空夹爪判断抓后掉落。脚本优先使用项目 `.venv-sam3`，可通过 `VLM_PYTHON` 指定解释器；无需初始化 GDK。可覆盖 `--vlm-mode`、`--model`、`--api-url`、`--env-file`、`--timeout`，例如超时使用 `--timeout 120`。
 
 `pin_inserted=true` 表示模型判断 B 轴插入；`obvious_c_leak=false` 仅表示没有明显板外 C 孔，不等于螺丝孔精确同轴，也不是完整安装合格证明。遮挡/证据不足必须保留 unknown/null，不转为成功。
 
 ## 密钥与故障排查
 
-真实密钥只用本地 `config/vlm.env`，维持权限 `600` 和 Git 忽略；不要上传、打印或写日志。服务端和客户端的 `VLM_LAN_API_KEY` 必须一致；缺少 Key 检查文件配置；401 检查局域网地址和密钥；429 检查服务限流；超时可延长等待但不要判为掉件；JSON 解析失败检查模型输出。原始 HTTP 错误也应审查后再分享，避免泄露敏感信息。
+真实密钥只用本地 `config/vlm.env`，维持权限 `600` 和 Git 忽略；不要上传、打印或写日志。服务端和客户端的 local key 必须一致；缺少在线密钥时设置 `VLM_ONLINE_API_KEY`（或旧名 `DASHSCOPE_API_KEY`），缺少局域网 key 时设置 `VLM_LOCAL_API_KEY`（或旧名 `VLM_LAN_API_KEY`）。401 检查对应服务地址和密钥；429 检查服务限流；超时可延长等待但不要判为掉件；JSON 解析失败检查模型输出。原始 HTTP 错误也应审查后再分享，避免泄露敏感信息。
 
 无需请求 API 的检查：
 
@@ -69,7 +71,8 @@ bash vlm_checks/run.sh right-fixture-grasp \
 全流程阶段：
 
 - `left_grasp` 开始进入抓取前监视；夹爪闭合保持后、上抬前进入 `post_grasp`，仅使用新鲜当前图。后续在运输、放置及门1等待期间持续检查。`vlm_gripper_check` 保留阶段入口，但不阻塞等待远程响应；松爪阶段开始停止夹持检查。
-- `vlm_assembly_check`：左手释放并到达 LL2 后检查 3 轮，每轮从原图缓存重新取右、左、头图，轮间等待 1 秒；`pin`、`c-hole` 和严格 `convex-inserted` 每轮输出结果。既有静态判别参考图不变，不把检查变成动作开关。`finish` 不再在右手归位后重复检查 C 孔。
+- `vlm_assembly_check`：左手释放并到达 LL2 后检查 3 轮，每轮从原图缓存重新取右、左、头图，轮间等待 1 秒；`pin` 和严格 `convex-inserted` 每轮输出结果。
+- `vlm_c_hole_check`：右手完成 LR2 夹爪闭合 1 秒并张开后、抓电批前，检查 C 孔 3 轮；每轮使用新鲜的左、右相机原图，轮间等待 1 秒。两项检查只输出结果，不作为动作开关；`finish` 不再额外重复检查 C 孔。
 
 VLM 只调用独立的线程安全原图缓存，不读取页面叠加图、不暂停页面、不直接读取 GDK 相机。缓存无新鲜原图时短暂等待，仍不可用则输出警告，不以叠加图替代。主流程通过 `--vlm-enable` 显式启用，未指定时跳过全部 VLM 检查。
 

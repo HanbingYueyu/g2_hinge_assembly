@@ -19,6 +19,7 @@ import json
 import math
 import os
 import sys
+import threading
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -270,15 +271,24 @@ def parse_args(argv=None) -> argparse.Namespace:
         "--vlm-enable", nargs="?", const=True, default=False, type=_parse_bool,
         help="启用全流程 VLM 判别，可写 true/false；不指定时跳过 VLM。",
     )
+    parser.add_argument(
+        "--vlm-mode", choices=("online", "local"), default="local",
+        help="VLM API 配置档：online 使用云端 API，local 使用局域网 API；默认 local。",
+    )
+    parser.add_argument(
+        "--tts-enable", nargs="?", const=True, default=False, type=_parse_bool,
+        help="语音播报 VLM 判别结果，可写 true/false；默认关闭。",
+    )
     # Kept as a hidden compatibility switch for old launch wrappers.  The
     # public interface is now the positive --vlm-enable flag.
     parser.add_argument("--disable-vlm-checks", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--vlm-env-file", type=Path, default=PROJECT_ROOT / "vlm_checks" / "config" / "vlm.env")
-    parser.add_argument("--vlm-model", default=os.environ.get("VLM_MODEL", "qwen3-vl-8b-local"))
+    parser.add_argument("--vlm-model", default=None,
+                        help="覆盖所选 VLM 配置档的模型；不指定时从对应配置读取。")
     parser.add_argument(
         "--vlm-api-url",
-        default=os.environ.get("VLM_API_URL", "http://192.168.30.12:8000/v1"),
-        help="OpenAI-compatible VLM /v1 基地址或完整 /chat/completions 地址。",
+        default=None,
+        help="覆盖所选 VLM 配置档的 API URL；不指定时从对应配置读取。",
     )
     parser.add_argument("--vlm-timeout-s", type=float, default=60.0)
     parser.add_argument("--vlm-gripper-crop", default=None, help="可选像素框 x0,y0,x1,y1；默认居中保留高度60%%、宽度40%%")
@@ -318,6 +328,11 @@ def vlm_enabled(args: argparse.Namespace) -> bool:
     return bool(getattr(args, "vlm_enable", False)) and not bool(
         getattr(args, "disable_vlm_checks", False)
     )
+
+
+def should_release_gdk(tts_announcer) -> bool:
+    """Do not release GDK while the optional TTS worker may still be using it."""
+    return tts_announcer is None or not tts_announcer.is_alive
 
 
 def run_dry_run(args: argparse.Namespace) -> int:
@@ -904,6 +919,22 @@ def stage_vlm_assembly_check(ctx: FlowContext) -> dict:
         ctx.services.get("vlm_client"),
         ctx.runtime.emit_event,
         include_convex=True,
+        include_c_hole=False,
+    )
+    return {"tasks": [record["task"] for record in records], "ok": all(record["ok"] for record in records)}
+
+
+def stage_vlm_c_hole_check(ctx: FlowContext) -> dict:
+    if not vlm_enabled(ctx.args):
+        return {"skipped": True, "reason": "disabled"}
+    try:
+        from .vlm_flow_checks import run_c_hole_review
+    except ImportError:
+        from vlm_flow_checks import run_c_hole_review
+    records = run_c_hole_review(
+        ctx.services.web,
+        ctx.services.get("vlm_client"),
+        ctx.runtime.emit_event,
     )
     return {"tasks": [record["task"] for record in records], "ok": all(record["ok"] for record in records)}
 
@@ -1024,6 +1055,7 @@ STAGE_HANDLERS = {
     Stage.LEFT_RELEASE_LIFT_TO_LL2: stage_left_release_lift_to_ll2,
     Stage.VLM_ASSEMBLY_CHECK: stage_vlm_assembly_check,
     Stage.RIGHT_TO_LR2_AND_GRIPPER_CYCLE: stage_right_to_lr2_and_gripper_cycle,
+    Stage.VLM_C_HOLE_CHECK: stage_vlm_c_hole_check,
     Stage.RIGHT_GRASP: stage_right_grasp,
     Stage.RIGHT_RETURN: stage_right_return,
     Stage.FINISH: stage_finish,
@@ -1074,6 +1106,8 @@ def run_flow(args: argparse.Namespace) -> int:
     services: StageServices | None = None
     ctx: FlowContext | None = None
     feeds: dict = {}
+    tts_announcer = None
+    event_log_lock = threading.Lock()
     try:
         robot = agibot_gdk.Robot()
         time.sleep(1.0)
@@ -1083,10 +1117,31 @@ def run_flow(args: argparse.Namespace) -> int:
         controller.prepare_joint_impedance_control()
         def flow_event_sink(event: dict) -> None:
             record = {"utc": datetime.now(timezone.utc).isoformat(), **event}
-            append_jsonl_record(log_path, record)
-            summary = console_event_summary(record)
-            if summary is not None:
-                print(summary, flush=True)
+            with event_log_lock:
+                append_jsonl_record(log_path, record)
+                summary = console_event_summary(record)
+                if summary is not None:
+                    print(summary, flush=True)
+            if tts_announcer is not None:
+                tts_announcer.handle_event(record)
+
+        if args.tts_enable and not vlm_enabled(args):
+            flow_event_sink({"event": "tts_warning", "error": "VLM 未启用，当前没有可播报的判别结果。"})
+        elif args.tts_enable:
+            try:
+                try:
+                    from .vlm_tts import VlmTtsAnnouncer
+                except ImportError:
+                    from vlm_tts import VlmTtsAnnouncer
+                tts_announcer = VlmTtsAnnouncer(
+                    agibot_gdk.Interaction(),
+                    warning_sink=lambda error: flow_event_sink({
+                        "event": "tts_warning", "error": error,
+                    }),
+                )
+                print("[TTS] VLM 结果语音播报已启用。", flush=True)
+            except Exception as exc:  # noqa: BLE001 - optional TTS never blocks robot startup
+                flow_event_sink({"event": "tts_warning", "error": f"初始化失败：{exc}"})
 
         dianpi = DianpiCycleRunner(event_sink=flow_event_sink)
         dianpi.start_p10_monitor()
@@ -1171,7 +1226,8 @@ def run_flow(args: argparse.Namespace) -> int:
             try:
                 from vlm_checks.src.vlm_three_checks import VlmClient
                 services.put("vlm_client", VlmClient(
-                    args.vlm_env_file, args.vlm_model, args.vlm_api_url, args.vlm_timeout_s,
+                    args.vlm_env_file, args.vlm_model, args.vlm_api_url,
+                    args.vlm_timeout_s, mode=args.vlm_mode,
                 ))
             except Exception as exc:
                 services.put("vlm_client", None)
@@ -1181,6 +1237,8 @@ def run_flow(args: argparse.Namespace) -> int:
             args=args, controller=controller, gate=gate, worker=worker,
             models=models, journal_path=log_path,
         )
+        if tts_announcer is not None:
+            runtime.add_event_observer(tts_announcer.handle_event)
         ctx = FlowContext(
             gdk=agibot_gdk, services=services, runtime=runtime, settings=settings, feeds=feeds,
         )
@@ -1218,6 +1276,8 @@ def run_flow(args: argparse.Namespace) -> int:
                 worker.stop()
             except Exception:
                 pass
+        if tts_announcer is not None and not tts_announcer.close(timeout_s=3.0):
+            print("[TTS 警告] 播报线程退出超时；不影响流程收尾。", flush=True)
         if dianpi is not None:
             try:
                 # The P10 monitor can be inside a slow native import/open when
@@ -1245,10 +1305,16 @@ def run_flow(args: argparse.Namespace) -> int:
         except Exception:
             pass
         time.sleep(0.2)
-        try:
-            agibot_gdk.gdk_release()
-        except Exception:
-            pass
+        if should_release_gdk(tts_announcer):
+            try:
+                agibot_gdk.gdk_release()
+            except Exception:
+                pass
+        else:
+            print(
+                "[GDK 警告] TTS 仍在调用 GDK，跳过 gdk_release；进程退出后由系统回收。",
+                flush=True,
+            )
 
 
 def _drive(ctx: FlowContext, args: argparse.Namespace) -> int:

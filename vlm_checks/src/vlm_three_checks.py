@@ -22,6 +22,8 @@ import requests
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_API_URL = os.environ.get("VLM_API_URL", "http://192.168.30.12:8000/v1")
 DEFAULT_MODEL = os.environ.get("VLM_MODEL", "qwen3-vl-8b-local")
+DEFAULT_ONLINE_API_URL = "https://dashscope.aliyuncs.com/compatible-mode/v1"
+DEFAULT_ONLINE_MODEL = "qwen3.8-flash"
 
 TASKS = {
     "pin": {
@@ -53,6 +55,7 @@ TASKS = {
     "four-screws": {
         "prompt": ROOT / "prompts" / "four_screws.txt",
         "references": [],
+        "max_tokens": 1024,
     },
     "right-fixture-grasp": {
         "prompt": ROOT / "prompts" / "right_fixture_grasp.txt",
@@ -60,6 +63,7 @@ TASKS = {
             ROOT / "references" / "right_fixture" / "positive_board.jpg",
             ROOT / "references" / "right_fixture" / "negative_board.jpg",
         ],
+        "max_tokens": 1024,
     },
 }
 
@@ -74,9 +78,45 @@ def normalize_api_url(url: str) -> str:
     return value + "/chat/completions"
 
 
-def api_key_from_environment() -> str:
-    """Use the LAN key first, while retaining DashScope compatibility."""
-    return os.environ.get("VLM_LAN_API_KEY", "").strip() or os.environ.get("DASHSCOPE_API_KEY", "").strip()
+def api_key_from_environment(mode: str = "local") -> str:
+    """Resolve credentials for one endpoint without crossing profiles."""
+    profile = str(mode).strip().lower()
+    if profile == "online":
+        return (
+            os.environ.get("VLM_ONLINE_API_KEY", "").strip()
+            or os.environ.get("DASHSCOPE_API_KEY", "").strip()
+        )
+    if profile == "local":
+        return (
+            os.environ.get("VLM_LOCAL_API_KEY", "").strip()
+            or os.environ.get("VLM_LAN_API_KEY", "").strip()
+            or os.environ.get("DASHSCOPE_API_KEY", "").strip()
+        )
+    raise ValueError("VLM mode must be 'online' or 'local'")
+
+
+def resolve_vlm_profile(
+    mode: str, model: str | None = None, api_url: str | None = None,
+) -> tuple[str, str]:
+    """Return selected profile model and base URL; explicit CLI values win."""
+    profile = str(mode).strip().lower()
+    if profile == "online":
+        selected_model = os.environ.get("VLM_ONLINE_MODEL", "").strip() or DEFAULT_ONLINE_MODEL
+        selected_url = os.environ.get("VLM_ONLINE_API_URL", "").strip() or DEFAULT_ONLINE_API_URL
+    elif profile == "local":
+        selected_model = (
+            os.environ.get("VLM_LOCAL_MODEL", "").strip()
+            or os.environ.get("VLM_MODEL", "").strip()
+            or DEFAULT_MODEL
+        )
+        selected_url = (
+            os.environ.get("VLM_LOCAL_API_URL", "").strip()
+            or os.environ.get("VLM_API_URL", "").strip()
+            or DEFAULT_API_URL
+        )
+    else:
+        raise ValueError("VLM mode must be 'online' or 'local'")
+    return str(model).strip() if model else selected_model, str(api_url).strip() if api_url else selected_url
 
 
 def load_env_file(path: Path) -> None:
@@ -131,7 +171,13 @@ def fixture_sequence_board_bytes(images: list[Path]) -> bytes:
     return encoded.tobytes()
 
 
-def build_payload(model: str, prompt: str, image_data_urls: Iterable[str]) -> dict[str, Any]:
+def build_payload(
+    model: str,
+    prompt: str,
+    image_data_urls: Iterable[str],
+    *,
+    max_tokens: int = 256,
+) -> dict[str, Any]:
     content: list[dict[str, Any]] = [{"type": "text", "text": prompt}]
     content.extend(
         {"type": "image_url", "image_url": {"url": url}}
@@ -143,7 +189,7 @@ def build_payload(model: str, prompt: str, image_data_urls: Iterable[str]) -> di
         "temperature": 0,
         "seed": 42,
         "enable_thinking": False,
-        "max_tokens": 256,
+        "max_tokens": int(max_tokens),
     }
 
 
@@ -165,7 +211,10 @@ def response_text(data: dict[str, Any]) -> str:
     choices = data.get("choices")
     if not isinstance(choices, list) or not choices:
         raise ValueError(f"API response has no choices: {data}")
-    content = choices[0].get("message", {}).get("content", "")
+    choice = choices[0]
+    if choice.get("finish_reason") == "length":
+        raise ValueError("VLM response truncated: output token limit reached")
+    content = choice.get("message", {}).get("content", "")
     if isinstance(content, str):
         return content
     if isinstance(content, list):
@@ -174,12 +223,16 @@ def response_text(data: dict[str, Any]) -> str:
 
 
 class VlmClient:
-    """Reusable DashScope client accepting in-memory live JPEG frames."""
+    """Reusable OpenAI-compatible VLM client accepting in-memory JPEG frames."""
 
-    def __init__(self, env_file: Path, model: str, api_url: str, timeout_s: float) -> None:
+    def __init__(
+        self, env_file: Path, model: str | None, api_url: str | None,
+        timeout_s: float, mode: str = "local",
+    ) -> None:
         load_env_file(Path(env_file))
-        self.model = str(model)
-        self.api_url = normalize_api_url(api_url)
+        self.mode = str(mode).strip().lower()
+        self.model, profile_url = resolve_vlm_profile(self.mode, model, api_url)
+        self.api_url = normalize_api_url(profile_url)
         self.timeout_s = float(timeout_s)
         self.session = requests.Session()
 
@@ -190,20 +243,26 @@ class VlmClient:
         prompt = cfg["prompt"].read_text(encoding="utf-8")
         urls = [image_data_url(Path(path)) for path in cfg["references"]]
         urls.extend(image_bytes_data_url(image) for image in images)
-        key = api_key_from_environment()
+        key = api_key_from_environment(self.mode)
         if not key:
-            raise RuntimeError("VLM_LAN_API_KEY or DASHSCOPE_API_KEY is missing; check config/vlm.env")
+            if self.mode == "online":
+                raise RuntimeError("VLM_ONLINE_API_KEY or DASHSCOPE_API_KEY is missing; check config/vlm.env")
+            raise RuntimeError("VLM_LOCAL_API_KEY or VLM_LAN_API_KEY is missing; check config/vlm.env")
         response = self.session.post(
             self.api_url,
             headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
-            json=build_payload(self.model, prompt, urls),
+            json=build_payload(self.model, prompt, urls, max_tokens=cfg.get("max_tokens", 256)),
             timeout=self.timeout_s,
         )
         response.raise_for_status()
         return parse_json_object(response_text(response.json()))
 
 
-def run_check(task: str, images: list[Path], model: str, api_url: str, timeout: float) -> dict[str, Any]:
+def run_check(
+    task: str, images: list[Path], model: str | None, api_url: str | None,
+    timeout: float, mode: str = "local",
+) -> dict[str, Any]:
+    model, api_url = resolve_vlm_profile(mode, model, api_url)
     cfg = TASKS[task]
     prompt = cfg["prompt"].read_text(encoding="utf-8")
     if task == "right-fixture-grasp" and len(images) == 4:
@@ -212,10 +271,12 @@ def run_check(task: str, images: list[Path], model: str, api_url: str, timeout: 
     else:
         ordered = [*cfg["references"], *images]
         urls = [image_data_url(Path(path)) for path in ordered]
-    payload = build_payload(model, prompt, urls)
-    key = api_key_from_environment()
+    payload = build_payload(model, prompt, urls, max_tokens=cfg.get("max_tokens", 256))
+    key = api_key_from_environment(mode)
     if not key:
-        raise RuntimeError("VLM_LAN_API_KEY or DASHSCOPE_API_KEY is missing; check config/vlm.env")
+        if mode == "online":
+            raise RuntimeError("VLM_ONLINE_API_KEY or DASHSCOPE_API_KEY is missing; check config/vlm.env")
+        raise RuntimeError("VLM_LOCAL_API_KEY or VLM_LAN_API_KEY is missing; check config/vlm.env")
     response = requests.post(
         normalize_api_url(api_url),
         headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
@@ -232,14 +293,18 @@ def main() -> int:
     )
     parser.add_argument("task", choices=sorted(TASKS))
     parser.add_argument("--image", action="append", required=True, help="Input JPEG/PNG; repeat in chronological/order sequence")
-    parser.add_argument("--model", default=os.environ.get("VLM_MODEL", DEFAULT_MODEL))
-    parser.add_argument("--api-url", default=os.environ.get("VLM_API_URL", DEFAULT_API_URL))
+    parser.add_argument("--vlm-mode", choices=("online", "local"), default="local")
+    parser.add_argument("--model", default=None)
+    parser.add_argument("--api-url", default=None)
     parser.add_argument("--env-file", default=str(ROOT / "config" / "vlm.env"))
     parser.add_argument("--timeout", type=float, default=60.0)
     args = parser.parse_args()
     load_env_file(Path(args.env_file))
     try:
-        result = run_check(args.task, [Path(x) for x in args.image], args.model, args.api_url, args.timeout)
+        result = run_check(
+            args.task, [Path(x) for x in args.image], args.model, args.api_url,
+            args.timeout, args.vlm_mode,
+        )
     except Exception as exc:
         print(json.dumps({"error": str(exc)}, ensure_ascii=False), file=sys.stderr)
         return 1

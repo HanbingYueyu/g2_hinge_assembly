@@ -96,6 +96,8 @@ def console_event_summary(record: dict) -> str | None:
         return f"[VLM {label}] result={value}{stable}{review} confidence={result.get('confidence')} reason={reason}{timing}"
     if event == "vlm_check_warning":
         return f"[VLM 警告] task={record.get('task')} error={record.get('error')}"
+    if event == "tts_warning":
+        return f"[TTS 警告] {record.get('error')}"
     if record.get("level") == "warning":
         return f"[警告] {record.get('reason', event)}"
     return None
@@ -151,6 +153,7 @@ class BilateralRuntime:
         self.clock = clock
         self.sleep = sleep
         self.events: list[dict] = []
+        self.event_observers: list[Callable[[dict], None]] = []
 
     # ------------------------------------------------------------------ log
     @property
@@ -165,7 +168,15 @@ class BilateralRuntime:
         summary = console_event_summary(record)
         if summary is not None:
             print(summary, flush=True)
+        for observer in tuple(self.event_observers):
+            try:
+                observer(record)
+            except Exception as exc:  # noqa: BLE001 - optional observers cannot stop the workflow
+                print(f"[事件观察器警告] {exc}", flush=True)
         return record
+
+    def add_event_observer(self, observer: Callable[[dict], None]) -> None:
+        self.event_observers.append(observer)
 
     def emit(self, event: str, **fields: Any) -> dict:
         return self.emit_event({"event": event, **fields})

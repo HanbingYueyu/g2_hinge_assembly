@@ -39,6 +39,38 @@ class OrchestratorCliTests(unittest.TestCase):
         self.assertFalse(args.vlm_enable)
         self.assertTrue(args.teach_enable)
 
+    def test_vlm_mode_and_tts_switch_are_selectable(self):
+        try:
+            args = flow.parse_args([
+                "--vlm-mode", "online", "--vlm-enable", "true", "--tts-enable", "true",
+            ])
+        except SystemExit as exc:
+            self.fail(f"VLM mode and TTS switches should parse: {exc}")
+        self.assertEqual(args.vlm_mode, "online")
+        self.assertTrue(args.tts_enable)
+
+        args = flow.parse_args(["--vlm-mode", "local", "--tts-enable", "false"])
+        self.assertEqual(args.vlm_mode, "local")
+        self.assertFalse(args.tts_enable)
+
+    def test_vlm_mode_and_tts_default_to_local_and_disabled(self):
+        args = flow.parse_args([])
+        self.assertEqual(args.vlm_mode, "local")
+        self.assertFalse(args.tts_enable)
+
+    def test_gdk_is_not_released_while_tts_worker_is_using_it(self):
+        class Announcer:
+            is_alive = True
+
+        class StoppedAnnouncer:
+            is_alive = False
+
+        should_release = getattr(flow, "should_release_gdk", None)
+        self.assertIsNotNone(should_release, "GDK release policy for TTS shutdown is missing")
+        self.assertFalse(should_release(Announcer()))
+        self.assertTrue(should_release(StoppedAnnouncer()))
+        self.assertTrue(should_release(None))
+
     def test_teach_enable_requires_right_files(self):
         args = flow.parse_args(["--device", "/dev/test", "--teach-enable"])
         with contextlib.redirect_stderr(io.StringIO()):

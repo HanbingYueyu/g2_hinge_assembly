@@ -57,11 +57,86 @@ class PackageTests(unittest.TestCase):
         payload = module.build_payload("qwen3.8-flash", "test", ["data:image/jpeg;base64,AA=="])
         self.assertEqual(payload["temperature"], 0)
         self.assertEqual(payload["seed"], 42)
+        self.assertEqual(payload["max_tokens"], 256)
         self.assertIs(payload["enable_thinking"], False)
+
+    def test_long_multi_frame_checks_receive_a_larger_output_budget(self):
+        module = load_module()
+        response = Mock()
+        response.raise_for_status.return_value = None
+        response.json.side_effect = [
+            {"choices": [{"message": {"content": '{"latest_decision":"unknown"}'}, "finish_reason": "stop"}]},
+            {"choices": [{"message": {"content": '{"decision":"unknown"}'}, "finish_reason": "stop"}]},
+        ]
+        with patch.dict(module.os.environ, {"DASHSCOPE_API_KEY": "test-key"}), patch.object(
+            module.requests.Session, "post", return_value=response,
+        ) as post:
+            client = module.VlmClient(ROOT / "config" / "missing.env", None, None, 10.0)
+            client.run_bytes("four-screws", [b"f1", b"f2", b"f3", b"f4"])
+            client.run_bytes("right-fixture-grasp", [b"f1", b"f2", b"f3", b"f4"])
+
+        budgets = [call.kwargs["json"]["max_tokens"] for call in post.call_args_list]
+        self.assertEqual(budgets, [1024, 1024])
+
+    def test_token_limited_vlm_response_reports_truncation_before_json_decode(self):
+        module = load_module()
+        response = Mock()
+        response.raise_for_status.return_value = None
+        response.json.return_value = {
+            "choices": [{"message": {"content": '{"latest_decision":"unknown"}'}, "finish_reason": "length"}],
+        }
+        with patch.dict(module.os.environ, {"DASHSCOPE_API_KEY": "test-key"}), patch.object(
+            module.requests.Session, "post", return_value=response,
+        ):
+            client = module.VlmClient(ROOT / "config" / "missing.env", None, None, 10.0)
+            with self.assertRaisesRegex(ValueError, "truncated.*token limit"):
+                client.run_bytes("four-screws", [b"f1", b"f2", b"f3", b"f4"])
 
     def test_image_bytes_data_url_uses_jpeg_base64(self):
         module = load_module()
         self.assertEqual(module.image_bytes_data_url(b"abc"), "data:image/jpeg;base64,YWJj")
+
+    def test_vlm_profile_resolves_online_and_local_endpoints_without_key_leakage(self):
+        module = load_module()
+        resolver = getattr(module, "resolve_vlm_profile", None)
+        self.assertIsNotNone(resolver, "VLM online/local profile resolver is missing")
+        with patch.dict(module.os.environ, {
+            "VLM_LOCAL_API_URL": "http://local.test/v1",
+            "VLM_LOCAL_MODEL": "local-model",
+            "VLM_ONLINE_API_URL": "https://online.test/v1",
+            "VLM_ONLINE_MODEL": "online-model",
+        }, clear=True):
+            self.assertEqual(
+                resolver("local"),
+                ("local-model", "http://local.test/v1"),
+            )
+            self.assertEqual(
+                resolver("online"),
+                ("online-model", "https://online.test/v1"),
+            )
+
+    def test_online_profile_uses_online_endpoint_model_and_key(self):
+        module = load_module()
+        response = Mock()
+        response.raise_for_status.return_value = None
+        response.json.return_value = {
+            "choices": [{"message": {"content": '{"state":"inserted"}'}}],
+        }
+        with patch.dict(module.os.environ, {
+            "VLM_ONLINE_API_KEY": "online-secret",
+            "VLM_ONLINE_API_URL": "https://online.test/v1",
+            "VLM_ONLINE_MODEL": "online-model",
+            "VLM_LAN_API_KEY": "local-secret",
+            "DASHSCOPE_API_KEY": "",
+        }, clear=True), patch.object(module.requests.Session, "post", return_value=response) as post:
+            client = module.VlmClient(
+                ROOT / "config" / "missing.env", None, None, 10.0, mode="online",
+            )
+            client.run_bytes("pin", [b"current"])
+        self.assertEqual(post.call_args.args[0], "https://online.test/v1/chat/completions")
+        self.assertEqual(post.call_args.kwargs["headers"]["Authorization"], "Bearer online-secret")
+        self.assertEqual(post.call_args.kwargs["json"]["model"], "online-model")
+        self.assertNotIn("online-secret", repr(post.call_args.kwargs["json"]))
 
     def test_run_bytes_orders_references_before_live_images(self):
         module = load_module()

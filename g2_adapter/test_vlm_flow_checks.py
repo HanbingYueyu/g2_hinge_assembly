@@ -12,6 +12,8 @@ from vlm_flow_checks import (
     parse_crop_xyxy,
     run_assembly_checks,
     run_assembly_review,
+    run_c_hole_check,
+    run_c_hole_review,
     run_convex_insert_check,
     run_four_screws_check,
     run_gripper_check,
@@ -53,6 +55,48 @@ class VlmFlowChecksTests(unittest.TestCase):
             records = run_assembly_review(None, None, emit, sleep=lambda _: None, include_convex=True)
         self.assertEqual(convex.call_count, 3)
         self.assertEqual([r['task'] for r in records], ['pin', 'c-hole', 'convex-inserted'] * 3)
+
+    def test_assembly_review_can_defer_c_hole_until_after_right_gripper_cycle(self):
+        class Client:
+            def run_bytes(self, task, _images):
+                return {"state": "inserted"} if task == "pin" else {"decision": "已插入"}
+
+        web = FakeWeb({"head": b"head", "left": b"left", "right": b"right"})
+        with patch("vlm_flow_checks._save_inputs"):
+            records = run_assembly_review(
+                web, Client(), lambda _record: None, sleep=lambda _: None,
+                include_convex=True, include_c_hole=False,
+            )
+        self.assertEqual([record["task"] for record in records], ["pin", "convex-inserted"] * 3)
+
+    def test_c_hole_check_uses_fresh_left_and_right_original_images(self):
+        class Client:
+            def __init__(self):
+                self.calls = []
+
+            def run_bytes(self, task, images):
+                self.calls.append((task, images))
+                return {"obvious_c_leak": False}
+
+        client = Client()
+        with patch("vlm_flow_checks._save_inputs"):
+            record = run_c_hole_check(FakeWeb({"left": b"left-original", "right": b"right-original"}), client)
+        self.assertEqual(record["task"], "c-hole")
+        self.assertEqual(client.calls, [("c-hole", [b"left-original", b"right-original"])])
+
+    def test_c_hole_review_runs_three_checks_and_emits_each_result(self):
+        from unittest.mock import Mock
+
+        emit = Mock()
+        with patch("vlm_flow_checks.run_c_hole_check", side_effect=[
+            {"task": "c-hole", "ok": True, "result": {"obvious_c_leak": False}},
+            {"task": "c-hole", "ok": True, "result": {"obvious_c_leak": False}},
+            {"task": "c-hole", "ok": True, "result": {"obvious_c_leak": False}},
+        ]) as check:
+            records = run_c_hole_review(None, None, emit, sleep=lambda _: None)
+        self.assertEqual(check.call_count, 3)
+        self.assertEqual([record["review_round"] for record in records], [1, 2, 3])
+        self.assertEqual(emit.call_count, 3)
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)

@@ -207,18 +207,33 @@ def run_gripper_check(web, client, crop_xyxy=None, clock=time.monotonic, *, refe
     return _safe_check(client, "gripper", images, statuses, clock)
 
 
-def run_assembly_checks(web, client, clock=time.monotonic) -> list[dict]:
+def run_assembly_checks(web, client, clock=time.monotonic, *, include_c_hole: bool = True) -> list[dict]:
     try:
         frames, statuses = _snapshots(web, ("head", "left", "right"))
         if client is None:
             raise RuntimeError("VLM client is unavailable")
     except Exception as exc:
-        return [_warning("pin", exc, locals().get("statuses", {})), _warning("c-hole", exc, locals().get("statuses", {}))]
+        tasks = ("pin", "c-hole") if include_c_hole else ("pin",)
+        return [_warning(task, exc, locals().get("statuses", {})) for task in tasks]
     _save_inputs("vlm_assembly_check", frames, statuses)
-    with ThreadPoolExecutor(max_workers=2, thread_name_prefix="vlm-assembly") as pool:
+    with ThreadPoolExecutor(max_workers=2 if include_c_hole else 1, thread_name_prefix="vlm-assembly") as pool:
         pin = pool.submit(_safe_check, client, "pin", [frames["right"], frames["left"], frames["head"]], statuses, clock)
-        c_hole = pool.submit(_safe_check, client, "c-hole", [frames["left"], frames["right"]], statuses, clock)
-        return [pin.result(), c_hole.result()]
+        if include_c_hole:
+            c_hole = pool.submit(_safe_check, client, "c-hole", [frames["left"], frames["right"]], statuses, clock)
+            return [pin.result(), c_hole.result()]
+        return [pin.result()]
+
+
+def run_c_hole_check(web, client, clock=time.monotonic) -> dict:
+    """Check the visible C-hole area using fresh, unprocessed left/right frames."""
+    try:
+        frames, statuses = _snapshots(web, ("left", "right"))
+        if client is None:
+            raise RuntimeError("VLM client is unavailable")
+    except Exception as exc:
+        return _warning("c-hole", exc, locals().get("statuses", {}))
+    _save_inputs("vlm_c_hole_check", frames, statuses)
+    return _safe_check(client, "c-hole", [frames["left"], frames["right"]], statuses, clock)
 
 
 def run_convex_insert_check(web, client, clock=time.monotonic, *, frames_override=None) -> dict:
@@ -288,12 +303,14 @@ def run_right_fixture_grasp_check(web, client, clock=time.monotonic, *, frames_o
     return _safe_check(client, "right-fixture-grasp", [sequence_board], statuses, clock)
 
 
-def run_assembly_review(web, client, emit, *, sleep=time.sleep, include_convex: bool = False):
+def run_assembly_review(
+    web, client, emit, *, sleep=time.sleep, include_convex: bool = False, include_c_hole: bool = True,
+):
     records = []
     for round_index in range(1,4):
         if round_index > 1:
             sleep(1.)
-        for record in run_assembly_checks(web, client):
+        for record in run_assembly_checks(web, client, include_c_hole=include_c_hole):
             record = dict(record)
             record['review_round'] = round_index
             records.append(record)
@@ -303,4 +320,17 @@ def run_assembly_review(web, client, emit, *, sleep=time.sleep, include_convex: 
             record['review_round'] = round_index
             records.append(record)
             emit(record)
+    return records
+
+
+def run_c_hole_review(web, client, emit, *, sleep=time.sleep):
+    """Repeat the read-only C-hole check three times after the operator stage."""
+    records = []
+    for round_index in range(1, 4):
+        if round_index > 1:
+            sleep(1.)
+        record = dict(run_c_hole_check(web, client))
+        record['review_round'] = round_index
+        records.append(record)
+        emit(record)
     return records

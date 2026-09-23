@@ -286,6 +286,14 @@ class ConsoleSummaryTests(unittest.TestCase):
             self.assertEqual(stored["preset"], "LR1")
             self.assertIn("utc", stored)
 
+    def test_emit_notifies_optional_event_observers(self):
+        runtime = BilateralRuntime(args=Namespace(poses="unused"), controller=None)
+        observed = []
+        runtime.add_event_observer(observed.append)
+        runtime.emit("vlm_pin_result", result={"state": "inserted"})
+        self.assertEqual(len(observed), 1)
+        self.assertEqual(observed[0]["event"], "vlm_pin_result")
+
 
 class GripperAndHomeTests(RuntimeFixture):
     def test_open_all_grippers_drives_both_arms_and_confirms_feedback(self):

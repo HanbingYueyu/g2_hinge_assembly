@@ -6,7 +6,7 @@ from bilateral_stages import DEFAULT_PLAN, Stage, StageSequencer, stage_names
 class BilateralStagePlanTests(unittest.TestCase):
     def test_plan_covers_the_operator_steps_in_order(self):
         steps = [spec.user_step for spec in DEFAULT_PLAN]
-        self.assertEqual(steps, ["1", "2", "3", "3", "4", "5", "5", "5", "5", "6", "6", "6-7", "8", "8", "9"])
+        self.assertEqual(steps, ["1", "2", "3", "3", "4", "5", "5", "5", "5", "6", "6", "6", "6-7", "8", "8", "9"])
         self.assertEqual(stage_names()[0], "home")
         self.assertEqual(stage_names()[-1], "finish")
 
@@ -21,7 +21,8 @@ class BilateralStagePlanTests(unittest.TestCase):
         self.assertLess(order.index("left_to_ll1_and_seat"), order.index("gate_left"))
         self.assertLess(order.index("gate_left"), order.index("left_release_lift_to_ll2"))
         self.assertLess(order.index("vlm_assembly_check"), order.index("right_to_lr2_and_gripper_cycle"))
-        self.assertLess(order.index("right_to_lr2_and_gripper_cycle"), order.index("gate_right_pre_grasp"))
+        self.assertLess(order.index("right_to_lr2_and_gripper_cycle"), order.index("vlm_c_hole_check"))
+        self.assertLess(order.index("vlm_c_hole_check"), order.index("gate_right_pre_grasp"))
         self.assertLess(order.index("gate_right_pre_grasp"), order.index("right_grasp"))
         self.assertLess(order.index("right_grasp"), order.index("gate_right"))
         self.assertLess(order.index("gate_right"), order.index("right_return"))
@@ -34,6 +35,7 @@ class BilateralStagePlanTests(unittest.TestCase):
             Stage.LEFT_RELEASE_LIFT_TO_LL2: None,
             Stage.RIGHT_TO_LR1: "right",
             Stage.RIGHT_TO_LR2_AND_GRIPPER_CYCLE: None,
+            Stage.VLM_C_HOLE_CHECK: None,
             Stage.RIGHT_GRASP: "right",
             # right_return runs the pre-return VLM check from the live raw
             # feed; it must not pause that feed as a camera-owning stage.

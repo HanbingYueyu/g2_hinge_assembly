@@ -137,6 +137,8 @@ class DianpiController:
         self._cycle_lock = threading.Lock()
         self._cycle_running = False
         self._stop_event = threading.Event()
+        self._input_report_lock = threading.Lock()
+        self._reported_input_states = {PIN_OK: 1, PIN_ERR: 1}
         self._read_tx = None
         self._read_rx = None
 
@@ -269,10 +271,16 @@ class DianpiController:
             return states
 
     def _report_inputs(self, states: dict[int, int]) -> None:
-        if states.get(PIN_OK, 1) == 0:
-            self._output_fn(">>> [OK] 信号收到! <<<")
-        if states.get(PIN_ERR, 1) == 0:
-            self._output_fn(">>> [ERR] 信号收到! <<<")
+        messages = []
+        with self._input_report_lock:
+            for pin, label in ((PIN_OK, "OK"), (PIN_ERR, "ERR")):
+                current = int(states.get(pin, 1))
+                previous = self._reported_input_states[pin]
+                if previous != 0 and current == 0:
+                    messages.append(f">>> [{label}] 信号收到! <<<")
+                self._reported_input_states[pin] = current
+        for message in messages:
+            self._output_fn(message)
 
     def _wait_and_report(self, duration_s: float) -> None:
         deadline = self._monotonic_fn() + duration_s
@@ -365,7 +373,7 @@ class DianpiController:
 
 def main() -> None:
     controller = DianpiController()
-    prev_state = {PIN_OK: 1, PIN_ERR: 1, PIN_START: 1}
+    prev_state = {PIN_START: 1}
     try:
         controller.open()
         print("=" * 55)
@@ -379,13 +387,8 @@ def main() -> None:
                 time.sleep(0.1)
                 continue
 
-            curr_ok = states.get(PIN_OK, 1)
-            curr_err = states.get(PIN_ERR, 1)
+            controller._report_inputs(states)
             curr_start = states.get(PIN_START, 1)
-            if curr_ok == 0 and prev_state[PIN_OK] == 1:
-                print(">>> [OK] 信号收到! <<<")
-            if curr_err == 0 and prev_state[PIN_ERR] == 1:
-                print(">>> [ERR] 信号收到! <<<")
             if curr_start == 0 and prev_state[PIN_START] == 1:
                 print("\n*** 收到启动信号! 开始执行时序... ***\n")
                 try:
@@ -395,10 +398,11 @@ def main() -> None:
                 print("\n*** 时序执行完毕! 继续等待启动信号... ***\n")
                 states = controller.read_inputs()
                 if states:
-                    prev_state.update({pin: states.get(pin, 1) for pin in INPUT_PINS})
+                    controller._report_inputs(states)
+                    prev_state[PIN_START] = states.get(PIN_START, 1)
                 continue
 
-            prev_state.update({PIN_OK: curr_ok, PIN_ERR: curr_err, PIN_START: curr_start})
+            prev_state[PIN_START] = curr_start
             time.sleep(0.05)
     except KeyboardInterrupt:
         print("\n\n程序被用户中断。")
