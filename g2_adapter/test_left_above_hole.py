@@ -85,6 +85,8 @@ def make_args(**overrides) -> Namespace:
     base = dict(
         step_tcp_end_mm="0,0,145",
         hole_speed_mm_s=10.0,
+        auto_preset_velocity_rad_s=.2,
+        preset_velocity_rad_s=.08,
         hole_x_mm=0.0,
         hole_y_mm=0.0,
         hole_z_mm=100.0,
@@ -100,6 +102,22 @@ def make_args(**overrides) -> Namespace:
 
 
 class LeftAboveHoleTests(unittest.TestCase):
+    def test_head_approach_uses_endpoint_ik_and_preset_velocity(self):
+        args = left_grasp_gdk.parse_args([])
+        args.auto_preset_velocity_rad_s = .23
+        args.step_tcp_end_mm = '0,0,0'
+        args.head_above_mm = 100.
+        controller = Mock()
+        controller.read_end_effector_pose.return_value = CartesianPoseTarget((.4,.2,.8), (0.,0.,0.,1.))
+        with patch('left_hole_joint_move.move_left_hole_joint_target', side_effect=lambda c, target, **kw: target) as move:
+            _, _, result = left_grasp_gdk.run_head_coarse_approach_in_process(
+                gdk=None, controller=controller, tf=None, args=args,
+                head_model_path=pathlib.Path('unused'), log=io.StringIO(),
+                prelocalized_targets={'hinge': {'position_base_link_m': [.4,.2,.7]}})
+        self.assertEqual(move.call_args.kwargs['velocity_rad_s'], .23)
+        self.assertEqual(result['target_end_link_base_m'], [.4,.2,.7999999999999999])
+        controller.start_left_end_effector_position_stream.assert_not_called()
+
     def setUp(self) -> None:
         self.log = io.StringIO()
         self.hole = [0.5, 0.1, 0.8]
@@ -111,11 +129,11 @@ class LeftAboveHoleTests(unittest.TestCase):
 
     def _run(self, actual=None, args=None):
         if actual is None:
-            def reached_target(_controller, _stream, target, **_kwargs):
+            def reached_target(_controller, target, **_kwargs):
                 return target
-            wait_patch = patch.object(left_grasp_gdk, "wait_actual_left_target", side_effect=reached_target)
+            wait_patch = patch("left_hole_joint_move.move_left_hole_joint_target", side_effect=reached_target)
         else:
-            wait_patch = patch.object(left_grasp_gdk, "wait_actual_left_target", return_value=actual)
+            wait_patch = patch("left_hole_joint_move.move_left_hole_joint_target", return_value=actual)
         with wait_patch as waiter:
             record = left_grasp_gdk.move_left_above_hole(
                 controller=self.controller, hole_base_m=self.hole,
@@ -128,15 +146,13 @@ class LeftAboveHoleTests(unittest.TestCase):
         self.assertEqual(record["event"], "left_above_hole_arrived")
         self.assertEqual(record["travel_mm"] > 0, True)
         self.assertEqual(waiter.call_count, 1)
-        # The stream is created with the requested speed limit and released.
-        kwargs = self.controller.start_left_end_effector_position_stream.call_args.kwargs
-        self.assertAlmostEqual(kwargs["max_translation_velocity_mps"], 0.010)
-        self.stream.stop.assert_called_once()
+        self.assertEqual(waiter.call_args.kwargs['velocity_rad_s'], .2)
+        self.controller.start_left_end_effector_position_stream.assert_not_called()
         self.assertIn("left_above_hole_motion_start", self.log.getvalue())
 
     def test_xyz_offsets_shift_the_target_in_base_link(self):
         actual = CartesianPoseTarget((0.52, 0.07, 0.92), (0, 0, 0, 1))
-        self._run(
+        _, waiter = self._run(
             actual=actual,
             args=make_args(
                 step_tcp_end_mm="0,0,0",
@@ -145,7 +161,7 @@ class LeftAboveHoleTests(unittest.TestCase):
                 hole_z_mm=120.0,
             ),
         )
-        target = self.stream.update_target.call_args.args[0]
+        target = waiter.call_args.args[1]
         self.assertEqual(target.position_m, (0.52, 0.07, 0.92))
 
     def test_horizontal_error_beyond_tolerance_is_rejected(self):
@@ -164,7 +180,7 @@ class LeftAboveHoleTests(unittest.TestCase):
         with self.assertRaises(SafetyError):
             left_grasp_gdk.move_left_above_hole(
                 controller=self.controller, hole_base_m=self.hole,
-                args=make_args(hole_speed_mm_s=0.0), log=self.log,
+                args=make_args(auto_preset_velocity_rad_s=0.0), log=self.log,
             )
         with self.assertRaises(SafetyError):
             left_grasp_gdk.move_left_above_hole(

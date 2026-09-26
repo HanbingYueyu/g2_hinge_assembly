@@ -2279,40 +2279,26 @@ def run_head_coarse_approach_in_process(*, gdk, controller: G2Controller, tf, ar
         controller.prepare_joint_impedance_control(("left",))
         current = controller.read_end_effector_pose(LEFT_VISUAL_TIP_LINK)
         orientation_error_deg = quaternion_angle_deg(current.orientation_xyzw, fixed_orientation)
-        # Do not turn to the approach orientation as a separate,
-        # translation-frozen wrist move.  On a VLM regrasp restart the arm is
-        # already near the tray, so a pure yaw turn there repeatedly hit wrist
-        # joint limits.  Translate and rotate in the same bounded stream so
-        # whole-body IK can spread the rotation over the arm.
+        # Solve the final position and orientation together, then use the
+        # preset joint planner; the intermediate Cartesian path is unconstrained.
         target = gripper_end_target(hinge_base, fixed_orientation, tcp_end_m, args.head_above_mm / 1000.0)
         travel_mm = float(np.linalg.norm(np.asarray(target.position_m) - np.asarray(current.position_m)) * 1000.0)
         if travel_mm > 450.0:
             raise SafetyError(f"当前末端到头部目标直线距离 {travel_mm:.1f} mm，超过 450.0 mm")
+        velocity_rad_s = float(args.preset_velocity_rad_s if args.auto_preset_velocity_rad_s is None
+                               else args.auto_preset_velocity_rad_s)
         start = {"event": "left_above_hinge_motion_start", "travel_mm": round(travel_mm, 2),
                  "orientation_error_deg": round(orientation_error_deg, 2),
-                 "xy_speed_mm_s": args.xy_speed_mm_s,
+                 "control_method": "endpoint_ik_joint_plan", "control_mode": 3,
+                 "velocity_rad_s": velocity_rad_s,
                  "target_end_link_base_m": list(target.position_m), "orientation_xyzw": list(target.orientation_xyzw)}
         print(json.dumps(start, ensure_ascii=False), flush=True)
         json_record(log, start)
-        approach_timeout_s = max(
-            8.0,
-            travel_mm / args.xy_speed_mm_s + orientation_error_deg / 20.0 + 3.0,
-        )
-        stream = controller.start_left_end_effector_position_stream(
-            current, rate_hz=50.0, life_time_s=0.10,
-            max_translation_velocity_mps=args.xy_speed_mm_s / 1000.0,
-            allow_orientation_change=True,
-            max_angular_velocity_rad_s=math.radians(20.0),
-        )
         try:
-            stream.update_target(target)
-            if not stream.wait_until_target(approach_timeout_s):
-                raise SafetyError("左手位姿流未在限定时间内发送到目标")
-            actual = wait_actual_left_target(
-                controller, stream, target, timeout_s=approach_timeout_s, tolerance_m=0.010,
-            )
-        finally:
-            stream.stop()
+            from .left_hole_joint_move import move_left_hole_joint_target
+        except ImportError:
+            from left_hole_joint_move import move_left_hole_joint_target
+        actual = move_left_hole_joint_target(controller, target, velocity_rad_s=velocity_rad_s)
         actual_center = gripper_end_target(np.asarray(actual.position_m), actual.orientation_xyzw, -tcp_end_m, 0.0).position_m
         xy_error_mm = float(np.linalg.norm(np.asarray(actual_center[:2]) - hinge_base[:2]) * 1000.0)
         if xy_error_mm > args.head_xy_tolerance_mm:
@@ -2391,8 +2377,8 @@ def move_left_above_hole(*, controller: G2Controller, hole_base_m, args, log, li
     """Move the left end-link above the head-localized hole with a fixed pose.
 
     The grasped part stays closed in the gripper; only the end-link pose is
-    commanded, so this is a single streamed Cartesian move with measured
-    arrival and a horizontal error check against the hole target.
+    converted to endpoint IK and sent as a planned joint request. The path is
+    not Cartesian-constrained; actual endpoint position and orientation are checked.
     """
     try:
         tcp_end_m = np.asarray([float(value) for value in args.step_tcp_end_mm.split(",")], dtype=float) / 1000.0
@@ -2403,9 +2389,10 @@ def move_left_above_hole(*, controller: G2Controller, hole_base_m, args, log, li
     hole_target = np.asarray(hole_base_m, dtype=float)
     if hole_target.shape != (3,) or not np.isfinite(hole_target).all():
         raise SafetyError(f"hole 目标三维坐标无效：{hole_base_m}")
-    speed_mm_s = float(args.hole_speed_mm_s)
-    if not (math.isfinite(speed_mm_s) and 0.0 < speed_mm_s <= 50.0):
-        raise SafetyError("--hole-speed-mm-s 必须在 (0, 50] mm/s")
+    velocity_rad_s = float(args.preset_velocity_rad_s if args.auto_preset_velocity_rad_s is None
+                           else args.auto_preset_velocity_rad_s)
+    if not math.isfinite(velocity_rad_s) or velocity_rad_s <= 0:
+        raise SafetyError("--auto-preset-velocity-rad-s 必须为正有限值")
     offsets_mm = np.asarray([args.hole_x_mm, args.hole_y_mm, args.hole_z_mm], dtype=float)
     if not np.isfinite(offsets_mm).all():
         raise SafetyError("--hole-x-mm/--hole-y-mm/--hole-z-mm 必须是有限数值")
@@ -2432,6 +2419,8 @@ def move_left_above_hole(*, controller: G2Controller, hole_base_m, args, log, li
         )
     start = {
         "event": "left_above_hole_motion_start", "travel_mm": round(travel_mm, 2),
+        "control_method": "endpoint_ik_joint_plan", "control_mode": 3,
+        "velocity_rad_s": velocity_rad_s,
         "hole_position_base_link_m": [float(value) for value in hole_target],
         "hole_offset_mm": [float(value) for value in offsets_mm],
         "grasp_center_target_base_link_m": [float(value) for value in grasp_center_target],
@@ -2443,27 +2432,11 @@ def move_left_above_hole(*, controller: G2Controller, hole_base_m, args, log, li
     }
     print(json.dumps(start, ensure_ascii=False), flush=True)
     json_record(log, start)
-    hole_rotation_deg_s = float(getattr(args, "hole_rotation_deg_s", 20.0))
-    if not (math.isfinite(hole_rotation_deg_s) and 0.0 < hole_rotation_deg_s <= 28.6):
-        raise SafetyError("--hole-rotation-deg-s 必须在 (0, 28.6] deg/s")
-    stream = controller.start_left_end_effector_position_stream(
-        current, rate_hz=50.0, life_time_s=0.10,
-        max_translation_velocity_mps=speed_mm_s / 1000.0,
-        allow_orientation_change=True,
-        max_angular_velocity_rad_s=math.radians(hole_rotation_deg_s),
-    )
     try:
-        stream.update_target(target)
-        if not stream.wait_until_target(travel_mm / speed_mm_s + 5.0):
-            raise SafetyError("左手到 hole 上方的位姿流未在限定时间内发送到目标")
-        actual = wait_actual_left_target(
-            controller, stream, target,
-            timeout_s=max(5.0, travel_mm / speed_mm_s + 3.0),
-            tolerance_m=0.005,
-            orientation_tolerance_deg=2.0,
-        )
-    finally:
-        stream.stop()
+        from .left_hole_joint_move import move_left_hole_joint_target
+    except ImportError:
+        from left_hole_joint_move import move_left_hole_joint_target
+    actual = move_left_hole_joint_target(controller, target, velocity_rad_s=velocity_rad_s)
     actual_center = gripper_end_target(
         np.asarray(actual.position_m), actual.orientation_xyzw, -tcp_end_m, 0.0,
     ).position_m
