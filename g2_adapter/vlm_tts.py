@@ -14,6 +14,7 @@ _RESULT_FIELDS = {
     "vlm_convex_inserted_result": "decision",
     "vlm_four_screws_result": "latest_decision",
     "vlm_right_fixture_grasp_result": "decision",
+    "vlm_hole_alignment_result": "decision",
 }
 
 _RESULT_PHRASES = {
@@ -44,15 +45,24 @@ _RESULT_PHRASES = {
         "unknown": "暂时无法判断螺丝是否都已打好。",
     },
     "vlm_right_fixture_grasp_result": {
+        "抓住": "右手已经夹住电批了。",
+        "未抓住": "右手还没有夹住电批。",
         "yes": "右手已经夹住电批了。",
         "no": "右手还没有夹住电批。",
         "unknown": "暂时无法判断右手是否夹住电批。",
+    },
+    "vlm_hole_alignment_result": {
+        "无明显大偏差": "铰链安装位置没有明显偏差。",
+        "明显大偏差": "铰链安装位置有明显偏差，请检查。",
+        "unknown": "暂时无法判断铰链是否对齐。",
     },
 }
 
 
 def _result_message(event: dict) -> tuple[tuple[str, str], str] | None:
     event_name = event.get("event")
+    if event_name == "vlm_hole_alignment_result" and not event.get("aggregate"):
+        return None
     spec = _RESULT_FIELDS.get(event_name)
     result = event.get("result")
     if spec is None or not isinstance(result, dict) or event.get("ok") is False:
@@ -91,6 +101,12 @@ class VlmTtsAnnouncer:
 
     def handle_event(self, event: dict) -> bool:
         """Queue a supported semantic result once; warnings are never spoken."""
+        if event.get("event") == "vlm_regrasp_requested":
+            with self._lock:
+                self._spoken_or_queued = {
+                    key for key in self._spoken_or_queued if key[0] != "vlm_gripper_result"
+                }
+            return False
         parsed = _result_message(event)
         if parsed is None:
             return False

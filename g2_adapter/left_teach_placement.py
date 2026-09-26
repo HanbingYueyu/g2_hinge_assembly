@@ -87,6 +87,30 @@ def end_on_takeover(result, robot, label, worker=None):
             worker.allow_advance_right = previous
 
 
+def move_left_to_teach_start(services, args):
+    spec = validate_teach_args(args)
+    robot = _GatedRobot(services.robot, services.gate,
+        automatic_guard=getattr(getattr(services, 'controller', None), 'check_automatic_guard', None))
+    print("正在移动到左手示教起点…", flush=True)
+    if spec.kind == "cartesian_solved":
+        replay_solved_trajectory(services.gdk, robot, spec,
+            speed_scale=args.left_teach_speed_scale,
+            start_velocity_rad_s=args.left_teach_start_velocity_rad_s,
+            max_velocity_rad_s=getattr(args, "teach_max_velocity_rad_s", 1.0),
+            max_acceleration_rad_s2=getattr(args, "teach_max_acceleration_rad_s2", 15.0),
+            start_only=True)
+    else:
+        session = G2TrajectorySession(services.gdk, robot, "left",
+            controller=getattr(services, "controller", None), monotonic_fn=robot.clock, event_sink=print)
+        session.controller.prepare_joint_impedance_control(("left",))
+        session.controller._require_joint_impedance_mode("teach trajectory start")
+        initial = spec.trajectory.samples[0].joint_positions_rad
+        session._plan_to_start(initial, velocity_rad_s=args.left_teach_start_velocity_rad_s)
+        session._wait_for_start(initial)
+    print("左手示教起点已到达。", flush=True)
+    return {"method": "teach_start", "trajectory": str(spec.path)}
+
+
 def replay_left_placement(services, args):
     spec = validate_teach_args(args)
     robot = _GatedRobot(services.robot, services.gate, stop_on_takeover=True,
@@ -107,6 +131,7 @@ def replay_left_placement(services, args):
                 start_velocity_rad_s=args.left_teach_start_velocity_rad_s,
                 max_velocity_rad_s=getattr(args, "teach_max_velocity_rad_s", 1.0),
                 max_acceleration_rad_s2=getattr(args, "teach_max_acceleration_rad_s2", 15.0),
+                move_to_start=False,
             )
             print(f"左手末端示教放置完成：发送 {result['sent']} 个关节目标。", flush=True)
         return result
@@ -121,7 +146,7 @@ def replay_left_placement(services, args):
     )
     result = {"method": "teach", "trajectory": str(spec.path), "speed_scale": args.left_teach_speed_scale}
     with end_on_takeover(result, robot, "左手", getattr(services, "worker", None)):
-        result["sent"] = session.replay(trajectory, speed_scale=args.left_teach_speed_scale, start_velocity_rad_s=args.left_teach_start_velocity_rad_s)
+        result["sent"] = session.replay(trajectory, speed_scale=args.left_teach_speed_scale, start_velocity_rad_s=args.left_teach_start_velocity_rad_s, move_to_start=False)
         session._wait_for_start(trajectory.samples[-1].joint_positions_rad)
         print(f"左手示教放置完成：发送 {result['sent']} 个关节目标。", flush=True)
     return result

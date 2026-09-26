@@ -655,6 +655,16 @@ def stage_left_grasp(ctx: FlowContext) -> dict:
     return {"returncode": code, "hole_detected": "hole" in targets}
 
 
+def stage_left_to_teach_start(ctx: FlowContext) -> dict:
+    if not teach_enabled(ctx.args):
+        return {"skipped": True, "reason": "teach_disabled"}
+    try:
+        from .left_teach_placement import move_left_to_teach_start
+    except ImportError:
+        from left_teach_placement import move_left_to_teach_start
+    return move_left_to_teach_start(ctx.services, ctx.args)
+
+
 def stage_left_to_ll1_and_seat(ctx: FlowContext) -> dict:
     monitor = ctx.services.get('vlm_gripper_monitor')
     try:
@@ -920,6 +930,7 @@ def stage_vlm_assembly_check(ctx: FlowContext) -> dict:
         ctx.runtime.emit_event,
         include_convex=True,
         include_c_hole=False,
+        include_pin=False,
     )
     return {"tasks": [record["task"] for record in records], "ok": all(record["ok"] for record in records)}
 
@@ -928,10 +939,10 @@ def stage_vlm_c_hole_check(ctx: FlowContext) -> dict:
     if not vlm_enabled(ctx.args):
         return {"skipped": True, "reason": "disabled"}
     try:
-        from .vlm_flow_checks import run_c_hole_review
+        from .vlm_flow_checks import run_hole_alignment_review
     except ImportError:
-        from vlm_flow_checks import run_c_hole_review
-    records = run_c_hole_review(
+        from vlm_flow_checks import run_hole_alignment_review
+    records = run_hole_alignment_review(
         ctx.services.web,
         ctx.services.get("vlm_client"),
         ctx.runtime.emit_event,
@@ -1012,12 +1023,24 @@ def stage_right_return(ctx: FlowContext) -> dict:
     events: list[dict] = []
     if teach_enabled(ctx.args):
         try:
-            from .right_hole_motion import lift_right_before_return
+            from .right_hole_motion import lift_right_before_return, move_right_tool_above_hole
         except ImportError:
-            from right_hole_motion import lift_right_before_return
-        print("右手归位前先上抬 30 mm，随后检查四颗螺丝…", flush=True)
+            from right_hole_motion import lift_right_before_return, move_right_tool_above_hole
+        workpiece = ctx.services.get("right_saved_workpiece_pose")
+        hole = (ctx.services.get("head_targets") or {}).get("hole")
+        if workpiece is None or hole is None:
+            raise SafetyError("缺少电批抓取定位或本次 hole 位置；无法移动到螺丝检查点")
+        print("右手先上抬 30 mm，再移动到 hole 偏移点，到位后检查四颗螺丝…", flush=True)
         ctx.runtime.emit_event(lift_right_before_return(
             ctx.services.controller, speed_mm_s=ctx.args.auto_speed_mm_s, distance_mm=30.0,
+        ))
+        ctx.runtime.emit_event(move_right_tool_above_hole(
+            ctx.services.controller, saved, workpiece, hole["position_base_link_m"],
+            x_mm=ctx.args.right_hole_x_mm, y_mm=ctx.args.right_hole_y_mm,
+            z_mm=ctx.args.right_hole_z_mm,
+            yaw_deg=ctx.args.right_hole_yaw_deg, pitch_deg=ctx.args.right_hole_pitch_deg,
+            roll_deg=ctx.args.right_hole_roll_deg, speed_mm_s=ctx.args.auto_speed_mm_s,
+            lift_before_move=False,
         ))
     four_screws = _one_shot_four_screws_check(ctx, phase="before_right_return")
     return_screwdriver(
@@ -1052,6 +1075,7 @@ STAGE_HANDLERS = {
     Stage.VLM_GRIPPER_CHECK: stage_vlm_gripper_check,
     Stage.RIGHT_TO_LR1: stage_right_to_lr1,
     Stage.LEFT_TO_LL1_AND_SEAT: stage_left_to_ll1_and_seat,
+    Stage.LEFT_TO_TEACH_START: stage_left_to_teach_start,
     Stage.LEFT_RELEASE_LIFT_TO_LL2: stage_left_release_lift_to_ll2,
     Stage.VLM_ASSEMBLY_CHECK: stage_vlm_assembly_check,
     Stage.RIGHT_TO_LR2_AND_GRIPPER_CYCLE: stage_right_to_lr2_and_gripper_cycle,

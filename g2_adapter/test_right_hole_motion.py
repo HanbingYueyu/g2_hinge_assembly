@@ -1,4 +1,5 @@
 import unittest
+from unittest.mock import Mock, patch
 
 import numpy as np
 
@@ -9,10 +10,26 @@ from right_hole_motion import (
     end_target_for_tool_axis,
     move_right_via_vertical_clearance,
     right_hole_orientation,
+    move_right_tool_above_hole,
 )
 
 
 class RightHoleTargetTests(unittest.TestCase):
+    def test_observation_move_skips_grasp_lift_and_waits_for_target(self):
+        pose = CartesianPoseTarget((0.4, -0.2, 0.6), (0., 0., 0., 1.))
+        controller = Mock()
+        controller.read_end_effector_pose.return_value = pose
+        stream = controller.start_right_end_effector_position_stream.return_value
+        stream.wait_until_actual_target.return_value = pose
+        with patch('right_hole_motion.lift_after_grasp') as lift, \
+             patch('right_hole_motion.end_target_for_tool_axis', return_value=pose):
+            move_right_tool_above_hole(controller, pose, np.eye(4), [0.4, -0.2, 0.5],
+                x_mm=0, y_mm=60, z_mm=100, yaw_deg=55, pitch_deg=0, roll_deg=0,
+                speed_mm_s=30, lift_before_move=False)
+        lift.assert_not_called()
+        stream.wait_until_actual_target.assert_called_once()
+        stream.stop.assert_called_once()
+
     def test_right_lr2_clearance_goes_up_then_returns_to_original_pose(self):
         current = CartesianPoseTarget((0.4, -0.2, 0.4), (0.0, 0.0, 0.0, 1.0))
         origin = CartesianPoseTarget((0.4, -0.2, 0.6), (0.0, 0.0, 0.0, 1.0))

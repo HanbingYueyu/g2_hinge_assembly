@@ -69,7 +69,7 @@ def console_event_summary(record: dict) -> str | None:
     if event in {
         "vlm_gripper_result", "vlm_pin_result", "vlm_c_hole_result",
         "vlm_convex_inserted_result", "vlm_four_screws_result",
-        "vlm_right_fixture_grasp_result",
+        "vlm_right_fixture_grasp_result", "vlm_hole_alignment_result",
     }:
         result = record.get("result") or {}
         label = {
@@ -79,16 +79,19 @@ def console_event_summary(record: dict) -> str | None:
             "vlm_convex_inserted_result": "凸轴严格",
             "vlm_four_screws_result": "四颗螺丝",
             "vlm_right_fixture_grasp_result": "右手夹具",
+            "vlm_hole_alignment_result": "孔对齐",
         }[event]
         value = result.get("state", result.get("obvious_c_leak"))
         if event == "vlm_convex_inserted_result":
             value = result.get("decision")
         elif event == "vlm_four_screws_result":
             value = result.get("latest_decision")
-        elif event == "vlm_right_fixture_grasp_result":
+        elif event in {"vlm_right_fixture_grasp_result", "vlm_hole_alignment_result"}:
             value = result.get("decision", result.get("latest_decision"))
         stable = f" stable={record['stable_state']}" if 'stable_state' in record else ''
-        review = f" round={record['review_round']}/3" if 'review_round' in record else ''
+        review = f" round={record['review_round']}/{record.get('review_total', 3)}" if 'review_round' in record else ''
+        if record.get('aggregate'):
+            review = ' 多数票'
         timing = ''
         if event == 'vlm_gripper_result':
             timing = f" image_time={record.get('input_status', {}).get('image_time', 'unknown')} elapsed={record.get('elapsed_s', 'unknown')}s"

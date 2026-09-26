@@ -14,6 +14,7 @@ from vlm_flow_checks import (
     run_assembly_review,
     run_c_hole_check,
     run_c_hole_review,
+    run_hole_alignment_review,
     run_convex_insert_check,
     run_four_screws_check,
     run_gripper_check,
@@ -38,6 +39,45 @@ class FakeWeb:
 
 
 class VlmFlowChecksTests(unittest.TestCase):
+    def test_snapshot_rejects_cached_frame_from_before_arrival(self):
+        from vlm_flow_checks import _snapshots
+        from unittest.mock import Mock
+        web = Mock()
+        web.snapshot_raw_pane.side_effect = [
+            (b'before movement', {'raw_age_s': .5}),
+            (b'after arrival', {'raw_age_s': 0.}),
+        ]
+        with patch('vlm_flow_checks.time.monotonic', return_value=10.), \
+             patch('vlm_flow_checks.time.sleep'):
+            frames, _ = _snapshots(web, ('right',), not_before=9.9)
+        self.assertEqual(frames['right'], b'after arrival')
+
+    def test_hole_alignment_uses_five_right_images_and_majority(self):
+        calls, emitted = [], []
+        class Client:
+            def run_bytes(self, task, images):
+                calls.append((task, images))
+                return {'decision': '无明显大偏差' if len(calls) <= 3 else '明显大偏差'}
+        raw = jpeg(1280, 1056)
+        records = run_hole_alignment_review(FakeWeb({'right': raw, 'left': b'wrong camera'}), Client(), emitted.append, sleep=lambda _: None)
+        self.assertEqual(calls, [('hole-alignment', [raw])] * 5)
+        self.assertEqual(len(emitted), 6)
+        self.assertTrue(records[-1]['aggregate'])
+        self.assertEqual(records[-1]['result']['decision'], '无明显大偏差')
+        self.assertEqual(len(list(self.output.rglob('*_crop.jpg'))), 5)
+        self.assertEqual(len(list(self.output.rglob('*_right_vlm_hole_alignment_check_crop.jpg'))), 5)
+
+    def test_strict_only_review_does_not_send_legacy_pin(self):
+        calls = []
+        class Client:
+            def run_bytes(self, task, images):
+                calls.append((task, images))
+                return {'decision': '已插入'}
+        run_assembly_review(FakeWeb({'right': b'right'}), Client(), lambda _: None,
+                            sleep=lambda _: None, include_convex=True,
+                            include_c_hole=False, include_pin=False)
+        self.assertEqual(calls, [('convex-inserted', [b'right'])] * 3)
+
     def test_assembly_review_refreshes_images_three_rounds_without_motion(self):
         from unittest.mock import Mock
         emit = Mock()
@@ -282,15 +322,14 @@ class VlmFlowChecksTests(unittest.TestCase):
             def run_bytes(self, task, images):
                 calls.append((task, images))
                 return {"latest_decision": "unknown"} if task == "four-screws" else {"decision": "unknown"}
-        frames = [jpeg() for _ in range(4)]
+        frames = [jpeg(1280, 1056) for _ in range(4)]
         screws = run_four_screws_check(FakeWeb({"right": frames[-1]}), Client(), frames_override=frames)
         fixture = run_right_fixture_grasp_check(FakeWeb({"right": frames[-1]}), Client(), frames_override=frames)
         self.assertTrue(screws["ok"])
         self.assertTrue(fixture["ok"])
         self.assertEqual(calls[0], ("four-screws", frames))
         self.assertEqual(calls[1][0], "right-fixture-grasp")
-        self.assertEqual(len(calls[1][1]), 1)
-        self.assertNotEqual(calls[1][1][0], frames[0])
+        self.assertEqual(calls[1][1], frames)
 
     def test_keyboard_interrupt_propagates(self):
         class Client:

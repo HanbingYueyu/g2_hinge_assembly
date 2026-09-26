@@ -34,6 +34,7 @@ class Stage(str, Enum):
     LEFT_GRASP = "left_grasp"
     VLM_GRIPPER_CHECK = "vlm_gripper_check"
     RIGHT_TO_LR1 = "right_to_lr1"
+    LEFT_TO_TEACH_START = "left_to_teach_start"
     GATE_LEFT = "gate_left"
     LEFT_TO_LL1_AND_SEAT = "left_to_ll1_and_seat"
     LEFT_RELEASE_LIFT_TO_LL2 = "left_release_lift_to_ll2"
@@ -63,12 +64,13 @@ DEFAULT_PLAN: tuple[StageSpec, ...] = (
     StageSpec(Stage.VLM_GRIPPER_CHECK, "VLM 只读检查左夹爪是否仍夹持铰链", "3"),
     StageSpec(Stage.RIGHT_TO_LR1, "右臂移动到 LR1", "4", camera_pane="right"),
     # Motion-only handlers do not publish frames: keep the raw camera feed live.
-    StageSpec(Stage.LEFT_TO_LL1_AND_SEAT, "左臂移动到 LL1 并力保护下探", "5"),
+    StageSpec(Stage.LEFT_TO_TEACH_START, "左臂移动到示教起点（非示教模式跳过）", "5"),
+    StageSpec(Stage.LEFT_TO_LL1_AND_SEAT, "左臂示教放置回放／LL1 力保护下探", "5"),
     StageSpec(Stage.GATE_LEFT, "等待 SpaceMouse 下一阶段指令（门1）", "5", waits_for_advance=True),
     StageSpec(Stage.LEFT_RELEASE_LIFT_TO_LL2, "张开左爪、上抬 100 mm 并移动到 LL2", "5"),
     StageSpec(Stage.VLM_ASSEMBLY_CHECK, "VLM 只读检查凸轴 B 是否插入", "5"),
     StageSpec(Stage.RIGHT_TO_LR2_AND_GRIPPER_CYCLE, "右臂先到 LR2 上方 50 mm 再下降到 LR2、闭合夹爪保持 1 秒后张开", "6"),
-    StageSpec(Stage.VLM_C_HOLE_CHECK, "VLM 只读检查明显 C 孔外漏", "6"),
+    StageSpec(Stage.VLM_C_HOLE_CHECK, "VLM 右相机孔对齐判别（5次多数票）", "6"),
     StageSpec(Stage.GATE_RIGHT_PRE_GRASP, "等待 SpaceMouse 下一阶段指令（门2，右手抓取电批前）", "6", waits_for_advance=True),
     StageSpec(
         Stage.RIGHT_GRASP,

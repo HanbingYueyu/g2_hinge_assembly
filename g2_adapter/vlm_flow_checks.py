@@ -20,6 +20,7 @@ RESULT_EVENTS = {
     "convex-inserted": "vlm_convex_inserted_result",
     "four-screws": "vlm_four_screws_result",
     "right-fixture-grasp": "vlm_right_fixture_grasp_result",
+    "hole-alignment": "vlm_hole_alignment_result",
 }
 OUTPUT_DIR = Path(__file__).resolve().parents[1] / "outputs" / "vlm"
 _RUN_NAME = None
@@ -114,7 +115,7 @@ def _safe_check(client, task: str, images: list[bytes], statuses: dict, clock=ti
             raise ValueError("invalid convex-inserted VLM decision")
         if task == "four-screws" and result.get("latest_decision") not in {"yes", "no", "unknown", None}:
             raise ValueError("invalid four-screws VLM decision")
-        if task == "right-fixture-grasp" and result.get("decision", result.get("latest_decision")) not in {"yes", "no", "unknown", None}:
+        if task == "right-fixture-grasp" and result.get("decision", result.get("latest_decision")) not in {"抓住", "未抓住", "不确定", "yes", "no", "unknown", None}:
             raise ValueError("invalid right-fixture-grasp VLM decision")
         return {"event": RESULT_EVENTS[task], "task": task, "ok": True, "elapsed_s": round(clock() - started, 3), "input_status": statuses, "result": result}
     except Exception as exc:
@@ -123,16 +124,18 @@ def _safe_check(client, task: str, images: list[bytes], statuses: dict, clock=ti
         return record
 
 
-def _snapshots(web, names: tuple[str, ...]):
+def _snapshots(web, names: tuple[str, ...], *, not_before: float | None = None):
     if web is None:
         raise RuntimeError("Web JPEG cache is disabled")
     deadline = time.monotonic() + 2.0
     while True:
         frames, statuses = {}, {}
         for name in names:
+            sampled_at = time.monotonic()
             frame, status = web.snapshot_raw_pane(name)
             statuses[name] = status
-            if frame and status.get('raw_age_s', 0.0) <= 1.0:
+            age = status.get('raw_age_s', 0.0)
+            if frame and age <= 1.0 and (not_before is None or sampled_at - age >= not_before):
                 frames[name] = bytes(frame)
         if len(frames) == len(names):
             return frames, statuses
@@ -142,14 +145,15 @@ def _snapshots(web, names: tuple[str, ...]):
         time.sleep(.05)
 
 
-def _snapshot_sequence(web, name: str, *, count: int = 4, interval_s: float = .25):
+def _snapshot_sequence(web, name: str, *, count: int = 4, interval_s: float = .25,
+                       not_before: float | None = None):
     """Collect a short original-JPEG sequence without touching processed panes."""
     if count < 1:
         raise ValueError("snapshot sequence count must be positive")
     frames: list[bytes] = []
     statuses: dict = {}
     for index in range(count):
-        current, current_status = _snapshots(web, (name,))
+        current, current_status = _snapshots(web, (name,), not_before=not_before)
         frames.append(bytes(current[name]))
         statuses = current_status
         if index + 1 < count and interval_s > 0:
@@ -259,7 +263,7 @@ def run_four_screws_check(web, client, clock=time.monotonic, *, frames_override=
     """Read-only four-screw check over four fresh original right-camera frames."""
     try:
         if frames_override is None:
-            images, statuses = _snapshot_sequence(web, "right")
+            images, statuses = _snapshot_sequence(web, "right", not_before=time.monotonic())
         else:
             images = [bytes(frame) for frame in frames_override]
             statuses = {"right": {"raw_age_s": 0.0}}
@@ -278,10 +282,10 @@ def run_four_screws_check(web, client, clock=time.monotonic, *, frames_override=
 
 
 def run_right_fixture_grasp_check(web, client, clock=time.monotonic, *, frames_override=None) -> dict:
-    """Read-only V32 right-fixture check over four fresh original frames."""
+    """V47: four original frames spaced 1.5 seconds, contact ROI and V32/V40."""
     try:
         if frames_override is None:
-            images, statuses = _snapshot_sequence(web, "right")
+            images, statuses = _snapshot_sequence(web, "right", interval_s=1.5)
         else:
             images = [bytes(frame) for frame in frames_override]
             statuses = {"right": {"raw_age_s": 0.0}}
@@ -289,7 +293,8 @@ def run_right_fixture_grasp_check(web, client, clock=time.monotonic, *, frames_o
             raise ValueError("right-fixture-grasp VLM check requires four frames")
         if client is None:
             raise RuntimeError("VLM client is unavailable")
-        sequence_board = _fixture_sequence_board_jpeg(images)
+        from vlm_checks.src.migrated_checks import fixture_board
+        sequence_board = fixture_board(images)
     except Exception as exc:
         return _warning("right-fixture-grasp", exc, locals().get("statuses", {}))
     _save_inputs(
@@ -300,17 +305,45 @@ def run_right_fixture_grasp_check(web, client, clock=time.monotonic, *, frames_o
         },
         statuses,
     )
-    return _safe_check(client, "right-fixture-grasp", [sequence_board], statuses, clock)
+    return _safe_check(client, "right-fixture-grasp", images, statuses, clock)
+
+
+def run_hole_alignment_review(web, client, emit, *, sleep=time.sleep):
+    """Five fresh right-camera ROI judgments followed by a conservative majority."""
+    from vlm_checks.src.migrated_checks import alignment_roi, alignment_vote
+    records, results = [], []
+    for index in range(1, 6):
+        if index > 1:
+            sleep(1.)
+        statuses = {}
+        try:
+            frames, statuses = _snapshots(web, ("right",))
+            crop = alignment_roi(frames["right"])
+            _save_inputs("vlm_hole_alignment_check", {"right": frames["right"], "right_crop": crop}, statuses)
+            record = _safe_check(client, "hole-alignment", [frames["right"]], statuses)
+        except Exception as exc:
+            record = _warning("hole-alignment", exc, statuses)
+        record.update(review_round=index, review_total=5)
+        records.append(record)
+        results.append(record.get('result', {'decision': '不确定'}))
+        emit(record)
+    summary = {"event": RESULT_EVENTS['hole-alignment'], "task": 'hole-alignment',
+               "ok": True, "aggregate": True, "result": alignment_vote(results)}
+    emit(summary)
+    return [*records, summary]
 
 
 def run_assembly_review(
     web, client, emit, *, sleep=time.sleep, include_convex: bool = False, include_c_hole: bool = True,
+    include_pin: bool = True,
 ):
     records = []
     for round_index in range(1,4):
         if round_index > 1:
             sleep(1.)
-        for record in run_assembly_checks(web, client, include_c_hole=include_c_hole):
+        legacy = (run_assembly_checks(web, client, include_c_hole=include_c_hole)
+                  if include_pin else ([run_c_hole_check(web, client)] if include_c_hole else []))
+        for record in legacy:
             record = dict(record)
             record['review_round'] = round_index
             records.append(record)

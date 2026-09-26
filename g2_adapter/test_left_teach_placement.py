@@ -57,6 +57,19 @@ class PlacementTests(unittest.TestCase):
         replay.assert_called_once()
         self.assertEqual(result["trajectory_type"], "cartesian_solved")
         self.assertEqual(result["sent"], 7)
+        self.assertFalse(replay.call_args.kwargs['move_to_start'])
+
+    def test_start_stage_dispatches_start_only(self):
+        import left_teach_placement as placement
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'solved.json'
+            self._write_solved(path)
+            args = SimpleNamespace(left_teach_trajectory=path, left_teach_speed_scale=.5,
+                                   left_teach_start_velocity_rad_s=.05)
+            services = SimpleNamespace(gdk=object(), robot=object(), gate=None)
+            with patch('left_teach_placement.replay_solved_trajectory', return_value=0) as replay:
+                placement.move_left_to_teach_start(services, args)
+            self.assertTrue(replay.call_args.kwargs['start_only'])
 
     def test_arrival_wait_excludes_long_spacemouse_pause(self):
         from teach_trajectory_gdk import G2TrajectorySession

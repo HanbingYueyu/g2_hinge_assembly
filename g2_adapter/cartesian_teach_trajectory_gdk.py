@@ -206,6 +206,7 @@ def replay_trajectory(
     max_velocity_rad_s: float = 0.5, max_acceleration_rad_s2: float = 1.0,
     sleep_fn=time.sleep, monotonic_fn=time.monotonic,
     progress_sink: Callable[[str], None] | None = None,
+    move_to_start: bool = True, start_only: bool = False,
 ) -> int:
     ensure_replayable(trajectory, report)
     if not math.isfinite(speed_scale) or speed_scale <= 0.0:
@@ -236,16 +237,21 @@ def replay_trajectory(
     request.joint_names = list(trajectory.joint_names)
     request.joint_positions = list(trajectory.points[0].joint_positions_rad)
     request.joint_velocities = [float(start_velocity_rad_s)] * 7
-    robot.joint_control_request(request)
+    if move_to_start:
+        robot.joint_control_request(request)
     deadline = monotonic_fn() + 30.0
     while True:
         state = _joint_map(robot)
         error = max(abs(state[name]-target) for name, target in zip(trajectory.joint_names, request.joint_positions))
         if error <= 0.03:
             break
+        if not move_to_start:
+            raise RuntimeError("当前关节不在示教起点；请先运行 left_to_teach_start 阶段")
         if monotonic_fn() >= deadline:
             raise RuntimeError("trajectory start was not reached")
         sleep_fn(0.05)
+    if start_only:
+        return 0
     group = 0 if trajectory.side == "left" else 1
     send_deadline = monotonic_fn()
     sent = 0

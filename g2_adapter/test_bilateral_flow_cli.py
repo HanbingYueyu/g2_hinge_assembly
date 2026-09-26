@@ -556,6 +556,29 @@ class DispatchTests(unittest.TestCase):
         self.assertNotIn("final_vlm", result)
         check.assert_not_called()
 
+    def test_screw_check_moves_to_configured_hole_after_lift_before_images(self):
+        context, _ = self.make_context()
+        context.args.teach_enable = True
+        context.services.controller = Mock()
+        context.services.put('right_saved_grasp_pose', 'saved')
+        context.services.put('right_saved_workpiece_pose', 'workpiece')
+        context.services.put('head_targets', {'hole': {'position_base_link_m': [1, 2, 3]}})
+        context.services.put('right_config', {})
+        context.args.right_hole_x_mm = 17
+        calls = []
+        with patch('right_hole_motion.lift_right_before_return', side_effect=lambda *a, **k: calls.append('lift') or {'event': 'lift'}) as lift, \
+             patch('right_hole_motion.move_right_tool_above_hole', side_effect=lambda *a, **k: calls.append('hole') or {'event': 'hole'}) as move, \
+             patch('run_bilateral_flow_gdk._one_shot_four_screws_check', side_effect=lambda *a, **k: calls.append('images') or {}), \
+             patch('right_apriltag_grasp_gdk.return_screwdriver', side_effect=lambda *a, **k: calls.append('return')):
+            flow.stage_right_return(context)
+        self.assertEqual(calls, ['lift', 'hole', 'images', 'return'])
+        self.assertEqual(lift.call_args.kwargs['distance_mm'], 30.)
+        self.assertFalse(move.call_args.kwargs['lift_before_move'])
+        for axis in ('x', 'y', 'z'):
+            self.assertEqual(move.call_args.kwargs[axis + '_mm'], getattr(context.args, 'right_hole_' + axis + '_mm'))
+        for axis in ('yaw', 'pitch', 'roll'):
+            self.assertEqual(move.call_args.kwargs[axis + '_deg'], getattr(context.args, 'right_hole_' + axis + '_deg'))
+
     def test_handler_table_covers_every_non_gate_stage(self):
         expected = {spec.stage for spec in DEFAULT_PLAN if not spec.waits_for_advance}
         self.assertEqual(set(flow.STAGE_HANDLERS), expected)

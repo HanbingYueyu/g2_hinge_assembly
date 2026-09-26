@@ -172,6 +172,7 @@ class G2TrajectorySession:
         *,
         speed_scale: float = 0.2,
         start_velocity_rad_s: float = 0.05,
+        move_to_start: bool = True,
     ) -> int:
         """Move to the recorded start, then slowly replay a selected-arm path."""
         if trajectory.side != self.side or trajectory.joint_names != self.joint_names:
@@ -183,8 +184,11 @@ class G2TrajectorySession:
         self.controller.prepare_joint_impedance_control((self.side,))
         self.controller._require_joint_impedance_mode("teach trajectory replay start")
         initial = trajectory.samples[0].joint_positions_rad
-        self._event_sink(f"正在移动到录制起点（{self.side} 臂）…")
-        self._plan_to_start(initial, velocity_rad_s=start_velocity_rad_s)
+        if move_to_start:
+            self._event_sink(f"正在移动到录制起点（{self.side} 臂）…")
+            self._plan_to_start(initial, velocity_rad_s=start_velocity_rad_s)
+        elif max(abs(a-b) for a, b in zip(self._selected_state(), initial)) > 0.03:
+            raise RuntimeError("当前关节不在示教起点；请先运行 left_to_teach_start 阶段")
         self._wait_for_start(initial)
         stationary_other_arm = self._arm_state()[7:] if self.side == "left" else self._arm_state()[:7]
         targets = iter_smooth_targets(trajectory, rate_hz=REPLAY_RATE_HZ, speed_scale=speed_scale)

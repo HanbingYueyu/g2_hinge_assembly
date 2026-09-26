@@ -223,9 +223,11 @@ def move_right_tool_above_hole(
     pitch_deg: float,
     roll_deg: float,
     speed_mm_s: float,
+    lift_before_move: bool = True,
 ) -> dict:
-    """Lift 100 mm, then move the CAD bit axis to the configured hole offset."""
-    lift = lift_after_grasp(controller, saved_grasp_end, speed_mps=speed_mm_s / 1000.0)
+    """Move to the hole offset, optionally performing the initial grasp lift."""
+    lift = (lift_after_grasp(controller, saved_grasp_end, speed_mps=speed_mm_s / 1000.0)
+            if lift_before_move else None)
     current = controller.read_end_effector_pose("arm_r_end_link")
     orientation = right_hole_orientation(yaw_deg=yaw_deg, pitch_deg=pitch_deg, roll_deg=roll_deg)
     hole = np.asarray(hole_position_base_m, dtype=np.float64)

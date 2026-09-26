@@ -215,6 +215,18 @@ class ReplayTests(unittest.TestCase):
         self.assertEqual(robot.servo, [([0.0] * 7, 0.01, 1, False)])
         self.assertEqual(sent, 1)
 
+        # Split stages: the first sends only a plan; the second only servo targets.
+        robot = Robot()
+        options = dict(speed_scale=1.0, sleep_fn=lambda _: None, monotonic_fn=lambda: 0.0)
+        self.assertEqual(replay_trajectory(SimpleNamespace(JointControlReq=Request), robot,
+            trajectory, report, start_only=True, **options), 0)
+        self.assertEqual(len(robot.plans), 1)
+        self.assertEqual(robot.servo, [])
+        self.assertEqual(replay_trajectory(SimpleNamespace(JointControlReq=Request), robot,
+            trajectory, report, move_to_start=False, **options), 1)
+        self.assertEqual(len(robot.plans), 1)
+        self.assertEqual(len(robot.servo), 1)
+
     def test_live_model_check_rejects_a_wrong_end_link_transform(self):
         root = Path(__file__).resolve().parents[1]
         model = __import__("g2_kinematics").UrdfKinematics(root / "robot_description/G2_t2v2_crsB_omnipicker.urdf")

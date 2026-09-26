@@ -77,6 +77,8 @@ def replay_solved_trajectory(
     start_velocity_rad_s: float,
     max_velocity_rad_s: float = 1.0,
     max_acceleration_rad_s2: float = 15.0,
+    move_to_start: bool = True,
+    start_only: bool = False,
 ) -> int:
     """Replay a solved absolute Cartesian-teach document in position mode."""
     if spec.kind != "cartesian_solved" or spec.report is None:
@@ -91,7 +93,8 @@ def replay_solved_trajectory(
         f"{math.degrees(model_error[1]):.3f}°",
         flush=True,
     )
-    print(f"轨迹已通过离线验证；即将以 {speed_scale:g} 倍速位控回放。", flush=True)
+    if not start_only:
+        print(f"轨迹已通过离线验证；即将以 {speed_scale:g} 倍速位控回放。", flush=True)
     return replay_trajectory(
         gdk,
         robot,
@@ -101,4 +104,6 @@ def replay_solved_trajectory(
         start_velocity_rad_s=start_velocity_rad_s,
         max_velocity_rad_s=max_velocity_rad_s,
         max_acceleration_rad_s2=max_acceleration_rad_s2,
+        move_to_start=move_to_start,
+        start_only=start_only,
     )

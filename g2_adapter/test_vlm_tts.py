@@ -42,6 +42,31 @@ class BlockingInteraction:
 
 
 class VlmTtsTests(unittest.TestCase):
+    def test_regrasp_resets_only_gripper_speech(self):
+        announcer = load_module().VlmTtsAnnouncer(interaction := FakeInteraction())
+        grip = {'event': 'vlm_gripper_result', 'result': {'state': 'attached'}}
+        pin = {'event': 'vlm_convex_inserted_result', 'result': {'decision': '已插入'}}
+        try:
+            self.assertTrue(announcer.handle_event(grip))
+            self.assertTrue(announcer.handle_event(pin))
+            self.assertFalse(announcer.handle_event(grip))
+            announcer.handle_event({'event': 'vlm_regrasp_requested'})
+            self.assertTrue(announcer.handle_event(grip))
+            self.assertFalse(announcer.handle_event(grip))
+            self.assertFalse(announcer.handle_event(pin))
+        finally:
+            announcer.close()
+        self.assertEqual(interaction.messages.count('铰链已经夹稳了。'), 2)
+
+    def test_alignment_speaks_only_the_final_vote_and_v47_speaks_chinese_decision(self):
+        announcer = load_module().VlmTtsAnnouncer(interaction := FakeInteraction())
+        event = {'event': 'vlm_hole_alignment_result', 'ok': True, 'result': {'decision': '明显大偏差'}}
+        self.assertFalse(announcer.handle_event(event))
+        self.assertTrue(announcer.handle_event({**event, 'aggregate': True}))
+        self.assertTrue(announcer.handle_event({'event': 'vlm_right_fixture_grasp_result', 'ok': True, 'result': {'decision': '未抓住'}}))
+        announcer.close()
+        self.assertEqual(interaction.messages, ['铰链安装位置有明显偏差，请检查。', '右手还没有夹住电批。'])
+
     def test_identical_task_result_is_spoken_once_and_changed_result_is_spoken(self):
         module = load_module()
         interaction = FakeInteraction()

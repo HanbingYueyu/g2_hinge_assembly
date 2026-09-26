@@ -20,7 +20,7 @@ import requests
 
 
 ROOT = Path(__file__).resolve().parents[1]
-DEFAULT_API_URL = os.environ.get("VLM_API_URL", "http://192.168.30.12:8000/v1")
+DEFAULT_API_URL = os.environ.get("VLM_API_URL", "http://192.168.30.13:8000/v1")
 DEFAULT_MODEL = os.environ.get("VLM_MODEL", "qwen3-vl-8b-local")
 DEFAULT_ONLINE_API_URL = "https://dashscope.aliyuncs.com/compatible-mode/v1"
 DEFAULT_ONLINE_MODEL = "qwen3.8-flash"
@@ -58,12 +58,31 @@ TASKS = {
         "max_tokens": 1024,
     },
     "right-fixture-grasp": {
-        "prompt": ROOT / "prompts" / "right_fixture_grasp.txt",
+        # Public entry is V47 orchestration; V32/V40 requests are defined below.
+        "prompt": ROOT / "prompts" / "right_fixture_v32.txt",
         "references": [
-            ROOT / "references" / "right_fixture" / "positive_board.jpg",
-            ROOT / "references" / "right_fixture" / "negative_board.jpg",
+            ROOT / "references" / "right_fixture_v47" / "positive.jpg",
+            ROOT / "references" / "right_fixture_v47" / "negative.jpg",
         ],
-        "max_tokens": 1024,
+        "max_tokens": 240,
+    },
+    "fixture-v32": {
+        "prompt": ROOT / "prompts/right_fixture_v32.txt",
+        "references": [ROOT / "references/right_fixture_v47/positive.jpg", ROOT / "references/right_fixture_v47/negative.jpg"],
+        "max_tokens": 240,
+        "labels": ["第1张：已抓住参考板：", "第2张：未抓住参考板：", "第3张：当前时序："],
+    },
+    "fixture-v40": {
+        "prompt": ROOT / "prompts/right_fixture_v40.txt",
+        "references": [ROOT / "references/right_fixture_v47/positive.jpg", ROOT / "references/right_fixture_v47/negative.jpg"],
+        "max_tokens": 260,
+        "labels": ["第1张：已确认抓住的正例板：", "第2张：已确认未抓住的反例板：", "第3张：待判断四宫格，只判右下CURRENT："],
+    },
+    "hole-alignment": {
+        "prompt": ROOT / "prompts/hole_alignment.txt",
+        "references": [ROOT / "references/hole_alignment/positive.jpg", ROOT / "references/hole_alignment/negative.jpg"],
+        "max_tokens": 160,
+        "labels": ["正例教学图：", "负例教学图：", "当前图："],
     },
 }
 
@@ -237,6 +256,26 @@ class VlmClient:
         self.session = requests.Session()
 
     def run_bytes(self, task: str, images: list[bytes]) -> dict[str, Any]:
+        if task not in {"right-fixture-grasp", "hole-alignment"}:
+            return self._request(task, images)
+        try:
+            from .migrated_checks import fixture_board, alignment_roi, fuse_grasp
+        except ImportError:
+            if str(ROOT.parent) not in sys.path:
+                sys.path.insert(0, str(ROOT.parent))
+            from vlm_checks.src.migrated_checks import fixture_board, alignment_roi, fuse_grasp
+        if task == "right-fixture-grasp":
+            board = fixture_board(images)
+            primary = self._request("fixture-v32", [board])
+            verifier = self._request("fixture-v40", [board]) if primary.get("decision") != "yes" else None
+            return fuse_grasp(primary, verifier)
+        if task == "hole-alignment":
+            if len(images) != 1:
+                raise ValueError("hole-alignment requires one original right frame per observation")
+            return self._request(task, [alignment_roi(images[0])])
+        return self._request(task, images)
+
+    def _request(self, task: str, images: list[bytes]) -> dict[str, Any]:
         if task not in TASKS:
             raise ValueError(f"unsupported VLM task: {task}")
         cfg = TASKS[task]
@@ -248,20 +287,43 @@ class VlmClient:
             if self.mode == "online":
                 raise RuntimeError("VLM_ONLINE_API_KEY or DASHSCOPE_API_KEY is missing; check config/vlm.env")
             raise RuntimeError("VLM_LOCAL_API_KEY or VLM_LAN_API_KEY is missing; check config/vlm.env")
+        payload = build_payload(self.model, prompt, urls, max_tokens=cfg.get("max_tokens", 256))
+        if "labels" in cfg:
+            # Match the migration requests for BOTH backend profiles.
+            content = [{"type": "text", "text": prompt}]
+            for label, url in zip(cfg["labels"], urls, strict=True):
+                content.extend([{"type": "text", "text": label},
+                                {"type": "image_url", "image_url": {"url": url}}])
+            payload = {"model": self.model, "messages": [{"role": "user", "content": content}],
+                       "temperature": 0, "max_tokens": cfg["max_tokens"]}
         response = self.session.post(
             self.api_url,
             headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
-            json=build_payload(self.model, prompt, urls, max_tokens=cfg.get("max_tokens", 256)),
+            json=payload,
             timeout=self.timeout_s,
         )
         response.raise_for_status()
-        return parse_json_object(response_text(response.json()))
+        try:
+            result = parse_json_object(response_text(response.json()))
+        except ValueError as exc:
+            if task not in {"fixture-v32", "fixture-v40"}:
+                raise
+            return {"decision": "unknown", "reason": "模型输出无法解析", "error": str(exc)}
+        if task in {"fixture-v32", "fixture-v40"} and result.get("decision") not in {"yes", "no", "unknown"}:
+            result = {**result, "decision": "unknown"}
+        if task == "hole-alignment" and result.get("decision") not in {"无明显大偏差", "明显大偏差", "不确定"}:
+            raise ValueError("invalid hole alignment decision")
+        return result
 
 
 def run_check(
     task: str, images: list[Path], model: str | None, api_url: str | None,
     timeout: float, mode: str = "local",
 ) -> dict[str, Any]:
+    if task in {"right-fixture-grasp", "hole-alignment"}:
+        # main() has already loaded the requested env file; do not load a second profile.
+        client = VlmClient(ROOT / "config/.unused", model, api_url, timeout, mode)
+        return client.run_bytes(task, [path.read_bytes() for path in images])
     model, api_url = resolve_vlm_profile(mode, model, api_url)
     cfg = TASKS[task]
     prompt = cfg["prompt"].read_text(encoding="utf-8")

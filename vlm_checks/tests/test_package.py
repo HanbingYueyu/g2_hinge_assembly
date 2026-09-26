@@ -2,6 +2,12 @@ import importlib.util
 import unittest
 from pathlib import Path
 from unittest.mock import Mock, patch
+import cv2
+import numpy as np
+
+
+def original_frames():
+    return [cv2.imencode('.jpg', np.zeros((1056, 1280, 3), np.uint8))[1].tobytes()] * 4
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -66,17 +72,17 @@ class PackageTests(unittest.TestCase):
         response.raise_for_status.return_value = None
         response.json.side_effect = [
             {"choices": [{"message": {"content": '{"latest_decision":"unknown"}'}, "finish_reason": "stop"}]},
-            {"choices": [{"message": {"content": '{"decision":"unknown"}'}, "finish_reason": "stop"}]},
+            {"choices": [{"message": {"content": '{"decision":"yes"}'}, "finish_reason": "stop"}]},
         ]
         with patch.dict(module.os.environ, {"DASHSCOPE_API_KEY": "test-key"}), patch.object(
             module.requests.Session, "post", return_value=response,
         ) as post:
             client = module.VlmClient(ROOT / "config" / "missing.env", None, None, 10.0)
             client.run_bytes("four-screws", [b"f1", b"f2", b"f3", b"f4"])
-            client.run_bytes("right-fixture-grasp", [b"f1", b"f2", b"f3", b"f4"])
+            client.run_bytes("right-fixture-grasp", original_frames())
 
         budgets = [call.kwargs["json"]["max_tokens"] for call in post.call_args_list]
-        self.assertEqual(budgets, [1024, 1024])
+        self.assertEqual(budgets, [1024, 240])
 
     def test_token_limited_vlm_response_reports_truncation_before_json_decode(self):
         module = load_module()
@@ -186,14 +192,9 @@ class PackageTests(unittest.TestCase):
         response.json.return_value = {
             "choices": [{"message": {"content": '{"decision":"unknown"}'}}],
         }
-        images = [
-            ROOT / "references" / "right_fixture" / "positive_board.jpg",
-            ROOT / "references" / "right_fixture" / "negative_board.jpg",
-            ROOT / "references" / "convex_inserted" / "ref_inserted.jpg",
-            ROOT / "references" / "convex_inserted" / "ref_not_inserted_side.jpg",
-        ]
+        images = [Mock(read_bytes=Mock(return_value=frame)) for frame in original_frames()]
         with patch.dict(module.os.environ, {"VLM_LAN_API_KEY": "lan-secret"}), patch.object(
-            module.requests, "post", return_value=response,
+            module.requests.Session, "post", return_value=response,
         ) as post:
             module.run_check(
                 "right-fixture-grasp", images, "qwen3-vl-8b-local", "http://192.168.30.12:8000/v1", 10.0,
@@ -231,10 +232,10 @@ class PackageTests(unittest.TestCase):
             screws_content = post.call_args.kwargs["json"]["messages"][0]["content"]
             screws_urls = [item for item in screws_content if item["type"] == "image_url"]
             self.assertEqual(len(screws_urls), 4)
-            client.run_bytes("right-fixture-grasp", [b"f1", b"f2", b"f3", b"f4"])
+            client.run_bytes("right-fixture-grasp", original_frames())
             fixture_content = post.call_args.kwargs["json"]["messages"][0]["content"]
             fixture_urls = [item for item in fixture_content if item["type"] == "image_url"]
-            self.assertEqual(len(fixture_urls), 6)
+            self.assertEqual(len(fixture_urls), 3)
 
 
 if __name__ == "__main__":

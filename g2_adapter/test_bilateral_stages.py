@@ -6,7 +6,7 @@ from bilateral_stages import DEFAULT_PLAN, Stage, StageSequencer, stage_names
 class BilateralStagePlanTests(unittest.TestCase):
     def test_plan_covers_the_operator_steps_in_order(self):
         steps = [spec.user_step for spec in DEFAULT_PLAN]
-        self.assertEqual(steps, ["1", "2", "3", "3", "4", "5", "5", "5", "5", "6", "6", "6", "6-7", "8", "8", "9"])
+        self.assertEqual(steps, ["1", "2", "3", "3", "4", "5", "5", "5", "5", "5", "6", "6", "6", "6-7", "8", "8", "9"])
         self.assertEqual(stage_names()[0], "home")
         self.assertEqual(stage_names()[-1], "finish")
 
@@ -18,6 +18,8 @@ class BilateralStagePlanTests(unittest.TestCase):
         order = stage_names()
         self.assertLess(order.index("right_to_lr1"), order.index("gate_left"))
         self.assertLess(order.index("right_to_lr1"), order.index("left_to_ll1_and_seat"))
+        self.assertLess(order.index("right_to_lr1"), order.index("left_to_teach_start"))
+        self.assertLess(order.index("left_to_teach_start"), order.index("left_to_ll1_and_seat"))
         self.assertLess(order.index("left_to_ll1_and_seat"), order.index("gate_left"))
         self.assertLess(order.index("gate_left"), order.index("left_release_lift_to_ll2"))
         self.assertLess(order.index("vlm_assembly_check"), order.index("right_to_lr2_and_gripper_cycle"))
