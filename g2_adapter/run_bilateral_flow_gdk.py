@@ -1424,6 +1424,8 @@ def _drive(ctx: FlowContext, args: argparse.Namespace) -> int:
                 # All left stage streams have unwound/stopped before here.
                 # Replace the previous destination with measured joints;
                 # do not open the gripper while returning to the tray.
+                # Cartesian teach replay may have switched this arm to mode 1.
+                controller.prepare_joint_impedance_control(("left",))
                 current = list(controller.checked_arm_state()[:7])
                 for _ in range(20):
                     controller.hold_joint_positions("left", current)

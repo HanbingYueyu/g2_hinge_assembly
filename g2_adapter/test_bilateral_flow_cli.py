@@ -358,10 +358,15 @@ class DispatchTests(unittest.TestCase):
         context.services.put('vlm_gripper_monitor', monitor)
         sent = []
         context.services.robot = SimpleNamespace(move_arm_joint_servo=lambda *args: sent.append(args))
+        prepared = []
         context.services.controller = SimpleNamespace(
             checked_arm_state=lambda: (0.,)*14,
             _motion_write=nullcontext,
-            hold_joint_positions=lambda side, positions: context.services.robot.move_arm_joint_servo(positions, .01, 0, False),
+            prepare_joint_impedance_control=lambda sides: prepared.append(sides),
+            hold_joint_positions=lambda side, positions: (
+                self.assertEqual(prepared, [("left",)]),
+                context.services.robot.move_arm_joint_servo(positions, .01, 0, False),
+            ),
         )
         visits = []
         failed = [False]
@@ -379,6 +384,7 @@ class DispatchTests(unittest.TestCase):
         self.assertEqual(visits.count(Stage.LEFT_GRASP), 2)
         self.assertEqual(visits.count(Stage.HEAD_LOCALIZE), 1)
         self.assertEqual(len(sent), 20)
+        self.assertEqual(prepared, [("left",)])
         self.assertTrue(all(args == ([0.]*7, .01, 0, False) for args in sent))
         self.assertEqual(runtime.left_gripper_opens, 0)
 
@@ -393,6 +399,7 @@ class DispatchTests(unittest.TestCase):
         context.services.controller = SimpleNamespace(
             checked_arm_state=lambda: (0.,)*14,
             _motion_write=nullcontext,
+            prepare_joint_impedance_control=lambda sides: None,
             hold_joint_positions=lambda side, positions: context.services.robot.move_arm_joint_servo(positions, .01, 0, False),
         )
         visits = []

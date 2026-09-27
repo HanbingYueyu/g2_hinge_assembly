@@ -70,7 +70,7 @@ DEFAULT_PLAN: tuple[StageSpec, ...] = (
     StageSpec(Stage.LEFT_RELEASE_LIFT_TO_LL2, "张开左爪、上抬 100 mm 并移动到 LL2", "5"),
     StageSpec(Stage.VLM_ASSEMBLY_CHECK, "VLM 只读检查凸轴 B 是否插入", "5"),
     StageSpec(Stage.RIGHT_TO_LR2_AND_GRIPPER_CYCLE, "右臂先到 LR2 上方 50 mm 再下降到 LR2、闭合夹爪保持 1 秒后张开", "6"),
-    StageSpec(Stage.VLM_C_HOLE_CHECK, "VLM 右相机孔对齐判别（5次多数票）", "6"),
+    StageSpec(Stage.VLM_C_HOLE_CHECK, "VLM 右相机孔对齐判别（3次多数票）", "6"),
     StageSpec(Stage.GATE_RIGHT_PRE_GRASP, "等待 SpaceMouse 下一阶段指令（门2，右手抓取电批前）", "6", waits_for_advance=True),
     StageSpec(
         Stage.RIGHT_GRASP,

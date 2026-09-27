@@ -98,6 +98,25 @@ class VlmTtsTests(unittest.TestCase):
         self.assertEqual(interaction.messages, ['铰链抓取成功', '铰链脱落，重新抓取',
                                                 '铰链抓取成功', '铰链脱落，重新抓取'])
 
+    def test_regrasp_allows_insertion_announcement_again_at_next_hole_arrival(self):
+        for regrasp in (
+            {'event': 'vlm_regrasp_requested'},
+            {'event': 'left_visual_regrasp_requested', 'regrasp_attempt': 1},
+        ):
+            with self.subTest(regrasp=regrasp['event']):
+                interaction = FakeInteraction()
+                announcer = load_module().VlmTtsAnnouncer(interaction)
+                arrival = {'event': 'left_stage_complete_above_hole'}
+                try:
+                    self.assertTrue(announcer.handle_event(arrival))
+                    self.assertFalse(announcer.handle_event(arrival))
+                    announcer.handle_event(regrasp)
+                    self.assertTrue(announcer.handle_event(arrival))
+                    self.assertFalse(announcer.handle_event(arrival))
+                finally:
+                    announcer.close()
+                self.assertEqual(interaction.messages.count('现在插入铰链'), 2)
+
     def test_semantic_checks_speak_only_final_decisions(self):
         announcer = load_module().VlmTtsAnnouncer(interaction := FakeInteraction())
         self.assertFalse(announcer.handle_event({'event': 'vlm_convex_inserted_result', 'ok': True,

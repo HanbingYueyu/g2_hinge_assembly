@@ -88,6 +88,7 @@ class VlmTtsAnnouncer:
         """Queue a supported semantic result once; warnings are never spoken."""
         if event.get("event") == "vlm_regrasp_requested":
             with self._lock:
+                self._spoken_or_queued.discard(_result_message({"event": "left_stage_complete_above_hole"})[0])
                 loss_already_queued = ("gripper", "lost") in self._spoken_or_queued
                 self._spoken_or_queued = {
                     key for key in self._spoken_or_queued if key[0] != "gripper"
@@ -97,6 +98,7 @@ class VlmTtsAnnouncer:
                     return False
         elif event.get("event") == "left_visual_regrasp_requested":
             with self._lock:
+                self._spoken_or_queued.discard(_result_message({"event": "left_stage_complete_above_hole"})[0])
                 self._spoken_or_queued.discard(("gripper", "attached"))
         parsed = _result_message(event)
         if parsed is None:

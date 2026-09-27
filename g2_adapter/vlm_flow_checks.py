@@ -307,10 +307,10 @@ def run_right_fixture_grasp_check(web, client, clock=time.monotonic, *, frames_o
 
 
 def run_hole_alignment_review(web, client, emit, *, sleep=time.sleep):
-    """Five fresh right-camera ROI judgments followed by a conservative majority."""
+    """Three fresh right-camera ROI judgments followed by a conservative majority."""
     from vlm_checks.src.migrated_checks import alignment_roi, alignment_vote
     records, results = [], []
-    for index in range(1, 6):
+    for index in range(1, 4):
         if index > 1:
             sleep(1.)
         statuses = {}
@@ -321,7 +321,7 @@ def run_hole_alignment_review(web, client, emit, *, sleep=time.sleep):
             record = _safe_check(client, "hole-alignment", [frames["right"]], statuses)
         except Exception as exc:
             record = _warning("hole-alignment", exc, statuses)
-        record.update(review_round=index, review_total=5)
+        record.update(review_round=index, review_total=3)
         records.append(record)
         results.append(record.get('result', {'decision': '不确定'}))
         emit(record)

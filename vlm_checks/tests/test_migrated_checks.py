@@ -37,9 +37,9 @@ class MigratedChecksTests(unittest.TestCase):
         for pair, want in zip(itertools.product(('yes', 'no', 'unknown'), repeat=2), expected):
             self.assertEqual(fuse_grasp({'decision': pair[0]}, {'decision': pair[1]})['decision'], want)
 
-    def test_majority_requires_three_of_five_and_retains_unknowns(self):
-        for values, want in [(['无明显大偏差'] * 3 + ['明显大偏差'] * 2, '无明显大偏差'),
-                             (['无明显大偏差'] * 2 + ['明显大偏差'] * 2 + ['不确定'], '不确定')]:
+    def test_majority_requires_two_of_three_and_retains_unknowns(self):
+        for values, want in [(['无明显大偏差'] * 2 + ['明显大偏差'], '无明显大偏差'),
+                             (['无明显大偏差', '明显大偏差', '不确定'], '不确定')]:
             self.assertEqual(alignment_vote([{'decision': x} for x in values])['decision'], want)
 
     def test_fixed_image_preparation(self):

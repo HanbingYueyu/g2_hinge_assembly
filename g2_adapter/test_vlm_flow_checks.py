@@ -52,20 +52,22 @@ class VlmFlowChecksTests(unittest.TestCase):
             frames, _ = _snapshots(web, ('right',), not_before=9.9)
         self.assertEqual(frames['right'], b'after arrival')
 
-    def test_hole_alignment_uses_five_right_images_and_majority(self):
+    def test_hole_alignment_uses_three_right_images_and_majority(self):
         calls, emitted = [], []
         class Client:
             def run_bytes(self, task, images):
                 calls.append((task, images))
-                return {'decision': '无明显大偏差' if len(calls) <= 3 else '明显大偏差'}
+                return {'decision': '无明显大偏差' if len(calls) <= 2 else '明显大偏差'}
         raw = jpeg(1280, 1056)
         records = run_hole_alignment_review(FakeWeb({'right': raw, 'left': b'wrong camera'}), Client(), emitted.append, sleep=lambda _: None)
-        self.assertEqual(calls, [('hole-alignment', [raw])] * 5)
-        self.assertEqual(len(emitted), 6)
+        self.assertEqual(calls, [('hole-alignment', [raw])] * 3)
+        self.assertEqual(len(emitted), 4)
+        self.assertEqual([record['review_round'] for record in records[:-1]], [1, 2, 3])
+        self.assertTrue(all(record['review_total'] == 3 for record in records[:-1]))
         self.assertTrue(records[-1]['aggregate'])
         self.assertEqual(records[-1]['result']['decision'], '无明显大偏差')
-        self.assertEqual(len(list(self.output.rglob('*_crop.jpg'))), 5)
-        self.assertEqual(len(list(self.output.rglob('*_right_vlm_hole_alignment_check_crop.jpg'))), 5)
+        self.assertEqual(len(list(self.output.rglob('*_crop.jpg'))), 3)
+        self.assertEqual(len(list(self.output.rglob('*_right_vlm_hole_alignment_check_crop.jpg'))), 3)
 
     def test_hole_alignment_does_not_mark_all_failed_calls_as_valid_vote(self):
         records = run_hole_alignment_review(FakeWeb({}), None, lambda _: None,

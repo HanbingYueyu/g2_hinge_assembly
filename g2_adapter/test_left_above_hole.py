@@ -67,11 +67,11 @@ class HeldPartGateTests(unittest.TestCase):
         self.assertEqual(gate_step(monitor, make_observation(valid=False), now=3.0), "lost")
         self.assertIsNotNone(monitor["failure"])
 
-    def test_gate_treats_a_temporary_miss_like_the_p3p4_gate(self):
-        # ``valid=None`` is "fresh frame, locked instance temporarily missing";
-        # the established P3/P4 gate counts it but never treats it as a drop.
+    def test_gate_waits_for_positive_held_target_evidence_after_temporary_miss(self):
+        # A temporary miss is not a drop, but also cannot authorize transport.
         monitor = make_gate_monitor(now=0.0)
-        self.assertEqual(gate_step(monitor, make_observation(valid=None), now=0.5), "proceed")
+        self.assertEqual(gate_step(monitor, make_observation(valid=None), now=0.5), "wait")
+        self.assertEqual(gate_step(monitor, make_observation(valid=True), now=0.6), "proceed")
 
     def test_gate_recovers_after_stale_with_a_fresh_frame(self):
         monitor = make_gate_monitor(now=0.0)

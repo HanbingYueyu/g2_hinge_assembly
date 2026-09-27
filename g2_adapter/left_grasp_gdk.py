@@ -439,7 +439,10 @@ def held_part_gate_step(
             max_area_change_fraction=area_change_fraction,
             check_geometry=check_geometry,
         )
-        monitor["awaiting_fresh_observation"] = False
+        # A fresh frame with valid=None is only a temporary miss, not
+        # affirmative evidence that the hinge is still in the gripper.
+        if observation.get("valid") is True:
+            monitor["awaiting_fresh_observation"] = False
         monitor["paused"] = False
         monitor["stale_since"] = None
         monitor["last_observation_at"] = now
@@ -5157,15 +5160,44 @@ def run_left_cycle(*, services=None, argv=None) -> int:
                                 "depth_stable": depth_stable,
                                 "held_with_gripper": held_with_gripper,
                             }
-                            # A mask geometry change is not a drop decision:
-                            # occlusion by the fingers is expected.  Keep the
-                            # jaw closed and let the explicit post-grasp
-                            # lost-target timeout decide whether to regrasp.
-                            verification["action"] = "continue_closed_until_target_loss_timeout"
+                            verification["action"] = "transport" if held_with_gripper else "regrasp"
                             post_grasp_verify_baseline = None
                             post_grasp_verify_samples.clear()
-                            post_grasp_verified = True
                             record["post_grasp_verify"] = verification
+                            if not held_with_gripper:
+                                assert position_stream is not None and gripper_open is not None and gripper_tolerance is not None
+                                stop_force_descent_sam_preview(force_preview_stop, force_preview_thread)
+                                force_preview_stop = force_preview_thread = None
+                                force_preview_phase = None
+                                if services is not None and services.get('vlm_gripper_monitor') is not None:
+                                    services.get('vlm_gripper_monitor').set_phase('idle')
+                                position_stream, last_end_link_target, recovery = recover_for_visual_regrasp(
+                                    controller, position_stream,
+                                    retract_m=args.regrasp_retract_m,
+                                    translation_speed_mps=parameters.final_descent_speed_mps,
+                                    fixed_orientation_xyzw=last_end_link_target.orientation_xyzw,
+                                    gripper_open_rad=gripper_open,
+                                    gripper_tolerance_rad=gripper_tolerance,
+                                    gripper_timeout_s=gripper_close_timeout,
+                                )
+                                regrasp_attempts += 1
+                                state.reset_for_regrasp()
+                                tracked_center = tracked_depth_m = None
+                                missed_frames = 0
+                                gripper_sent_at = adaptive_hold_target_rad = adaptive_hold_sent_at = None
+                                gripper_position_samples.clear()
+                                active_regrasp_mailbox = None
+                                post_grasp_verified = False
+                                record.update({
+                                    "state": "regrasp_reacquiring",
+                                    "reason": "post_grasp_verify_failed",
+                                    "regrasp_attempt": regrasp_attempts,
+                                    "regrasp_recovery": recovery,
+                                })
+                                json_record(log, record)
+                                print_compact_record(record)
+                                continue
+                            post_grasp_verified = True
                         # Continue observing the same target while the jaw is
                         # closing.  A loss at this point is treated as a
                         # failed attempt, never as permission to transport an

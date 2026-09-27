@@ -73,9 +73,9 @@ def fuse_grasp(primary, verifier):
 
 
 def alignment_vote(results):
-    if len(results) != 5:
-        raise ValueError('Hole alignment majority requires five observations')
+    if len(results) != 3:
+        raise ValueError('Hole alignment majority requires three observations')
     votes = Counter(result.get('decision', '不确定') for result in results)
-    decision = next((value for value in ('无明显大偏差', '明显大偏差') if votes[value] >= 3), '不确定')
+    decision = next((value for value in ('无明显大偏差', '明显大偏差') if votes[value] >= 2), '不确定')
     return dict(decision=decision, votes=dict(votes), observations=results,
-                reason=f'5次判别多数票：{decision}')
+                reason=f'3次判别多数票：{decision}')
