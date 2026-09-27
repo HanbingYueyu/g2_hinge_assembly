@@ -114,6 +114,9 @@ class DianpiController:
         init_fn=IO_InitMultiPin,
         read_fn=IO_ReadMultiPin,
         write_fn=IO_WriteMultiPin,
+        read_input_bits_fn=IO_ReadPin_Bit,
+        read_output_bits_fn=IO_ReadOutputPin_Bit,
+        monitor_all_pins=False,
         sleep_fn=time.sleep,
         monotonic_fn=time.monotonic,
         output_fn=print,
@@ -124,6 +127,9 @@ class DianpiController:
         self._init_fn = init_fn
         self._read_fn = read_fn
         self._write_fn = write_fn
+        self._read_input_bits_fn = read_input_bits_fn
+        self._read_output_bits_fn = read_output_bits_fn
+        self._monitor_all_pins = bool(monitor_all_pins)
         self._sleep_fn = sleep_fn
         self._monotonic_fn = monotonic_fn
         self._output_fn = output_fn
@@ -138,7 +144,7 @@ class DianpiController:
         self._cycle_running = False
         self._stop_event = threading.Event()
         self._input_report_lock = threading.Lock()
-        self._reported_input_states = {PIN_OK: 1, PIN_ERR: 1}
+        self._reported_input_states = {PIN_ERR: None}
         self._read_tx = None
         self._read_rx = None
 
@@ -203,7 +209,11 @@ class DianpiController:
             self._serial_number = serial_number
             self._opened = True
 
-            total_pins = len(OUTPUT_ALL) + len(INPUT_PINS)
+            extra_inputs = (
+                [pin for pin in range(16) if pin not in OUTPUT_ALL and pin not in INPUT_PINS]
+                if self._monitor_all_pins else []
+            )
+            total_pins = len(OUTPUT_ALL) + len(INPUT_PINS) + len(extra_inputs)
             init_tx = (IO_InitMultiPin_TxStruct_t * total_pins)()
             init_rx = (IO_InitMultiPin_RxStruct_t * total_pins)()
             index = 0
@@ -217,7 +227,7 @@ class DianpiController:
                 init_tx[index].Mode = 1
                 init_tx[index].Pull = 2
                 index += 1
-            for pin in INPUT_PINS:
+            for pin in INPUT_PINS + extra_inputs:
                 init_tx[index].Pin = pin
                 init_tx[index].Mode = 0
                 init_tx[index].Pull = 1
@@ -270,13 +280,30 @@ class DianpiController:
                 states[pin] = int(self._read_rx[index].PinState)
             return states
 
+    def read_gpio_levels(self) -> dict[int, int]:
+        """Read P0-P15 levels from the input and output bitmap APIs."""
+        if not self._monitor_all_pins:
+            raise DianpiError("16 路监视需要 monitor_all_pins=True")
+        with self._io_lock:
+            sn = self._require_open()
+            input_bits = c_int()
+            output_bits = c_int()
+            if int(self._read_input_bits_fn(sn, byref(input_bits))) < 0:
+                raise DianpiError("RM1010 输入位图读取失败")
+            if int(self._read_output_bits_fn(sn, byref(output_bits))) < 0:
+                raise DianpiError("RM1010 输出位图读取失败")
+            return {
+                pin: (int(output_bits.value if pin in OUTPUT_ALL else input_bits.value) >> pin) & 1
+                for pin in range(16)
+            }
+
     def _report_inputs(self, states: dict[int, int]) -> None:
         messages = []
         with self._input_report_lock:
-            for pin, label in ((PIN_OK, "OK"), (PIN_ERR, "ERR")):
+            for pin, label in ((PIN_ERR, "ERR"),):
                 current = int(states.get(pin, 1))
                 previous = self._reported_input_states[pin]
-                if previous != 0 and current == 0:
+                if previous == 1 and current == 0:
                     messages.append(f">>> [{label}] 信号收到! <<<")
                 self._reported_input_states[pin] = current
         for message in messages:
@@ -296,7 +323,37 @@ class DianpiController:
             self._report_inputs(states)
             self._sleep_fn(min(0.05, remaining))
 
-    def run_cycle(self) -> None:
+    def _wait_for_current_ok(self, timeout_s: float = 8.0) -> bool:
+        """Ignore latched old OK; accept only stable high followed by stable low."""
+        deadline = self._monotonic_fn() + timeout_s
+        high_since = None
+        low_since = None
+        armed = False
+        while self._monotonic_fn() < deadline:
+            if self._stop_event.is_set():
+                raise DianpiError("电批周期已停止")
+            states = self.read_inputs()
+            if states is None:
+                raise DianpiError("RM1010 输入读取失败")
+            self._report_inputs(states)
+            now = self._monotonic_fn()
+            if states[PIN_OK] == 1:
+                low_since = None
+                if high_since is None:
+                    high_since = now
+                if now - high_since >= 0.1:
+                    armed = True
+            elif not armed:
+                high_since = None
+            else:
+                if low_since is None:
+                    low_since = now
+                if now - low_since >= 0.15:
+                    return True
+            self._sleep_fn(min(0.05, max(0.0, deadline - now)))
+        return False
+
+    def run_cycle(self) -> bool:
         """执行一个完整电批周期；运行中拒绝并发周期。"""
         self._require_open()
         if not self._cycle_lock.acquire(blocking=False):
@@ -314,18 +371,23 @@ class DianpiController:
             self._output_fn("[步骤 2/4] 等待 2 秒...")
             self._wait_and_report(2.0)
 
-            self._output_fn("[步骤 3/4] 电磁阀开启: P8 LOW (10s)")
+            self._output_fn("[步骤 3/4] 电磁阀开启: P8 LOW")
             self._write_pin(PIN_SOLENOID, 0)
-            self._wait_and_report(2.0)
+            self._wait_and_report(1.5)
 
             self._write_pin(PIN_FORWARD, 0)
-            self._output_fn("  [> 正转启动: P0 LOW (8s)")
-            self._wait_and_report(8.0)
+            self._output_fn("  [> 正转启动: P0 LOW，等待本次 OK（最长 8s）")
+            ok = self._wait_for_current_ok()
 
             self._write_pin(PIN_FORWARD, 1)
             self._write_pin(PIN_SOLENOID, 1)
-            self._output_fn("  [> 正转停止 (8s) + 电磁阀关闭 (10s)  ✓")
             completed = True
+            if ok:
+                self._output_fn(">>> [OK] 信号收到! <<<")
+                self._output_fn("  [> 正转停止 + 电磁阀关闭  ✓")
+            else:
+                self._output_fn("[电批超时] 本次正转未检测到有效 OK；已停止正转并关闭电磁阀，继续后续流程")
+            return ok
         finally:
             if not completed:
                 self._restore_cycle_outputs()

@@ -10,10 +10,11 @@ from dianpi_runner import DianpiCycleRunner, DianpiTriggerResult
 
 
 class FakeController:
-    def __init__(self, *, block=False, fail_open=False, fail_cycle=False, input_states=None):
+    def __init__(self, *, block=False, fail_open=False, fail_cycle=False, input_states=None, cycle_result=None):
         self.block = block
         self.fail_open = fail_open
         self.fail_cycle = fail_cycle
+        self.cycle_result = cycle_result
         self.input_states = list(input_states or [])
         self.last_input_state = {3: 1, 4: 1, 10: 1}
         self.open_calls = 0
@@ -38,6 +39,7 @@ class FakeController:
         if self.block:
             self.release.wait(1.0)
         self.cycle_finished.set()
+        return self.cycle_result
 
     def read_inputs(self):
         self.read_calls += 1
@@ -87,6 +89,17 @@ def test_trigger_lazily_opens_and_runs_one_cycle():
     assert controller.cycle_calls == 1
     runner.close()
     assert controller.close_calls == 1
+
+
+def test_timeout_is_reported_without_stopping_runner():
+    events = []
+    runner, controller, _ = make_runner(controller=FakeController(cycle_result=False), events=events)
+    assert runner.trigger() is DianpiTriggerResult.STARTED
+    wait_until(lambda: any(event["event"] == "dianpi_timeout" for event in events))
+    assert not any(event["event"] in ("dianpi_finished", "dianpi_error") for event in events)
+    assert runner.trigger() is DianpiTriggerResult.STARTED
+    wait_until(lambda: controller.cycle_calls == 2)
+    runner.close()
 
 
 def test_trigger_while_running_returns_busy_without_second_cycle():

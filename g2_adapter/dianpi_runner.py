@@ -225,8 +225,8 @@ class DianpiCycleRunner:
         try:
             controller = self._ensure_controller()
             self._emit({"event": "dianpi_started"})
-            controller.run_cycle()
-            self._emit({"event": "dianpi_finished"})
+            result = controller.run_cycle()
+            self._emit({"event": "dianpi_timeout" if result is False else "dianpi_finished"})
         except BaseException as exc:
             with self._lock:
                 self._last_error = exc
