@@ -89,14 +89,15 @@ class GripperMonitor:
                 return None
             state = record.get('result', {}).get('state', 'unknown') if record['ok'] else 'unknown'
             self.votes.append(state)
-            tail = list(self.votes)[-3:]
-            stable = tail[-1] if len(tail) == 3 and len(set(tail)) == 1 else 'unknown'
+            stable = 'unknown'
+            if len(self.votes) == 5:
+                for candidate in ('attached', 'not_attached'):
+                    if self.votes.count(candidate) >= 3:
+                        stable = candidate
             record.update(workflow_phase=phase, stable_state=stable, votes=list(self.votes))
             self.latest = record
-            failure_tail = list(self.votes)[-2:]
-            if phase == 'post_grasp' and len(failure_tail) == 2 and all(v in {'not_attached', 'dropped'} for v in failure_tail):
-                record['stable_state'] = 'failed'
-                self.regrasp_reason = 'VLM 连续两次确认夹持失败'
+            if phase == 'post_grasp' and stable == 'not_attached':
+                self.regrasp_reason = 'VLM 最近五次多数票确认未抓住（至少三票）'
         self.emit(record)
         return record
 

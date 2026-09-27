@@ -28,12 +28,14 @@ class MonitorTests(unittest.TestCase):
         G2Controller.check_automatic_guard(controller)
         self.assertEqual(calls, ['guard'])
 
-    def test_mixed_failure_requests_regrasp_after_two_post_grasp_votes(self):
+    def test_failure_requires_three_of_five_post_grasp_votes(self):
         monitor = GripperMonitor(None, None, lambda record: None)
         monitor.set_phase('post_grasp')
-        with patch('vlm_gripper_monitor._snapshots', return_value=({'left': b'full'}, {})), patch('vlm_gripper_monitor.crop_jpeg', return_value=b'crop'), patch('vlm_gripper_monitor.run_gripper_check', side_effect=[{'ok': True, 'result': {'state': 'dropped'}}, {'ok': True, 'result': {'state': 'not_attached'}}]):
-            monitor.sample()
-            monitor.raise_if_regrasp_requested()
+        results = [{'ok': True, 'result': {'state': s}} for s in ['not_attached','attached','not_attached','unknown','not_attached']]
+        with patch('vlm_gripper_monitor._snapshots', return_value=({'left': b'full'}, {})), patch('vlm_gripper_monitor.run_gripper_check', side_effect=results):
+            for _ in range(4):
+                monitor.sample()
+                monitor.raise_if_regrasp_requested()
             monitor.sample()
             with self.assertRaises(VlmRegraspRequested):
                 monitor.raise_if_regrasp_requested()
@@ -71,6 +73,8 @@ class MonitorTests(unittest.TestCase):
             first = monitor.sample()
             self.assertEqual(first['stable_state'], 'unknown')
             self.assertIsNone(check.call_args.kwargs.get('reference'))
+            monitor.sample()
+            self.assertEqual(monitor.sample()['stable_state'], 'unknown')
             monitor.sample()
             self.assertEqual(monitor.sample()['stable_state'], 'attached')
         monitor.set_phase('pre_grasp')

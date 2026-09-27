@@ -41,8 +41,10 @@ TASKS = {
         ],
     },
     "gripper": {
-        "prompt": ROOT / "prompts" / "gripper_drop.txt",
-        "references": [],
+        "prompt": ROOT / "prompts/left_gripper_v2.txt",
+        "references": [ROOT / "references/left_gripper_v2/positive.jpg", ROOT / "references/left_gripper_v2/negative.jpg"],
+        "labels": ["参考图1，人工真值：已抓住。", "参考图2，人工真值：未抓住。", "当前图，只判断这一张："],
+        "max_tokens": 210,
     },
     "convex-inserted": {
         "prompt": ROOT / "prompts" / "convex_inserted.txt",
@@ -256,6 +258,17 @@ class VlmClient:
         self.session = requests.Session()
 
     def run_bytes(self, task: str, images: list[bytes]) -> dict[str, Any]:
+        if task == 'gripper':
+            if str(ROOT.parent) not in sys.path:
+                sys.path.insert(0, str(ROOT.parent))
+            from vlm_checks.src.migrated_checks import gripper_roi
+            if len(images) != 1:
+                raise ValueError('gripper V2 requires one original left frame')
+            result = self._request(task, [gripper_roi(images[0])])
+            states = {'yes': 'attached', 'no': 'not_attached', 'unknown': 'unknown'}
+            if result.get('decision') not in states:
+                raise ValueError('invalid gripper V2 decision')
+            return {**result, 'state': states[result['decision']]}
         if task not in {"right-fixture-grasp", "hole-alignment"}:
             return self._request(task, images)
         try:
@@ -320,7 +333,7 @@ def run_check(
     task: str, images: list[Path], model: str | None, api_url: str | None,
     timeout: float, mode: str = "local",
 ) -> dict[str, Any]:
-    if task in {"right-fixture-grasp", "hole-alignment"}:
+    if task in {"right-fixture-grasp", "hole-alignment", "gripper"}:
         # main() has already loaded the requested env file; do not load a second profile.
         client = VlmClient(ROOT / "config/.unused", model, api_url, timeout, mode)
         return client.run_bytes(task, [path.read_bytes() for path in images])

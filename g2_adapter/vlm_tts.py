@@ -7,79 +7,64 @@ import threading
 from typing import Callable
 
 
-_RESULT_FIELDS = {
-    "vlm_gripper_result": "state",
-    "vlm_pin_result": "state",
-    "vlm_c_hole_result": "obvious_c_leak",
-    "vlm_convex_inserted_result": "decision",
-    "vlm_four_screws_result": "latest_decision",
-    "vlm_right_fixture_grasp_result": "decision",
-    "vlm_hole_alignment_result": "decision",
-}
-
-_RESULT_PHRASES = {
-    "vlm_gripper_result": {
-        "attached": "铰链已经夹稳了。",
-        "not_attached": "还没有夹住铰链。",
-        "dropped": "铰链掉了，请检查。",
-        "unknown": "暂时无法判断铰链是否夹稳。",
-    },
-    "vlm_pin_result": {
-        "inserted": "凸轴已经插入到位。",
-        "not_inserted": "凸轴还没有插到位。",
-        "unknown": "暂时无法判断凸轴是否插到位。",
-    },
-    "vlm_c_hole_result": {
-        "true": "安装位置的 C 孔还有明显外露。",
-        "false": "安装位置没有看到明显的 C 孔外露。",
-        "unknown": "暂时无法判断 C 孔是否外露。",
-    },
-    "vlm_convex_inserted_result": {
-        "已插入": "凸轴已经插入到位。",
-        "未插入": "凸轴还没有插到位。",
-        "unknown": "暂时无法判断凸轴是否插到位。",
-    },
-    "vlm_four_screws_result": {
-        "yes": "四颗螺丝看起来都已打好。",
-        "no": "还有螺丝没有打好。",
-        "unknown": "暂时无法判断螺丝是否都已打好。",
-    },
-    "vlm_right_fixture_grasp_result": {
-        "抓住": "右手已经夹住电批了。",
-        "未抓住": "右手还没有夹住电批。",
-        "yes": "右手已经夹住电批了。",
-        "no": "右手还没有夹住电批。",
-        "unknown": "暂时无法判断右手是否夹住电批。",
-    },
-    "vlm_hole_alignment_result": {
-        "无明显大偏差": "铰链安装位置没有明显偏差。",
-        "明显大偏差": "铰链安装位置有明显偏差，请检查。",
-        "unknown": "暂时无法判断铰链是否对齐。",
-    },
+_FLOW_PHRASES = {
+    ("stage_start", "home"): "现在开始演示冰箱铰链装配锁附作业流程",
+    ("left_above_hinge_arrived", None): "现在开始抓取铰链",
+    ("left_stage_complete_above_hole", None): "现在插入铰链",
+    ("right_lr2_clearance_arrived", None): "开始对齐铰链螺丝孔",
+    ("right_pr1_premove_arrived", "RR1"): "开始抓取电批",
+    ("dianpi_started", None): "开始打螺丝",
+    ("stage_start", "finish"): "演示完成，回到初始位置",
 }
 
 
 def _result_message(event: dict) -> tuple[tuple[str, str], str] | None:
     event_name = event.get("event")
-    if event_name == "vlm_hole_alignment_result" and not event.get("aggregate"):
+    flow_key = (event_name, event.get("stage") if event_name == "stage_start" else
+                event.get("preset") if event_name == "right_pr1_premove_arrived" else None)
+    if flow_key in _FLOW_PHRASES:
+        return ("flow", str(flow_key)), _FLOW_PHRASES[flow_key]
+    result = event.get("result") or {}
+    if event_name == "vlm_regrasp_requested":
+        return ("gripper", "lost"), "铰链脱落，重新抓取"
+    if event_name == "left_visual_regrasp_requested":
+        return ("visual_regrasp", str(event.get("regrasp_attempt"))), "铰链脱落，重新抓取"
+    if event_name == "vlm_gripper_result":
+        if event.get("workflow_phase") != "post_grasp" or event.get("ok") is False:
+            return None
+        state = event.get("stable_state", result.get("state"))
+        if state == "attached":
+            return ("gripper", "attached"), "铰链抓取成功"
+        if state in {"not_attached", "dropped"}:
+            return ("gripper", "lost"), "铰链脱落，重新抓取"
         return None
-    spec = _RESULT_FIELDS.get(event_name)
-    result = event.get("result")
-    if spec is None or not isinstance(result, dict) or event.get("ok") is False:
+    if event.get("ok") is False:
         return None
-    field = spec
-    if event_name == "vlm_right_fixture_grasp_result" and field not in result:
-        field = "latest_decision"
-    if field not in result:
-        return None
-    raw_value = result[field]
-    normalized = str(raw_value).strip().lower() if isinstance(raw_value, str) else str(raw_value).lower()
-    if normalized in {"unknown", "none", "不确定", ""}:
-        normalized = "unknown"
-    message = _RESULT_PHRASES[event_name].get(normalized)
-    if message is None:
-        return None
-    return (str(event_name), normalized), message
+    if event_name == "vlm_convex_inserted_result" and event.get("aggregate"):
+        decision = result.get("decision")
+        if decision not in {"已插入", "未插入", "不确定"}:
+            return None
+        success = decision == "已插入"
+        return ("pin", str(success)), "铰链成功插入" if success else "铰链疑似未插入"
+    if event_name == "vlm_hole_alignment_result" and event.get("aggregate"):
+        decision = result.get("decision")
+        if decision not in {"无明显大偏差", "明显大偏差", "不确定"}:
+            return None
+        success = decision == "无明显大偏差"
+        return ("hole", str(success)), "铰链螺丝孔已对齐" if success else "铰链螺丝孔疑似未对齐"
+    if event_name == "vlm_right_fixture_grasp_result":
+        decision = result.get("decision", result.get("latest_decision"))
+        if decision not in {"抓住", "未抓住", "不确定", "yes", "no", "unknown"}:
+            return None
+        success = decision in {"抓住", "yes"}
+        return ("fixture", str(success)), "电批抓取成功" if success else "电批疑似抓取失败"
+    if event_name == "vlm_four_screws_result":
+        decision = result.get("latest_decision")
+        if decision not in {"yes", "no", "unknown"}:
+            return None
+        success = decision == "yes"
+        return ("screws", str(success)), "识别到4颗螺丝成功打入" if success else "识别到有螺丝未成功打入"
+    return None
 
 
 class VlmTtsAnnouncer:
@@ -103,15 +88,23 @@ class VlmTtsAnnouncer:
         """Queue a supported semantic result once; warnings are never spoken."""
         if event.get("event") == "vlm_regrasp_requested":
             with self._lock:
+                loss_already_queued = ("gripper", "lost") in self._spoken_or_queued
                 self._spoken_or_queued = {
-                    key for key in self._spoken_or_queued if key[0] != "vlm_gripper_result"
+                    key for key in self._spoken_or_queued if key[0] != "gripper"
                 }
-            return False
+                if loss_already_queued:
+                    self._spoken_or_queued.add(("gripper", "lost"))
+                    return False
+        elif event.get("event") == "left_visual_regrasp_requested":
+            with self._lock:
+                self._spoken_or_queued.discard(("gripper", "attached"))
         parsed = _result_message(event)
         if parsed is None:
             return False
         key, message = parsed
         with self._lock:
+            if key == ("gripper", "attached"):
+                self._spoken_or_queued.discard(("gripper", "lost"))
             if self._closed or key in self._spoken_or_queued:
                 return False
             self._spoken_or_queued.add(key)

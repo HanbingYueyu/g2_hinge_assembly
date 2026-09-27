@@ -67,6 +67,11 @@ class VlmFlowChecksTests(unittest.TestCase):
         self.assertEqual(len(list(self.output.rglob('*_crop.jpg'))), 5)
         self.assertEqual(len(list(self.output.rglob('*_right_vlm_hole_alignment_check_crop.jpg'))), 5)
 
+    def test_hole_alignment_does_not_mark_all_failed_calls_as_valid_vote(self):
+        records = run_hole_alignment_review(FakeWeb({}), None, lambda _: None,
+                                            sleep=lambda _: None)
+        self.assertFalse(records[-1]['ok'])
+
     def test_strict_only_review_does_not_send_legacy_pin(self):
         calls = []
         class Client:
@@ -77,6 +82,27 @@ class VlmFlowChecksTests(unittest.TestCase):
                             sleep=lambda _: None, include_convex=True,
                             include_c_hole=False, include_pin=False)
         self.assertEqual(calls, [('convex-inserted', [b'right'])] * 3)
+
+    def test_strict_convex_review_emits_one_majority_vote_after_three_rounds(self):
+        decisions = iter(['已插入', '未插入', '已插入'])
+        class Client:
+            def run_bytes(self, task, images):
+                return {'decision': next(decisions)}
+        emitted = []
+        run_assembly_review(FakeWeb({'right': b'right'}), Client(), emitted.append,
+                            sleep=lambda _: None, include_convex=True,
+                            include_c_hole=False, include_pin=False)
+        self.assertEqual(len(emitted), 4)
+        self.assertEqual(emitted[-1]['result']['decision'], '已插入')
+        self.assertTrue(emitted[-1]['aggregate'])
+
+    def test_strict_convex_review_does_not_mark_all_failed_calls_as_valid_vote(self):
+        emitted = []
+        run_assembly_review(FakeWeb({'right': b'right'}), None, emitted.append,
+                            sleep=lambda _: None, include_convex=True,
+                            include_c_hole=False, include_pin=False)
+        self.assertFalse(emitted[-1]['ok'])
+        self.assertEqual(emitted[-1]['result']['decision'], '不确定')
 
     def test_assembly_review_refreshes_images_three_rounds_without_motion(self):
         from unittest.mock import Mock
@@ -94,7 +120,7 @@ class VlmFlowChecksTests(unittest.TestCase):
              patch('vlm_flow_checks.run_convex_insert_check', return_value={'task': 'convex-inserted', 'ok': True}) as convex:
             records = run_assembly_review(None, None, emit, sleep=lambda _: None, include_convex=True)
         self.assertEqual(convex.call_count, 3)
-        self.assertEqual([r['task'] for r in records], ['pin', 'c-hole', 'convex-inserted'] * 3)
+        self.assertEqual([r['task'] for r in records], ['pin', 'c-hole', 'convex-inserted'] * 3 + ['convex-inserted'])
 
     def test_assembly_review_can_defer_c_hole_until_after_right_gripper_cycle(self):
         class Client:
@@ -107,7 +133,7 @@ class VlmFlowChecksTests(unittest.TestCase):
                 web, Client(), lambda _record: None, sleep=lambda _: None,
                 include_convex=True, include_c_hole=False,
             )
-        self.assertEqual([record["task"] for record in records], ["pin", "convex-inserted"] * 3)
+        self.assertEqual([record["task"] for record in records], ["pin", "convex-inserted"] * 3 + ["convex-inserted"])
 
     def test_c_hole_check_uses_fresh_left_and_right_original_images(self):
         class Client:
@@ -165,14 +191,16 @@ class VlmFlowChecksTests(unittest.TestCase):
             def run_bytes(self, task, images):
                 sent.extend(images)
                 return {"state": "attached"}
-        run_gripper_check(FakeWeb({"left": jpeg()}), Client(), (80, 120, 560, 480))
+        run_gripper_check(FakeWeb({"left": jpeg(1280,1056)}), Client(), (80, 120, 560, 480))
         files = sorted(self.output.rglob("*.jpg"))
         self.assertEqual(len(files), 2)
         for file in files:
             self.assertRegex(file.name, r"^\d{8}_\d{6}_\d{6}_left_vlm_gripper_check(?:_crop)?\.jpg$")
         full = next(file for file in files if not file.stem.endswith("_crop"))
         crop = next(file for file in files if file.stem.endswith('_crop'))
-        self.assertEqual([full.read_bytes(), crop.read_bytes()], sent)
+        from vlm_checks.src.migrated_checks import gripper_roi
+        self.assertEqual([full.read_bytes()], sent)
+        self.assertEqual(crop.read_bytes(), gripper_roi(full.read_bytes()))
 
     def test_assembly_saves_shared_frames_once_even_on_api_failure(self):
         class Client:
@@ -194,7 +222,7 @@ class VlmFlowChecksTests(unittest.TestCase):
                 return {"state": "attached"}
         with patch("vlm_flow_checks.OUTPUT_DIR", blocker):
             with self.assertWarnsRegex(RuntimeWarning, "VLM.*保存"):
-                record = run_gripper_check(FakeWeb({"left": jpeg()}), Client(), (80, 120, 560, 480))
+                record = run_gripper_check(FakeWeb({"left": jpeg(1280,1056)}), Client(), (80, 120, 560, 480))
         self.assertTrue(record["ok"])
 
     def test_crop_parser_and_jpeg_crop(self):
@@ -221,15 +249,15 @@ class VlmFlowChecksTests(unittest.TestCase):
     def test_gripper_uses_original_full_then_crop_then_historical_reference(self):
         calls = []
         client = type("Client", (), {"run_bytes": lambda _s, task, images: calls.append((task, images)) or {"state": "attached", "confidence": .9}})()
-        record = run_gripper_check(FakeWeb({"left": jpeg()}), client, (80, 120, 560, 480), reference=b'historical')
+        record = run_gripper_check(FakeWeb({"left": jpeg(1280,1056)}), client, (80, 120, 560, 480), reference=b'historical')
         self.assertTrue(record["ok"])
         self.assertEqual(calls[0][0], "gripper")
-        self.assertEqual(calls[0][1], [jpeg(), crop_jpeg(jpeg(), (80,120,560,480)), b'historical'])
+        self.assertEqual(calls[0][1], [jpeg(1280,1056)])
 
     def test_overlay_never_replaces_original_vlm_input(self):
         from bilateral_web import BilateralWeb
         web = BilateralWeb()
-        web.publish_raw_pane('left', jpeg(), {})
+        web.publish_raw_pane('left', jpeg(1280,1056), {})
         web.update_pane('left', b'annotated', {})
         sent = []
         class Client:
@@ -238,9 +266,9 @@ class VlmFlowChecksTests(unittest.TestCase):
                 return {'state': 'attached'}
         record = run_gripper_check(web, Client(), None)
         self.assertTrue(record['ok'])
-        self.assertEqual(sent, [jpeg(), crop_jpeg(jpeg(), None)])
+        self.assertEqual(sent, [jpeg(1280,1056)])
         self.assertEqual(web.snapshot_pane('left')[0], b'annotated')
-        self.assertEqual(next(self.output.rglob('*_check.jpg')).read_bytes(), jpeg())
+        self.assertEqual(next(self.output.rglob('*_check.jpg')).read_bytes(), jpeg(1280,1056))
 
     def test_raw_http_handler_serves_original_and_rejects_stale_frame(self):
         from bilateral_web import BilateralWeb
@@ -336,7 +364,7 @@ class VlmFlowChecksTests(unittest.TestCase):
             def run_bytes(self, task, images):
                 raise KeyboardInterrupt
         with self.assertRaises(KeyboardInterrupt):
-            run_gripper_check(FakeWeb({"left": jpeg()}), Client(), (80, 120, 560, 480))
+            run_gripper_check(FakeWeb({"left": jpeg(1280,1056)}), Client(), (80, 120, 560, 480))
 
 
 if __name__ == "__main__":

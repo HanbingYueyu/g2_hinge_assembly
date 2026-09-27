@@ -76,9 +76,9 @@ def acquire_frames(names, web_url):
 def run_task(task, frames, source, client, crop):
     statuses = {name: {"state": f"live_{source}"} for name in frames}
     if task == "gripper":
-        crop_box = parse_crop_xyxy(crop) if isinstance(crop, str) else crop
-        images = [frames['left'], crop_jpeg(frames['left'], crop_box)]
-        _save_inputs("vlm_gripper_check", {'left': images[0], 'left_crop': images[1]}, statuses)
+        from vlm_checks.src.migrated_checks import gripper_roi
+        images = [frames['left']]
+        _save_inputs("vlm_gripper_check", {'left': images[0], 'left_crop': gripper_roi(images[0])}, statuses)
     else:
         _save_inputs("vlm_assembly_check", frames, statuses)
         order = ("right", "left", "head") if task == "pin" else ("left", "right")
@@ -95,7 +95,7 @@ def main():
     parser.add_argument("--model", default=None, help="覆盖所选 VLM 配置档模型")
     parser.add_argument("--api-url", default=None, help="覆盖所选 VLM 配置档 API 地址")
     parser.add_argument("--timeout", type=float, default=60)
-    parser.add_argument("--gripper-crop", default=None, help="可选像素框；默认居中保留高度60%、宽度40%")
+    parser.add_argument("--gripper-crop", default=None, help="旧兼容参数；V2 使用固定裁剪")
     args = parser.parse_args()
     start_vlm_run()
     sys.path.insert(0, str(ROOT))

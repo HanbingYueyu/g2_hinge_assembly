@@ -32,6 +32,16 @@ def alignment_roi(data):
     return result.stdout
 
 
+def gripper_roi(data):
+    """Exact left-gripper V2 FFmpeg crop from the 20260927 package."""
+    decode_original(data)
+    return subprocess.run([
+        'ffmpeg', '-hide_banner', '-loglevel', 'error', '-i', 'pipe:0',
+        '-frames:v', '1', '-vf', 'crop=760:760:260:40,scale=900:900:flags=lanczos',
+        '-q:v', '2', '-f', 'image2pipe', '-vcodec', 'mjpeg', 'pipe:1',
+    ], input=data, capture_output=True, check=True, timeout=15).stdout
+
+
 def fixture_board(images, interval_s=1.5):
     if len(images) != 4:
         raise ValueError('V47 requires four chronological original right frames')

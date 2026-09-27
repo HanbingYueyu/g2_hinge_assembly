@@ -47,15 +47,30 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 class JsonLineSuppressingStream:
     """Pass human-readable child output through while hiding JSON event lines."""
 
-    def __init__(self, destination) -> None:
+    def __init__(self, destination, event_sink=None) -> None:
         self.destination = destination
+        self.event_sink = event_sink
         self._buffer = ""
 
     def write(self, text: str) -> int:
         self._buffer += str(text)
         while "\n" in self._buffer:
             line, self._buffer = self._buffer.split("\n", 1)
-            if not line.lstrip().startswith("{"):
+            if line.lstrip().startswith("{"):
+                if self.event_sink is not None:
+                    try:
+                        record = json.loads(line)
+                    except (ValueError, TypeError):
+                        record = None
+                    if isinstance(record, dict) and record.get("event") in {
+                        "left_above_hinge_arrived", "left_stage_complete_above_hole",
+                        "right_pr1_premove_arrived",
+                    }:
+                        self.event_sink(record)
+                    elif isinstance(record, dict) and record.get("state") == "regrasp_reacquiring":
+                        self.event_sink({"event": "left_visual_regrasp_requested",
+                                         "regrasp_attempt": record.get("regrasp_attempt")})
+            else:
                 self.destination.write(line + "\n")
         return len(text)
 
@@ -67,8 +82,8 @@ class JsonLineSuppressingStream:
 
 
 @contextlib.contextmanager
-def concise_child_stdout():
-    stream = JsonLineSuppressingStream(sys.stdout)
+def concise_child_stdout(event_sink=None):
+    stream = JsonLineSuppressingStream(sys.stdout, event_sink=event_sink)
     try:
         with contextlib.redirect_stdout(stream):
             yield
@@ -291,7 +306,7 @@ def parse_args(argv=None) -> argparse.Namespace:
         help="覆盖所选 VLM 配置档的 API URL；不指定时从对应配置读取。",
     )
     parser.add_argument("--vlm-timeout-s", type=float, default=60.0)
-    parser.add_argument("--vlm-gripper-crop", default=None, help="可选像素框 x0,y0,x1,y1；默认居中保留高度60%%、宽度40%%")
+    parser.add_argument("--vlm-gripper-crop", default=None, help="旧参数，仅保留兼容；V2 固定使用 x260,y40,w760,h760 裁剪")
     parser.add_argument("--auto-speed-mm-s", type=float, default=10.0)
     parser.add_argument("--auto-preset-velocity-rad-s", type=float, default=0.08)
     parser.add_argument("--left-seat-max-descent-mm", type=float, default=10.0,
@@ -328,6 +343,10 @@ def vlm_enabled(args: argparse.Namespace) -> bool:
     return bool(getattr(args, "vlm_enable", False)) and not bool(
         getattr(args, "disable_vlm_checks", False)
     )
+
+
+def should_start_tts(args: argparse.Namespace) -> bool:
+    return bool(args.tts_enable)
 
 
 def should_release_gdk(tts_announcer) -> bool:
@@ -646,12 +665,14 @@ def stage_left_grasp(ctx: FlowContext) -> dict:
     # A missing hole is handled inside the left stage: warn, grasp, lift, then
     # hold and wait for the next stage command instead of moving to the hole.
     targets = ctx.services.get("head_targets") or {}
-    with concise_child_stdout():
+    with concise_child_stdout(event_sink=ctx.runtime.emit_event):
         code = run_left_cycle(services=ctx.services, argv=ctx.settings.left_argv())
     if monitor is not None:
         monitor.raise_if_regrasp_requested()
     if code != 0:
         raise SafetyError(f"左手抓取阶段返回 {code}")
+    if "hole" in targets:
+        ctx.runtime.emit_event({"event": "left_stage_complete_above_hole"})
     return {"returncode": code, "hole_detected": "hole" in targets}
 
 
@@ -792,6 +813,7 @@ def stage_right_to_lr2_and_gripper_cycle(ctx: FlowContext) -> dict:
         speed_mm_s=ctx.args.auto_speed_mm_s,
     )
     ctx.runtime.emit_event(clearance)
+    ctx.runtime.emit_event({"event": "right_lr2_clearance_arrived", "preset": "LR2"})
     close_target = float(gripper.get("closed_rad", 0.0))
     open_target = float(gripper.get("open_rad", -0.785))
     # Closing against a workpiece is expected to stop before the empty-tool
@@ -955,7 +977,7 @@ def stage_right_grasp(ctx: FlowContext) -> dict:
         from .right_apriltag_grasp_gdk import run_right_grasp_stage
     except ImportError:
         from right_apriltag_grasp_gdk import run_right_grasp_stage
-    with concise_child_stdout():
+    with concise_child_stdout(event_sink=ctx.runtime.emit_event):
         code = run_right_grasp_stage(services=ctx.services, argv=ctx.settings.right_argv())
     # The child no longer reads/publishes camera frames after returning.
     # Restore the raw feed now, not after the subsequent transport and replay.
@@ -1149,9 +1171,7 @@ def run_flow(args: argparse.Namespace) -> int:
             if tts_announcer is not None:
                 tts_announcer.handle_event(record)
 
-        if args.tts_enable and not vlm_enabled(args):
-            flow_event_sink({"event": "tts_warning", "error": "VLM 未启用，当前没有可播报的判别结果。"})
-        elif args.tts_enable:
+        if should_start_tts(args):
             try:
                 try:
                     from .vlm_tts import VlmTtsAnnouncer

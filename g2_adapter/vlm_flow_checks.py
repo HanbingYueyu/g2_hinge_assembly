@@ -197,16 +197,14 @@ def run_gripper_check(web, client, crop_xyxy=None, clock=time.monotonic, *, refe
         frames, statuses = frames_override if frames_override is not None else _snapshots(web, ("left",))
         if client is None:
             raise RuntimeError("VLM client is unavailable")
-        images = [frames["left"], crop_jpeg(frames['left'], crop_xyxy)]
+        from vlm_checks.src.migrated_checks import gripper_roi
+        crop = gripper_roi(frames['left'])
+        images = [frames["left"]]
         age = statuses.get('left', {}).get('raw_age_s', 0.)
         statuses['image_time'] = datetime.fromtimestamp(time.time() - age).astimezone().isoformat(timespec='milliseconds')
-        if reference is not None:
-            images.append(reference)
     except Exception as exc:
         return _warning("gripper", exc, locals().get("statuses", {}))
-    saved = {'left': images[0], 'left_crop': images[1]}
-    if reference is not None:
-        saved['left_reference'] = reference
+    saved = {'left': images[0], 'left_crop': crop}
     _save_inputs("vlm_gripper_check", saved, statuses)
     return _safe_check(client, "gripper", images, statuses, clock)
 
@@ -328,7 +326,8 @@ def run_hole_alignment_review(web, client, emit, *, sleep=time.sleep):
         results.append(record.get('result', {'decision': '不确定'}))
         emit(record)
     summary = {"event": RESULT_EVENTS['hole-alignment'], "task": 'hole-alignment',
-               "ok": True, "aggregate": True, "result": alignment_vote(results)}
+               "ok": any(record.get('ok') for record in records),
+               "aggregate": True, "result": alignment_vote(results)}
     emit(summary)
     return [*records, summary]
 
@@ -338,6 +337,7 @@ def run_assembly_review(
     include_pin: bool = True,
 ):
     records = []
+    convex_votes = []
     for round_index in range(1,4):
         if round_index > 1:
             sleep(1.)
@@ -353,6 +353,15 @@ def run_assembly_review(
             record['review_round'] = round_index
             records.append(record)
             emit(record)
+            convex_votes.append(record.get('result', {}).get('decision') if record.get('ok') else None)
+    if include_convex:
+        decision = ('已插入' if convex_votes.count('已插入') >= 2 else
+                    '未插入' if convex_votes.count('未插入') >= 2 else '不确定')
+        summary = {'event': RESULT_EVENTS['convex-inserted'], 'task': 'convex-inserted',
+                   'ok': any(vote is not None for vote in convex_votes),
+                   'aggregate': True, 'result': {'decision': decision}}
+        records.append(summary)
+        emit(summary)
     return records
 
 
