@@ -1278,7 +1278,7 @@ def open_left_gripper_with_feedback(
         stream.stop()
 
 
-def lift_before_visual_reacquire(controller, *, speed_mm_s):
+def lift_before_visual_reacquire(controller, *, speed_mm_s, regrasp_attempt=None):
     """Dedicated retry retreat; no gripper command or XY translation."""
     current = measured_left_end_link_pose(controller)
     target = CartesianPoseTarget(
@@ -1296,6 +1296,9 @@ def lift_before_visual_reacquire(controller, *, speed_mm_s):
     finally:
         stream.stop()
     print('[视觉重抓] 已竖直上抬 30 mm，继续重新定位夹取。', flush=True)
+    if regrasp_attempt is not None:
+        print(json.dumps({"event": "left_visual_regrasp_requested",
+                          "regrasp_attempt": regrasp_attempt}, ensure_ascii=False), flush=True)
 
 
 def recover_for_visual_regrasp(
@@ -3468,7 +3471,8 @@ def run_left_cycle(*, services=None, argv=None) -> int:
                         assert gripper_open is not None and gripper_tolerance is not None and gripper_close_timeout is not None
                         if services is not None and services.get('vlm_gripper_monitor') is not None:
                             services.get('vlm_gripper_monitor').set_phase('idle')
-                        lift_before_visual_reacquire(controller, speed_mm_s=args.xy_speed_mm_s)
+                        lift_before_visual_reacquire(controller, speed_mm_s=args.xy_speed_mm_s,
+                                                     regrasp_attempt=regrasp_attempts + 1)
                         post_grasp_regrasp_open_stream = controller.start_left_gripper_position_stream(gripper_open)
                         post_grasp_regrasp_open = {
                             "reason": (
@@ -3641,7 +3645,8 @@ def run_left_cycle(*, services=None, argv=None) -> int:
                         if position_stream is not None:
                             position_stream.stop()
                             position_stream = None
-                        lift_before_visual_reacquire(controller, speed_mm_s=args.xy_speed_mm_s)
+                        lift_before_visual_reacquire(controller, speed_mm_s=args.xy_speed_mm_s,
+                                                     regrasp_attempt=regrasp_attempts + 1)
                         post_grasp_regrasp_open_stream = controller.start_left_gripper_position_stream(gripper_open)
                         post_grasp_regrasp_open = {
                             "reason": "held_target_lost_after_timeout_before_hole_move",
@@ -3776,7 +3781,8 @@ def run_left_cycle(*, services=None, argv=None) -> int:
                             if position_stream is not None:
                                 position_stream.stop()
                                 position_stream = None
-                            lift_before_visual_reacquire(controller, speed_mm_s=args.xy_speed_mm_s)
+                            lift_before_visual_reacquire(controller, speed_mm_s=args.xy_speed_mm_s,
+                                                         regrasp_attempt=regrasp_attempts + 1)
                             post_grasp_regrasp_open_stream = controller.start_left_gripper_position_stream(gripper_open)
                             post_grasp_regrasp_open = {
                                 "reason": "held_target_lost_after_timeout_before_p4",

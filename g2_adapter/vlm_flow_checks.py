@@ -280,10 +280,10 @@ def run_four_screws_check(web, client, clock=time.monotonic, *, frames_override=
 
 
 def run_right_fixture_grasp_check(web, client, clock=time.monotonic, *, frames_override=None) -> dict:
-    """V47: four original frames spaced 1.5 seconds, contact ROI and V32/V40."""
+    """V47: four original frames spaced 0.25 seconds, contact ROI and V32/V40."""
     try:
         if frames_override is None:
-            images, statuses = _snapshot_sequence(web, "right", interval_s=1.5)
+            images, statuses = _snapshot_sequence(web, "right", interval_s=0.25)
         else:
             images = [bytes(frame) for frame in frames_override]
             statuses = {"right": {"raw_age_s": 0.0}}

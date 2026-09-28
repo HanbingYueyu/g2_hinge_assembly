@@ -361,6 +361,20 @@ class VlmFlowChecksTests(unittest.TestCase):
         self.assertEqual(calls[1][0], "right-fixture-grasp")
         self.assertEqual(calls[1][1], frames)
 
+    def test_right_fixture_frames_are_sampled_quarter_second_apart(self):
+        from vlm_flow_checks import _snapshot_sequence
+        class Client:
+            def run_bytes(self, task, images):
+                return {"decision": "不确定"}
+        raw = jpeg(1280, 1056)
+        with patch('vlm_flow_checks._snapshot_sequence', wraps=_snapshot_sequence) as snapshot, \
+             patch('vlm_flow_checks.time.sleep') as sleep:
+            record = run_right_fixture_grasp_check(FakeWeb({'right': raw}), Client())
+        self.assertTrue(record['ok'])
+        snapshot.assert_called_once_with(unittest.mock.ANY, 'right', interval_s=.25)
+        self.assertEqual(sleep.call_count, 3)
+        self.assertEqual([call.args[0] for call in sleep.call_args_list], [.25] * 3)
+
     def test_keyboard_interrupt_propagates(self):
         class Client:
             def run_bytes(self, task, images):

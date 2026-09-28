@@ -9,7 +9,7 @@
 - `references/convex_inserted/`：凸轴完全插入方案的三张严格参考图，`convex-inserted` 请求自动发送后再发送一张右相机原图。
 - `references/right_fixture_v47/`：20260923 V47 包的正/负参考板；`right-fixture-grasp` 先调用 V32，仅在非 yes 时调用 V40，同为 no 才输出“未抓住”，复核 yes 输出“抓住”，其他冲突输出“不确定”。保留两次原始结果。提示词取原程序 PROMPT 原文；V32 文本副本末尾的迁移提醒不追加到实际请求。
 - `references/hole_alignment/`：保留 20260923 孔对齐稳定版的正/负双图。当前按现场要求改用右相机 1280×1056 原图，裁剪 x=400,y=200,w=500,h=400，通过 FFmpeg Lanczos 缩放到 900×713。发送顺序为正例、负例、当前 ROI；temperature=0，max_tokens=160。该 ROI 已用保存的右相机图核对，但 LR2 动作后的取景仍需实机核验；原包左视角参考图在右视角下的精度尚未验证。
-- 右手 V47 按原程序 `fixture_roi → contact_roi → grid` 生成 2040×1710 四宫格，V32/V40 的 max_tokens 分别为 240/260。原包提示词写“6秒”，但程序实际是每 1.5 秒一帧、四帧跨度 4.5 秒；本项目遵循程序间隔。运行环境需 OpenCV、NumPy、requests 和 ffmpeg。
+- 右手 V47 按 `fixture_roi → contact_roi → grid` 生成 2040×1710 四宫格，V32/V40 的 max_tokens 分别为 240/260。现按现场要求每 0.25 秒取一帧、四帧跨度 0.75 秒；四宫格时间标签和 V32 提示词同步使用新间隔。运行环境需 OpenCV、NumPy、requests 和 ffmpeg。
 - `prompts/four_screws.txt`：四颗螺丝 V4 保守遮挡判别提示词；该任务不使用静态参考图，只发送四张连续右相机原图。
 - `references/review_all/`：完整人工核对卡，供人回看；不把所有卡片塞进每次请求，也不把它们当作夹爪成功参考。
 - `docs/verified_results.json`：原包八段现场标签；不代表当前相机和实时任务的准确率。
@@ -86,7 +86,7 @@ bash vlm_checks/run.sh right-fixture-grasp \
 # 改为 --vlm-mode online 测试在线 API
 ```
 
-该历史目录只有 3 张孔位图；历史取图间隔不能代替现场轮间 1 秒的实时取图验证。右手历史 4 帧是 0.25 秒间隔，测试标签按实际间隔显示，不能作为 4.5 秒时序的完整回归。
+该历史目录只有 3 张孔位图；历史取图间隔不能代替现场轮间 1 秒的实时取图验证。右手历史 4 帧是 0.25 秒间隔，可用于当前取图间隔的离线回归，但不能替代实机抓取验证。
 
 VLM 只调用独立的线程安全原图缓存，不读取页面叠加图、不暂停页面、不直接读取 GDK 相机。缓存无新鲜原图时短暂等待，仍不可用则输出警告，不以叠加图替代。主流程通过 `--vlm-enable` 显式启用，未指定时跳过全部 VLM 检查。
 

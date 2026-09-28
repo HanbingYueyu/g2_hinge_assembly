@@ -42,7 +42,7 @@ def gripper_roi(data):
     ], input=data, capture_output=True, check=True, timeout=15).stdout
 
 
-def fixture_board(images, interval_s=1.5):
+def fixture_board(images, interval_s=0.25):
     if len(images) != 4:
         raise ValueError('V47 requires four chronological original right frames')
     tiles = []

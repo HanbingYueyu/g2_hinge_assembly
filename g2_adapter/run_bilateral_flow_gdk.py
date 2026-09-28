@@ -64,7 +64,7 @@ class JsonLineSuppressingStream:
                         record = None
                     if isinstance(record, dict) and record.get("event") in {
                         "left_above_hinge_arrived", "left_stage_complete_above_hole",
-                        "right_pr1_premove_arrived",
+                        "right_pr1_premove_arrived", "left_visual_regrasp_requested",
                     }:
                         self.event_sink(record)
                     elif isinstance(record, dict) and record.get("state") == "regrasp_reacquiring":

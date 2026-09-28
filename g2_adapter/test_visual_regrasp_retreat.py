@@ -1,4 +1,7 @@
 import unittest
+import contextlib
+import io
+import json
 from unittest.mock import patch
 from types import SimpleNamespace
 
@@ -7,6 +10,17 @@ from left_grasp_gdk import recover_for_visual_regrasp, lift_before_visual_reacqu
 
 
 class VisualRetryTests(unittest.TestCase):
+    def test_completed_visual_reacquire_lift_emits_numbered_tts_event(self):
+        origin = CartesianPoseTarget((.2, .1, .3), (0., 0., 0., 1.))
+        stream = SimpleNamespace(update_target=lambda target: None, stop=lambda: None)
+        controller = SimpleNamespace(start_left_end_effector_position_stream=lambda *args, **kwargs: stream)
+        output = io.StringIO()
+        with patch('left_grasp_gdk.measured_left_end_link_pose', return_value=origin), \
+             patch('left_grasp_gdk.wait_actual_left_target'), contextlib.redirect_stdout(output):
+            lift_before_visual_reacquire(controller, speed_mm_s=30., regrasp_attempt=2)
+        records = [json.loads(line) for line in output.getvalue().splitlines() if line.startswith('{')]
+        self.assertEqual(records, [{'event': 'left_visual_regrasp_requested', 'regrasp_attempt': 2}])
+
     def test_streamed_reacquire_lift_is_vertical_and_failure_stops_stream(self):
         origin = CartesianPoseTarget((.2,.1,.3), (0.,0.,0.,1.))
         targets, stopped = [], []

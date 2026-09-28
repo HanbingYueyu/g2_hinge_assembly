@@ -37,10 +37,13 @@ class OrchestratorCliTests(unittest.TestCase):
         stream.write('{"event":"left_stage_complete_above_hole"}\n')
         stream.write('{"event":"right_pr1_premove_arrived","preset":"RR1"}\n')
         stream.write('{"event":"frame","state":"regrasp_reacquiring","regrasp_attempt":1}\n')
+        stream.write('{"event":"left_visual_regrasp_requested","regrasp_attempt":2}\n')
         stream.write('operator text\n')
         self.assertEqual([event['event'] for event in events], [
             'left_above_hinge_arrived', 'left_stage_complete_above_hole',
-            'right_pr1_premove_arrived', 'left_visual_regrasp_requested'])
+            'right_pr1_premove_arrived', 'left_visual_regrasp_requested',
+            'left_visual_regrasp_requested'])
+        self.assertEqual(events[-1]['regrasp_attempt'], 2)
         self.assertEqual(output.getvalue(), 'operator text\n')
     def test_features_are_explicitly_disabled_by_default(self):
         args = flow.parse_args([])
