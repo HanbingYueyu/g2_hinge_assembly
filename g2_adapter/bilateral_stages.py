@@ -10,8 +10,7 @@ Step mapping (operator spec):
 
 1. open both grippers, move both arms to ``workflow_home``
 2. head YOLO + depth: leftmost hinge (class 0) and highest-confidence hole (class 1)
-3. left arm above hinge (yaw 0 / pitch 42 / roll 180) -> visual grasp -> lift 150 mm
-   -> above hole (yaw 20 / pitch 42 / roll 180)
+3. left arm above hinge -> visual grasp -> lift 150 mm; then move above hole
 4. right arm to ``LR1``
 5. left arm to ``LL1`` -> force-guarded descent -> SpaceMouse gate 1 -> release
    -> lift 100 mm -> ``LL2``
@@ -32,6 +31,7 @@ class Stage(str, Enum):
     HOME = "home"
     HEAD_LOCALIZE = "head_localize"
     LEFT_GRASP = "left_grasp"
+    LEFT_TO_HOLE_OFFSET = "left_to_hole_offset"
     VLM_GRIPPER_CHECK = "vlm_gripper_check"
     RIGHT_TO_LR1 = "right_to_lr1"
     LEFT_TO_TEACH_START = "left_to_teach_start"
@@ -60,7 +60,8 @@ class StageSpec:
 DEFAULT_PLAN: tuple[StageSpec, ...] = (
     StageSpec(Stage.HOME, "张开左右夹爪并回到 workflow_home", "1"),
     StageSpec(Stage.HEAD_LOCALIZE, "头部定位最左 hinge 与最高置信度 hole", "2", camera_pane="head"),
-    StageSpec(Stage.LEFT_GRASP, "左臂到铰链上方→视觉伺服抓取→上抬 150 mm→到 hole XYZ 偏移位置", "3", camera_pane="left"),
+    StageSpec(Stage.LEFT_GRASP, "左臂到铰链上方→视觉伺服抓取→上抬 150 mm", "3", camera_pane="left"),
+    StageSpec(Stage.LEFT_TO_HOLE_OFFSET, "左臂保持夹持并移动到 hole XYZ 偏移位置", "3"),
     StageSpec(Stage.VLM_GRIPPER_CHECK, "VLM 只读检查左夹爪是否仍夹持铰链", "3"),
     StageSpec(Stage.RIGHT_TO_LR1, "右臂移动到 LR1", "4", camera_pane="right"),
     # Motion-only handlers do not publish frames: keep the raw camera feed live.

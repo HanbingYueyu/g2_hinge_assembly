@@ -238,9 +238,10 @@ class StageArgvTests(unittest.TestCase):
     def setUp(self) -> None:
         self.settings = flow.StageSettings(args=flow.parse_args([]))
 
-    def test_left_argv_requests_the_hole_move_and_skips_the_duplicate_home(self):
+    def test_left_argv_defers_the_hole_move_and_skips_the_duplicate_home(self):
         argv = self.settings.left_argv()
         self.assertIn("--move-above-hole", argv)
+        self.assertIn("--defer-hole-move", argv)
         self.assertIn("--skip-workflow-home", argv)
         self.assertIn("--full-cycle", argv)
         self.assertIn("--head-coarse-approach", argv)
@@ -628,6 +629,26 @@ class DispatchTests(unittest.TestCase):
         ), self.assertRaises(SafetyError):
             flow.stage_right_grasp(context)
 
+    def test_grasp_and_hole_transport_are_separate_stages(self):
+        context, runtime = self.make_context()
+        context.services.controller = object()
+        context.services.put('head_targets', {
+            'hinge': {'position_base_link_m': [0.4, 0.1, 0.8]},
+            'hole': {'position_base_link_m': [0.5, 0.2, 0.8]},
+        })
+        with tempfile.TemporaryDirectory() as directory:
+            context.args.log = Path(directory) / 'left.jsonl'
+            with patch.object(left_grasp_gdk, 'run_left_cycle', return_value=0), \
+                 patch.object(left_grasp_gdk, 'move_left_above_hole', return_value={'event': 'left_above_hole_arrived'}) as move:
+                flow.stage_left_grasp(context)
+                move.assert_not_called()
+                self.assertFalse(any(event == 'left_stage_complete_above_hole' for event, _ in runtime.events))
+                flow.stage_left_to_hole_offset(context)
+        move.assert_called_once()
+        self.assertEqual(move.call_args.kwargs['hole_base_m'], [0.5, 0.2, 0.8])
+        self.assertEqual(move.call_args.kwargs['args'].hole_y_mm, context.args.left_hole_y_mm)
+        self.assertTrue(any(event == 'left_stage_complete_above_hole' for event, _ in runtime.events))
+
     def test_right_grasp_transports_tool_axis_to_head_hole_instead_of_rr2(self):
         from control import CartesianPoseTarget
         import numpy as np
@@ -784,7 +805,7 @@ class DispatchTests(unittest.TestCase):
             code = flow._drive(context, flow.parse_args(["--through-stage", "right_to_lr1"]))
         self.assertEqual(code, 0)
         completed = [fields["stage"] for event, fields in runtime.events if event == "stage_complete"]
-        self.assertEqual(completed, ["home", "head_localize", "left_grasp", "vlm_gripper_check", "right_to_lr1"])
+        self.assertEqual(completed, ["home", "head_localize", "left_grasp", "left_to_hole_offset", "vlm_gripper_check", "right_to_lr1"])
         events = [event for event, _fields in runtime.events]
         self.assertIn("bilateral_flow_stopped_at_stage", events)
         self.assertNotIn("bilateral_flow_complete", events)

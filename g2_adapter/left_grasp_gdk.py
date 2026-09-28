@@ -820,6 +820,8 @@ def parse_args(argv=None) -> argparse.Namespace:
         action="store_true",
         help="分阶段流程使用：调用方已完成双臂归位，本阶段不再重复执行 workflow_home。",
     )
+    parser.add_argument("--defer-hole-move", action="store_true",
+                        help="分阶段流程：抓取和上抬确认后结束，hole 偏移点移动由下一阶段执行。")
     parser.add_argument(
         "--head-coarse-approach",
         action="store_true",
@@ -2367,7 +2369,7 @@ def head_context_from_targets(targets: dict) -> dict:
     }
 
 
-def hole_finalize_plan(hole_base_m) -> tuple[str, str]:
+def hole_finalize_plan(hole_base_m, *, defer_move: bool = False) -> tuple[str, str]:
     """Decide how the left stage ends after the held-part gate.
 
     The only difference between a localized hole and a missing one is the final
@@ -2376,6 +2378,8 @@ def hole_finalize_plan(hole_base_m) -> tuple[str, str]:
     """
     if hole_base_m is None:
         return "skip_hole_move", "left_stage_complete_without_hole_move"
+    if defer_move:
+        return "defer_hole_move", "left_grasp_ready_for_hole_move"
     return "move_to_hole", "left_stage_complete_above_hole"
 
 
@@ -3666,7 +3670,7 @@ def run_left_cycle(*, services=None, argv=None) -> int:
                         continue
                     if gate == "proceed":
                         hole_base = monitor["hole_base_m"]
-                        action, complete_event = hole_finalize_plan(hole_base)
+                        action, complete_event = hole_finalize_plan(hole_base, defer_move=args.defer_hole_move)
                         json_record(log, {
                             "event": "post_grasp_hole_verified",
                             "utc": datetime.now(timezone.utc).isoformat(),
@@ -3679,6 +3683,15 @@ def run_left_cycle(*, services=None, argv=None) -> int:
                             "nonblocking": True,
                         })
                         post_grasp_hole_monitor = None
+                        if action == "defer_hole_move":
+                            json_record(log, {
+                                "event": complete_event,
+                                "utc": datetime.now(timezone.utc).isoformat(),
+                                "hole_position_base_link_m": [float(value) for value in hole_base],
+                                "gripper": "preserved_closed",
+                            })
+                            print("左手抓取和上抬已确认；保持夹持，下一阶段移动到 hole 偏移点。", flush=True)
+                            return 0
                         if action == "skip_hole_move":
                             json_record(log, {
                                 "event": complete_event,

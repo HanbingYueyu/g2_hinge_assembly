@@ -272,6 +272,11 @@ class HoleFinalizePlanTests(unittest.TestCase):
         self.assertEqual(action, "move_to_hole")
         self.assertEqual(event, "left_stage_complete_above_hole")
 
+    def test_staged_grasp_finishes_before_hole_transfer(self):
+        action, event = left_grasp_gdk.hole_finalize_plan([0.5, 0.1, 0.8], defer_move=True)
+        self.assertEqual(action, "defer_hole_move")
+        self.assertEqual(event, "left_grasp_ready_for_hole_move")
+
     def test_a_missing_hole_only_skips_the_move(self):
         for missing in (None,):
             with self.subTest(hole=missing):

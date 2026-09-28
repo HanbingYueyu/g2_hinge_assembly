@@ -124,6 +124,7 @@ class StageSettings:
             "--yolo-center-fraction", str(args.yolo_center_fraction),
             "--post-grasp-target-lost-timeout-s", str(args.post_grasp_target_lost_timeout_s),
             "--move-above-hole",
+            "--defer-hole-move",
             "--hole-x-mm", str(args.left_hole_x_mm),
             "--hole-y-mm", str(args.left_hole_y_mm),
             "--hole-z-mm", str(args.left_hole_z_mm),
@@ -671,9 +672,35 @@ def stage_left_grasp(ctx: FlowContext) -> dict:
         monitor.raise_if_regrasp_requested()
     if code != 0:
         raise SafetyError(f"左手抓取阶段返回 {code}")
-    if "hole" in targets:
-        ctx.runtime.emit_event({"event": "left_stage_complete_above_hole"})
     return {"returncode": code, "hole_detected": "hole" in targets}
+
+
+def stage_left_to_hole_offset(ctx: FlowContext) -> dict:
+    monitor = ctx.services.get('vlm_gripper_monitor')
+    if monitor is not None:
+        monitor.raise_if_regrasp_requested()
+    hole = (ctx.services.get("head_targets") or {}).get("hole")
+    if hole is None:
+        return {"skipped": True, "reason": "head_hole_missing"}
+    try:
+        from .left_grasp_gdk import move_left_above_hole, parse_args as parse_left_args
+    except ImportError:
+        from left_grasp_gdk import move_left_above_hole, parse_args as parse_left_args
+    left_args = parse_left_args(ctx.settings.left_argv())
+    log_path = left_args.log or PROJECT_ROOT / "logs" / f"left_hole_offset_{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}.jsonl"
+    log_path = Path(log_path).expanduser().resolve()
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    with log_path.open("a", encoding="utf-8") as log:
+        arrived = move_left_above_hole(
+            controller=ctx.services.controller,
+            hole_base_m=hole["position_base_link_m"],
+            args=left_args,
+            log=log,
+        )
+    if monitor is not None:
+        monitor.raise_if_regrasp_requested()
+    ctx.runtime.emit_event({"event": "left_stage_complete_above_hole"})
+    return {"hole_detected": True, "arrival": arrived["event"]}
 
 
 def stage_left_to_teach_start(ctx: FlowContext) -> dict:
@@ -1094,6 +1121,7 @@ STAGE_HANDLERS = {
     Stage.HOME: stage_home,
     Stage.HEAD_LOCALIZE: stage_head_localize,
     Stage.LEFT_GRASP: stage_left_grasp,
+    Stage.LEFT_TO_HOLE_OFFSET: stage_left_to_hole_offset,
     Stage.VLM_GRIPPER_CHECK: stage_vlm_gripper_check,
     Stage.RIGHT_TO_LR1: stage_right_to_lr1,
     Stage.LEFT_TO_LL1_AND_SEAT: stage_left_to_ll1_and_seat,

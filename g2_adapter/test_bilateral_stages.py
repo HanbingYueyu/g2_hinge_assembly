@@ -6,7 +6,7 @@ from bilateral_stages import DEFAULT_PLAN, Stage, StageSequencer, stage_names
 class BilateralStagePlanTests(unittest.TestCase):
     def test_plan_covers_the_operator_steps_in_order(self):
         steps = [spec.user_step for spec in DEFAULT_PLAN]
-        self.assertEqual(steps, ["1", "2", "3", "3", "4", "5", "5", "5", "5", "5", "6", "6", "6", "6-7", "8", "8", "9"])
+        self.assertEqual(steps, ["1", "2", "3", "3", "3", "4", "5", "5", "5", "5", "5", "6", "6", "6", "6-7", "8", "8", "9"])
         self.assertEqual(stage_names()[0], "home")
         self.assertEqual(stage_names()[-1], "finish")
 
@@ -16,6 +16,8 @@ class BilateralStagePlanTests(unittest.TestCase):
 
     def test_ll1_and_force_descent_precede_gate_then_release_lift_and_ll2(self):
         order = stage_names()
+        self.assertEqual(order[order.index("left_grasp") + 1], "left_to_hole_offset")
+        self.assertLess(order.index("left_to_hole_offset"), order.index("vlm_gripper_check"))
         self.assertLess(order.index("right_to_lr1"), order.index("gate_left"))
         self.assertLess(order.index("right_to_lr1"), order.index("left_to_ll1_and_seat"))
         self.assertLess(order.index("right_to_lr1"), order.index("left_to_teach_start"))
