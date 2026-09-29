@@ -11,6 +11,7 @@ try:
         CartesianTrajectory,
         cartesian_document,
         load_joint_document,
+        resample_cartesian_trajectory,
     )
     from .cartesian_trajectory_optimizer import optimize_cartesian_trajectory
     from .optimize_cartesian_teach_trajectory import main
@@ -21,6 +22,7 @@ except ImportError:
         CartesianTrajectory,
         cartesian_document,
         load_joint_document,
+        resample_cartesian_trajectory,
     )
     from cartesian_trajectory_optimizer import optimize_cartesian_trajectory
     from optimize_cartesian_teach_trajectory import main
@@ -79,6 +81,49 @@ class CartesianOptimizationTests(unittest.TestCase):
 
         self.assertEqual(len(result.samples), 3)
         self.assertEqual(result.samples[1].position_m, samples[1].position_m)
+
+    def test_smoothing_keeps_a_stationary_start_from_jumping_forward(self):
+        samples = tuple(
+            CartesianSample(
+                index * 10_000_000,
+                (max(0, index - 30) * 0.001, 0.0, 0.0),
+                (0.0, 0.0, 0.0, 1.0), (0.0,) * 7,
+            )
+            for index in range(131)
+        )
+        optimized, _ = optimize_cartesian_trajectory(self._trajectory(samples))
+        replay_samples = resample_cartesian_trajectory(optimized, rate_hz=100.0).samples
+        self.assertLess(replay_samples[1].position_m[0], 0.0005)
+        self.assertEqual(replay_samples[0].position_m, samples[0].position_m)
+        self.assertEqual(replay_samples[-1].position_m, samples[-1].position_m)
+
+    def test_optimized_path_avoids_a_tiny_final_100hz_replay_interval(self):
+        samples = (
+            CartesianSample(0, (0.0, 0.0, 0.0), (0.0, 0.0, 0.0, 1.0), (0.0,) * 7),
+            CartesianSample(1_000_030_000, (0.1, 0.0, 0.0), (0.0, 0.0, 0.0, 1.0), (0.1,) * 7),
+        )
+        optimized, _ = optimize_cartesian_trajectory(self._trajectory(samples))
+        replay_samples = resample_cartesian_trajectory(optimized, rate_hz=100.0).samples
+        intervals = [after.t_ns - before.t_ns for before, after in zip(replay_samples, replay_samples[1:])]
+        self.assertGreaterEqual(min(intervals), 5_000_000)
+        self.assertEqual(optimized.samples[-1].position_m, samples[-1].position_m)
+
+    def test_smooths_100hz_back_and_forth_motion_while_preserving_endpoints(self):
+        samples = tuple(
+            CartesianSample(
+                index * 10_000_000,
+                (index * 0.0005 + (0.002 if index % 2 else -0.002)
+                 if 0 < index < 200 else index * 0.0005, 0.0, 0.0),
+                (0.0, 0.0, 0.0, 1.0), (0.0,) * 7,
+            )
+            for index in range(201)
+        )
+        result, _ = optimize_cartesian_trajectory(self._trajectory(samples))
+        positions = [sample.position_m[0] for sample in result.samples]
+        distance = sum(abs(after - before) for before, after in zip(positions, positions[1:]))
+        self.assertEqual(result.samples[0].position_m, samples[0].position_m)
+        self.assertEqual(result.samples[-1].position_m, samples[-1].position_m)
+        self.assertLess(distance, 0.12)
 
     def test_repairs_an_isolated_large_position_spike_before_simplifying(self):
         samples = tuple(

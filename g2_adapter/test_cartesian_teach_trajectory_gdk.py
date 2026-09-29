@@ -3,6 +3,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
 from cartesian_teach import (
     CartesianSample,
@@ -328,6 +329,40 @@ class ReplayTests(unittest.TestCase):
         )
 
         self.assertEqual(progress, [f"回放点进度：{value}%" for value in range(0, 101, 10)])
+
+
+class RecordOptimizeTests(unittest.TestCase):
+    def test_record_optimize_saves_raw_and_releases_gdk_before_offline_optimization(self):
+        names = tuple(f"idx2{i}_arm_l_joint{i}" for i in range(1, 8))
+        trajectory = CartesianTrajectory(
+            "left", "base_link", "arm_l_end_link", names,
+            {name: 0.0 for name in BODY_JOINT_NAMES},
+            (CartesianSample(0, (0.4, 0.2, 0.8), (0.0, 0.0, 0.0, 1.0), (0.0,) * 7),),
+        )
+        events = []
+        gdk = SimpleNamespace(gdk_release=lambda: events.append("released"))
+        with tempfile.TemporaryDirectory() as directory:
+            raw = Path(directory) / "left_raw.json"
+            solved = Path(directory) / "left_solved.json"
+
+            def optimize(argv):
+                self.assertTrue(raw.exists())
+                self.assertEqual(events, ["released"])
+                self.assertEqual(argv[argv.index("--input") + 1], str(raw))
+                self.assertEqual(argv[argv.index("--output") + 1], str(solved))
+                self.assertEqual(argv[argv.index("--max-acceleration-rad-s2") + 1], "20.0")
+                return 0
+
+            with patch("cartesian_teach_trajectory_gdk._open_gdk", return_value=(gdk, object())), \
+                 patch("cartesian_teach_trajectory_gdk.record_trajectory", return_value=trajectory), \
+                 patch("optimize_cartesian_teach_trajectory.main", side_effect=optimize):
+                code = main([
+                    "record-optimize", "--side", "left", "--raw-output", str(raw),
+                    "--output", str(solved), "--max-acceleration-rad-s2", "20.0",
+                    "--allow-motion",
+                ])
+            self.assertEqual(code, 0)
+            self.assertEqual(events, ["released"])
 
 
 class OfflineCliTests(unittest.TestCase):

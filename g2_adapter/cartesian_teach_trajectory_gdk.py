@@ -320,6 +320,28 @@ def _parser() -> argparse.ArgumentParser:
     record.add_argument("--leading-motion-deg", type=float, default=0.5,
                         help="保留首个明显移动点之前的姿态；默认旋转超过0.5度")
     record.add_argument("--allow-motion", action="store_true", help="确认允许切换到 control_mode=1；录制不发送运动目标")
+    combined = commands.add_parser("record-optimize", help="录制并保存原始末端轨迹，随后离线优化和整轨 IK")
+    combined.add_argument("--side", choices=("left", "right"), required=True)
+    combined.add_argument("--raw-output", type=Path, required=True)
+    combined.add_argument("--output", type=Path, required=True, help="优化后的 *_cartesian_solved.json")
+    combined.add_argument("--rate-hz", type=float, default=100.0)
+    combined.add_argument("--duration-s", type=float)
+    combined.add_argument("--urdf", type=Path, default=DEFAULT_URDF)
+    combined.add_argument("--leading-motion-mm", type=float, default=0.5)
+    combined.add_argument("--leading-motion-deg", type=float, default=0.5)
+    combined.add_argument("--allow-motion", action="store_true")
+    combined.add_argument("--position-tolerance-mm", type=float, default=1.0)
+    combined.add_argument("--orientation-tolerance-deg", type=float, default=1.0)
+    combined.add_argument("--jitter-position-mm", type=float, default=2.0)
+    combined.add_argument("--jitter-orientation-deg", type=float, default=1.0)
+    combined.add_argument("--outlier-position-mm", type=float, default=8.0)
+    combined.add_argument("--outlier-orientation-deg", type=float, default=5.0)
+    combined.add_argument("--pause-position-mm", type=float, default=0.01)
+    combined.add_argument("--pause-orientation-deg", type=float, default=0.01)
+    combined.add_argument("--median-window", type=int, default=7)
+    combined.add_argument("--smoothing-window-ms", type=float, default=1000.0)
+    combined.add_argument("--max-velocity-rad-s", type=float, default=1.0)
+    combined.add_argument("--max-acceleration-rad-s2", type=float, default=20.0)
     solve = commands.add_parser("solve", help="离线把整条绝对末端轨迹解算成连续关节轨迹")
     solve.add_argument("--input", type=Path, required=True)
     solve.add_argument("--output", type=Path, required=True)
@@ -390,6 +412,43 @@ def main(argv=None) -> int:
     args = _parser().parse_args(argv)
     gdk = None
     try:
+        if args.command == "record-optimize":
+            raw_output = args.raw_output.expanduser().resolve()
+            output = args.output.expanduser().resolve()
+            if raw_output == output:
+                raise ValueError("原始轨迹与优化轨迹不能使用同一个输出文件")
+            record_argv = [
+                "record", "--side", args.side, "--output", str(raw_output),
+                "--rate-hz", str(args.rate_hz), "--urdf", str(args.urdf),
+                "--leading-motion-mm", str(args.leading_motion_mm),
+                "--leading-motion-deg", str(args.leading_motion_deg),
+            ]
+            if args.duration_s is not None:
+                record_argv.extend(("--duration-s", str(args.duration_s)))
+            if args.allow_motion:
+                record_argv.append("--allow-motion")
+            result = main(record_argv)
+            if result != 0:
+                return result
+            try:
+                from .optimize_cartesian_teach_trajectory import main as optimize_main
+            except ImportError:
+                from optimize_cartesian_teach_trajectory import main as optimize_main
+            optimize_argv = [
+                "--input", str(raw_output), "--output", str(output),
+                "--rate-hz", str(args.rate_hz), "--urdf", str(args.urdf),
+            ]
+            for name in (
+                "position-tolerance-mm", "orientation-tolerance-deg",
+                "jitter-position-mm", "jitter-orientation-deg",
+                "outlier-position-mm", "outlier-orientation-deg",
+                "pause-position-mm", "pause-orientation-deg", "median-window",
+                "smoothing-window-ms",
+                "max-velocity-rad-s", "max-acceleration-rad-s2",
+            ):
+                optimize_argv.extend(("--" + name, str(getattr(args, name.replace("-", "_")))))
+            print("原始轨迹已保存并释放 GDK；开始离线优化与整轨 IK。", flush=True)
+            return optimize_main(optimize_argv)
         if args.command == "solve":
             return _solve(args)
         if args.command == "inspect":

@@ -27,6 +27,7 @@ def _validate_parameters(
     jitter_position_m: float, jitter_orientation_rad: float, median_window: int,
     pause_position_m: float, pause_orientation_rad: float,
     outlier_position_m: float, outlier_orientation_rad: float,
+    smoothing_window_s: float,
 ) -> None:
     for value, label in (
         (position_tolerance_m, "position_tolerance_m"),
@@ -46,6 +47,8 @@ def _validate_parameters(
             raise ValueError(f"{label} must be non-negative and finite")
     if not isinstance(median_window, int) or median_window < 1 or median_window % 2 == 0:
         raise ValueError("median_window must be a positive odd integer")
+    if not math.isfinite(smoothing_window_s) or smoothing_window_s < 0.0:
+        raise ValueError("smoothing_window_s must be non-negative and finite")
 
 
 def _aligned_quaternion(quaternion: Iterable[float], reference: Iterable[float]) -> np.ndarray:
@@ -151,6 +154,69 @@ def _median_filter(
     return tuple(filtered)
 
 
+def _smooth_timed_samples(
+    samples: tuple[CartesianSample, ...], *, window_s: float,
+) -> tuple[CartesianSample, ...]:
+    """Suppress short 100 Hz reversals without jumping away from either endpoint."""
+    if window_s == 0.0 or len(samples) < 5:
+        return samples
+    times = np.asarray([sample.t_ns for sample in samples], dtype=np.float64) / 1e9
+    positions = np.asarray([sample.position_m for sample in samples], dtype=np.float64)
+    joints = np.asarray([sample.reference_joint_positions_rad for sample in samples], dtype=np.float64)
+    orientations = np.asarray([sample.orientation_xyzw for sample in samples], dtype=np.float64)
+    half_window_s = window_s / 2.0
+    sigma_s = window_s / 4.0
+    smooth_positions = np.empty_like(positions)
+    smooth_joints = np.empty_like(joints)
+    smooth_orientations = np.empty_like(orientations)
+    for index in range(len(samples)):
+        first = int(np.searchsorted(times, times[index] - half_window_s, side="left"))
+        last = int(np.searchsorted(times, times[index] + half_window_s, side="right"))
+        weights = np.exp(-0.5 * ((times[first:last] - times[index]) / sigma_s) ** 2)
+        weights /= weights.sum()
+        smooth_positions[index] = np.sum(positions[first:last] * weights[:, None], axis=0)
+        smooth_joints[index] = np.sum(joints[first:last] * weights[:, None], axis=0)
+        quaternion_window = orientations[first:last].copy()
+        quaternion_window[quaternion_window @ orientations[index] < 0.0] *= -1.0
+        smooth_orientations[index] = np.sum(quaternion_window * weights[:, None], axis=0)
+        smooth_orientations[index] /= np.linalg.norm(smooth_orientations[index])
+
+    def endpoint_weight(distance_s: float) -> float:
+        fraction = min(1.0, max(0.0, distance_s / half_window_s))
+        return 1.0 - 3.0 * fraction**2 + 2.0 * fraction**3
+
+    start_orientation = _aligned_quaternion(orientations[0], smooth_orientations[0])
+    end_orientation = _aligned_quaternion(orientations[-1], smooth_orientations[-1])
+    result = [samples[0]]
+    for index in range(1, len(samples) - 1):
+        start_weight = endpoint_weight(times[index] - times[0])
+        end_weight = endpoint_weight(times[-1] - times[index])
+        position = (
+            smooth_positions[index]
+            + start_weight * (positions[0] - smooth_positions[0])
+            + end_weight * (positions[-1] - smooth_positions[-1])
+        )
+        reference_joints = (
+            smooth_joints[index]
+            + start_weight * (joints[0] - smooth_joints[0])
+            + end_weight * (joints[-1] - smooth_joints[-1])
+        )
+        orientation = (
+            smooth_orientations[index]
+            + start_weight * (start_orientation - smooth_orientations[0])
+            + end_weight * (end_orientation - smooth_orientations[-1])
+        )
+        orientation /= np.linalg.norm(orientation)
+        result.append(CartesianSample(
+            samples[index].t_ns,
+            tuple(float(value) for value in position),
+            tuple(float(value) for value in orientation),
+            tuple(float(value) for value in reference_joints),
+        ))
+    result.append(samples[-1])
+    return tuple(result)
+
+
 def _interpolated_pose_error(
     samples: tuple[CartesianSample, ...], first: int, last: int, index: int,
 ) -> tuple[float, float]:
@@ -226,6 +292,10 @@ def _retime_keyframes(
             )
         )
         elapsed += max(_CONTROL_TICK_NS, active_duration)
+        if current_index == indices[-1]:
+            # A fractional final tick would create a near-zero 100 Hz replay
+            # interval and spuriously inflate the measured acceleration.
+            elapsed = ((elapsed + _CONTROL_TICK_NS - 1) // _CONTROL_TICK_NS) * _CONTROL_TICK_NS
         sample = samples[current_index]
         result.append(CartesianSample(
             elapsed, sample.position_m, sample.orientation_xyzw,
@@ -244,6 +314,7 @@ def optimize_cartesian_trajectory(
     pause_orientation_rad: float = math.radians(0.01),
     outlier_position_m: float = 0.008,
     outlier_orientation_rad: float = math.radians(5.0),
+    smoothing_window_s: float = 1.0,
 ) -> tuple[CartesianTrajectory, dict]:
     """Simplify a Cartesian path while preserving its absolute endpoints.
 
@@ -260,6 +331,7 @@ def optimize_cartesian_trajectory(
         pause_orientation_rad=pause_orientation_rad,
         outlier_position_m=outlier_position_m,
         outlier_orientation_rad=outlier_orientation_rad,
+        smoothing_window_s=smoothing_window_s,
     )
     if not trajectory.samples:
         raise ValueError("Cartesian trajectory is empty")
@@ -277,13 +349,14 @@ def optimize_cartesian_trajectory(
         jitter_position_m=jitter_position_m,
         jitter_orientation_rad=jitter_orientation_rad,
     )
+    smoothed = _smooth_timed_samples(filtered, window_s=smoothing_window_s)
     indices, max_position_error, max_orientation_error = _select_keyframes(
-        filtered,
+        smoothed,
         position_tolerance_m=position_tolerance_m,
         orientation_tolerance_rad=orientation_tolerance_rad,
     )
     keyframes = _retime_keyframes(
-        filtered, indices,
+        smoothed, indices,
         pause_position_m=pause_position_m,
         pause_orientation_rad=pause_orientation_rad,
     )
@@ -305,6 +378,7 @@ def optimize_cartesian_trajectory(
         "pause_position_mm": pause_position_m*1000.0,
         "pause_orientation_deg": math.degrees(pause_orientation_rad),
         "median_window": median_window,
+        "smoothing_window_ms": smoothing_window_s * 1000.0,
         "max_simplification_position_error_mm": max_position_error*1000.0,
         "max_simplification_orientation_error_deg": math.degrees(max_orientation_error),
         "stationary_intervals_removed": True,

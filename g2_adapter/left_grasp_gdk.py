@@ -4568,11 +4568,7 @@ def run_left_cycle(*, services=None, argv=None) -> int:
                                             position_stream.rebase_to_measured_pose()
                                             position_stream.update_target(relief_target)
                                             last_end_link_target = relief_target
-                                            relief_deadline = time.monotonic() + (
-                                                contact_detector.parameters.relief_max_lift_m
-                                                / relief_speed_mps
-                                                + 0.35
-                                            )
+                                            relief_deadline = time.monotonic() + 5.0
                                             relief_hits = 0
                                             latest_relief_force_n: np.ndarray | None = None
                                             latest_relief_delta_force_n: float | None = None

@@ -82,6 +82,8 @@ def _parser() -> argparse.ArgumentParser:
                         help="小于此旋转的采样间隔视为停顿并压缩")
     parser.add_argument("--median-window", type=int, default=7,
                         help="中值平滑窗口，必须为奇数，默认 7")
+    parser.add_argument("--smoothing-window-ms", type=float, default=1000.0,
+                        help="按时间对示教往返抖动平滑，默认 1000 ms；0 禁用")
     parser.add_argument("--max-velocity-rad-s", type=float, default=1.0)
     parser.add_argument("--max-acceleration-rad-s2", type=float, default=15.0)
     return parser
@@ -105,6 +107,7 @@ def main(argv=None) -> int:
             pause_orientation_rad=math.radians(args.pause_orientation_deg),
             outlier_position_m=args.outlier_position_mm/1000.0,
             outlier_orientation_rad=math.radians(args.outlier_orientation_deg),
+            smoothing_window_s=args.smoothing_window_ms/1000.0,
         )
         resampled = resample_cartesian_trajectory(optimized, rate_hz=args.rate_hz)
         limits = ARM_POSITION_LIMITS[:7] if raw.side == "left" else ARM_POSITION_LIMITS[7:]
