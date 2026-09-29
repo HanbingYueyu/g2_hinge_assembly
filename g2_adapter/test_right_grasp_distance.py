@@ -1,5 +1,6 @@
 import unittest
 import numpy as np
+import right_grasp_distance
 from right_grasp_distance import robust_pose_mean, workpiece_moved
 from right_apriltag_grasp_gdk import distance_grasp_targets, RED_GRIP_CENTER_M
 from apriltag_workpiece import GraspTargets
@@ -18,6 +19,23 @@ class DistanceGraspTests(unittest.TestCase):
         a = np.deg2rad(4)
         current[:2, :2] = [[np.cos(a), -np.sin(a)], [np.sin(a), np.cos(a)]]
         self.assertTrue(workpiece_moved(reference, current, .005, 3)[0])
+
+    def test_single_pose_jump_does_not_interrupt_motion_but_repeated_shift_does(self):
+        reference = np.eye(4)
+        self.assertTrue(hasattr(right_grasp_distance, "WorkpieceMotionConfirmation"))
+        gate = right_grasp_distance.WorkpieceMotionConfirmation(
+            translation_m=.005, rotation_deg=3.0,
+            consistency_translation_m=.003, consistency_rotation_deg=2.0,
+            required_count=2,
+        )
+        noisy = np.eye(4)
+        noisy[0, 3] = .009
+        self.assertFalse(gate.update(reference, noisy))
+        self.assertFalse(gate.update(reference, reference))
+        self.assertFalse(gate.update(reference, noisy))
+        shifted = np.eye(4)
+        shifted[0, 3] = .010
+        self.assertTrue(gate.update(reference, shifted))
 
     def test_outliers_do_not_pull_target(self):
         poses = np.repeat(np.eye(4)[None], 3, axis=0)

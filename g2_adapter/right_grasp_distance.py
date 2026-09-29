@@ -12,6 +12,52 @@ def workpiece_moved(reference, current, translation_m, rotation_deg):
     return displacement > translation_m or angle > rotation_deg, displacement, angle
 
 
+class WorkpieceMotionConfirmation:
+    """Require consistent fresh pose changes before discarding a locked target."""
+
+    def __init__(
+        self, *, translation_m: float, rotation_deg: float,
+        consistency_translation_m: float, consistency_rotation_deg: float,
+        required_count: int = 2,
+    ) -> None:
+        if not isinstance(required_count, int) or required_count < 2:
+            raise ValueError("workpiece motion confirmations must be at least 2")
+        for value in (translation_m, rotation_deg, consistency_translation_m, consistency_rotation_deg):
+            if not np.isfinite(value) or value <= 0:
+                raise ValueError("workpiece motion thresholds must be finite and positive")
+        self.translation_m = translation_m
+        self.rotation_deg = rotation_deg
+        self.consistency_translation_m = consistency_translation_m
+        self.consistency_rotation_deg = consistency_rotation_deg
+        self.required_count = required_count
+        self.candidate = None
+        self.count = 0
+
+    def reset(self) -> None:
+        self.candidate = None
+        self.count = 0
+
+    def update(self, reference, current) -> bool:
+        changed, _, _ = workpiece_moved(
+            reference, current, self.translation_m, self.rotation_deg,
+        )
+        if not changed:
+            self.reset()
+            return False
+        consistent = False
+        if self.candidate is not None:
+            consistent = not workpiece_moved(
+                self.candidate, current,
+                self.consistency_translation_m, self.consistency_rotation_deg,
+            )[0]
+        if consistent:
+            self.count += 1
+        else:
+            self.candidate = np.asarray(current, dtype=float).copy()
+            self.count = 1
+        return self.count >= self.required_count
+
+
 def robust_pose_mean(poses):
     if len(poses) != 3:
         raise ValueError("exactly 3 fresh poses required")

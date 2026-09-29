@@ -5,7 +5,7 @@
   "description": "OpenArm 右手三张 tagStandard41h12 工件定位迁移至 G2。运动前必须填写实测的 right_end_from_grasp_tcp 并完成右臂 1 mm 末端位姿探针。当前运动使用 control_mode=3 和标准关节刚度；right_mode1_probe_verified 保留为历史兼容字段，不表示实时控制模式。",
   "tag_sample_count": 3,
   "grasp_distance_mm": 152.0,
-  "workpiece_relocalization": {"translation_m": 0.005, "rotation_deg": 3.0},
+  "workpiece_relocalization": {"translation_m": 0.010, "rotation_deg": 5.0, "confirmations": 3},
   "max_reprojection_error_px": 3.0,
   "calibration_max_reprojection_error_px": 3.0,
   "observation": {
@@ -38,7 +38,7 @@
   },
   "autonomous_approach": {
     "enabled": true,
-    "max_waypoint_translation_m": 0.005,
+    "max_waypoint_translation_m": 0.010,
     "max_waypoint_orientation_deg": 2.0,
     "speed_mps": 0.010,
     "angular_speed_deg_s": 10.0,

@@ -46,6 +46,7 @@ try:
     )
     from .spacemouse_takeover import MotionPauseGate, SpaceMouseTakeoverWorker
     from .dianpi_runner import DianpiCycleRunner
+    from .right_grasp_distance import WorkpieceMotionConfirmation, robust_pose_mean, workpiece_moved
     from .spacemouse_teleop import TeleopConfig
 except ImportError:
     from apriltag_workpiece import (
@@ -62,6 +63,7 @@ except ImportError:
     )
     from spacemouse_takeover import MotionPauseGate, SpaceMouseTakeoverWorker
     from dianpi_runner import DianpiCycleRunner
+    from right_grasp_distance import WorkpieceMotionConfirmation, robust_pose_mean, workpiece_moved
     from spacemouse_teleop import TeleopConfig
 
 
@@ -2027,26 +2029,43 @@ def run_right_grasp_stage(*, services=None, argv=None) -> int:
             movement = config.get("workpiece_relocalization", {})
             movement_m = get_number({"translation_m": movement.get("translation_m", .005)}, "translation_m", minimum=.0001)
             movement_deg = get_number({"rotation_deg": movement.get("rotation_deg", 3.0)}, "rotation_deg", minimum=.01)
+            movement_confirmations = int(movement.get("confirmations", 2))
+            if not 2 <= movement_confirmations <= 5:
+                raise ValueError("workpiece_relocalization.confirmations must be in [2, 5]")
+            motion_confirmation = WorkpieceMotionConfirmation(
+                translation_m=movement_m,
+                rotation_deg=movement_deg,
+                consistency_translation_m=0.003,
+                consistency_rotation_deg=2.0,
+                required_count=movement_confirmations,
+            )
 
             def acquire_distance_lock(*, moving: bool = False):
                 nonlocal cached_workpiece_mean
                 if grasp_distance_mm is None:
                     return acquire_raw_lock(moving=moving)
-                try:
-                    from .right_grasp_distance import robust_pose_mean, workpiece_moved
-                except ImportError:
-                    from right_grasp_distance import robust_pose_mean, workpiece_moved
                 lock = acquire_raw_lock(moving=moving)
                 if cached_workpiece_mean is not None:
                     changed, displacement, angle = workpiece_moved(cached_workpiece_mean,
                         lock["base_from_workpiece"], movement_m, movement_deg)
-                    if changed:
+                    confirmed_move = motion_confirmation.update(
+                        cached_workpiece_mean, lock["base_from_workpiece"],
+                    )
+                    if confirmed_move:
                         cached_workpiece_mean = None
+                        motion_confirmation.reset()
                         print(json.dumps({"event": "right_workpiece_moved", "translation_mm": displacement * 1000,
                             "rotation_deg": angle, "motion": "hold_then_resample_3"}), flush=True)
-                        # The caller catches this and commands a measured-pose
-                        # hold before the next call starts collecting samples.
-                        raise VisualLockTimeout("工件移动超过阈值；保持当前位置后重新采集3次")
+                        # A consistent pose change invalidates the old target;
+                        # hold the measured arm pose before sampling again.
+                        raise VisualLockTimeout("工件连续移动超过阈值；保持当前位置后重新采集3次")
+                    if changed:
+                        print(json.dumps({"event": "right_workpiece_move_candidate",
+                            "translation_mm": round(displacement * 1000, 2),
+                            "rotation_deg": round(angle, 2),
+                            "candidate_count": motion_confirmation.count,
+                            "required_count": movement_confirmations,
+                            "motion": "continue_bounded_cached_target"}), flush=True)
                 resampled = cached_workpiece_mean is None
                 if resampled:
                     poses = [lock["base_from_workpiece"]]
@@ -2058,6 +2077,7 @@ def run_right_grasp_stage(*, services=None, argv=None) -> int:
                         poses.append(lock["base_from_workpiece"])
                     try:
                         cached_workpiece_mean = robust_pose_mean(poses)
+                        motion_confirmation.reset()
                     except ValueError as exc:
                         raise VisualLockTimeout(str(exc)) from exc
                 mean = cached_workpiece_mean
