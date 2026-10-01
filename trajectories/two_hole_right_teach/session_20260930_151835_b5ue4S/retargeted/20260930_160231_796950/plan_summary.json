@@ -1,0 +1,76 @@
+{
+  "old_pair": {
+    "reference_dir": "/home/flyfuture/g2_hinge_assembly/datasets/two_hole_right_teach/session_20260930_151835_b5ue4S/reference/20260930_151837",
+    "table_base_link_m": [
+      0.5736969802540783,
+      0.10873235734042469,
+      0.7240631975003374
+    ],
+    "tip_base_link_m": [
+      0.5582163307235433,
+      -0.005651767114167905,
+      0.7226021354785481
+    ],
+    "midpoint_xy_m": [
+      0.5659566554888108,
+      0.051540295113128395
+    ],
+    "yaw_rad": -1.7053181138307771,
+    "spacing_m": 0.11542693982398988,
+    "max_xy_deviation_m": 0.0006896650644841761
+  },
+  "new_pair": {
+    "reference_dir": "/home/flyfuture/g2_hinge_assembly/datasets/two_hole_right_teach/session_20260930_151835_b5ue4S/relocalization/run_20260930_160221_Veihbs/20260930_160223",
+    "table_base_link_m": [
+      0.5975313901175242,
+      0.1337401188393654,
+      0.7219725456221332
+    ],
+    "tip_base_link_m": [
+      0.5789707634473544,
+      0.019570043963784794,
+      0.7214630470723696
+    ],
+    "midpoint_xy_m": [
+      0.5882510767824394,
+      0.07665508140157509
+    ],
+    "yaw_rad": -1.7319564091935515,
+    "spacing_m": 0.11566893645004737,
+    "max_xy_deviation_m": 0.0006776885139345746
+  },
+  "old_start_base_link_m": [
+    0.4501593574038588,
+    -0.23273911271938016,
+    0.8581070301923356
+  ],
+  "old_end_base_link_m": [
+    0.4360916297547737,
+    -0.09175547093727193,
+    0.7481701669944772
+  ],
+  "new_start_base_link_m": [
+    0.4686831484899414,
+    -0.20411451438856648,
+    0.8581070301923356
+  ],
+  "new_end_base_link_m": [
+    0.4546154208408563,
+    -0.06313087260645826,
+    0.7481701669944772
+  ],
+  "constant_translation_base_link_m": [
+    0.018523791086082597,
+    0.02862459833081367,
+    0.0
+  ],
+  "trajectory_orientation_changed": false,
+  "trajectory_z_changed": false,
+  "ik_position_tolerance_mm": 0.1,
+  "diagnostics": {
+    "pair_midpoint_translation_m": 0.03358264002624197,
+    "pair_spacing_change_m": 0.00024199662605749184,
+    "pair_yaw_change_deg": -1.5262618977098854
+  },
+  "replay_ready": true
+}

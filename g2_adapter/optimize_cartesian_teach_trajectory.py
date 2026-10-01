@@ -86,6 +86,10 @@ def _parser() -> argparse.ArgumentParser:
                         help="按时间对示教往返抖动平滑，默认 1000 ms；0 禁用")
     parser.add_argument("--max-velocity-rad-s", type=float, default=1.0)
     parser.add_argument("--max-acceleration-rad-s2", type=float, default=15.0)
+    parser.add_argument("--ik-position-tolerance-mm", type=float, default=0.05,
+                        help="内部 IK 收敛门槛；不得超过最终 0.1 mm FK 校验门槛")
+    parser.add_argument("--ik-reference-weight", type=float, default=1e-4,
+                        help="IK 贴近示教关节角的权重；默认保持原求解行为")
     return parser
 
 
@@ -118,6 +122,8 @@ def main(argv=None) -> int:
             urdf_sha256=_sha256(urdf),
             max_velocity_rad_s=args.max_velocity_rad_s,
             max_acceleration_rad_s2=args.max_acceleration_rad_s2,
+            ik_position_tolerance_m=args.ik_position_tolerance_mm/1000.0,
+            ik_reference_weight=args.ik_reference_weight,
         )
         document = joint_document(
             solved, report,

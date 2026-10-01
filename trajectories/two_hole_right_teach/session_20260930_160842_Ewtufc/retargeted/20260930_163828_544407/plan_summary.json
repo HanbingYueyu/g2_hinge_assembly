@@ -1,0 +1,81 @@
+{
+  "old_pair": {
+    "reference_dir": "/home/flyfuture/g2_hinge_assembly/datasets/two_hole_right_teach/session_20260930_160842_Ewtufc/reference/20260930_160844",
+    "table_base_link_m": [
+      0.5701835722085628,
+      0.11219426241552993,
+      0.7259715527801419
+    ],
+    "tip_base_link_m": [
+      0.5531217782380707,
+      -0.0020930217797891903,
+      0.7259715527801419
+    ],
+    "midpoint_xy_m": [
+      0.5616526752233167,
+      0.05505062031787037
+    ],
+    "yaw_rad": -1.718990501671718,
+    "spacing_m": 0.11555383222651319,
+    "max_xy_deviation_m": 0.0003937561502781082,
+    "tip_raw_depth_z_disagreement_m": 0.007887684185671595,
+    "tip_position_method": "head_color_ray_intersect_table_base_link_z"
+  },
+  "new_pair": {
+    "reference_dir": "/home/flyfuture/g2_hinge_assembly/datasets/two_hole_right_teach/session_20260930_160842_Ewtufc/relocalization/run_20260930_163818_fOP8wl/20260930_163820",
+    "table_base_link_m": [
+      0.6127561577576275,
+      0.12883777627262044,
+      0.7245131708638992
+    ],
+    "tip_base_link_m": [
+      0.5976801843251384,
+      0.014658645478901113,
+      0.7245131708638992
+    ],
+    "midpoint_xy_m": [
+      0.6052181710413829,
+      0.07174821087576078
+    ],
+    "yaw_rad": -1.702074844763946,
+    "spacing_m": 0.11517013017161344,
+    "max_xy_deviation_m": 0.0004924777403696359,
+    "tip_raw_depth_z_disagreement_m": 0.0016413161716526958,
+    "tip_position_method": "head_color_ray_intersect_table_base_link_z"
+  },
+  "old_start_base_link_m": [
+    0.41909351157294145,
+    -0.20196151157913095,
+    0.8714807904089258
+  ],
+  "old_end_base_link_m": [
+    0.4392829202724545,
+    -0.09377172168000847,
+    0.7582645215419095
+  ],
+  "new_start_base_link_m": [
+    0.46519382200392323,
+    -0.18731249563311947,
+    0.8714807904089258
+  ],
+  "new_end_base_link_m": [
+    0.4853832307034363,
+    -0.07912270573399699,
+    0.7582645215419095
+  ],
+  "constant_translation_base_link_m": [
+    0.046100310430981783,
+    0.014649015946011479,
+    0.0
+  ],
+  "trajectory_orientation_changed": false,
+  "trajectory_z_changed": false,
+  "ik_position_tolerance_mm": 0.1,
+  "ik_reference_weight": 1e-05,
+  "diagnostics": {
+    "pair_midpoint_translation_m": 0.04665578159577747,
+    "pair_spacing_change_m": 0.00038370205489975107,
+    "pair_yaw_change_deg": 0.9691957485066507
+  },
+  "replay_ready": true
+}

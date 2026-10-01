@@ -368,9 +368,18 @@ def solve_cartesian_trajectory(
     max_acceleration_rad_s2: float,
     max_position_error_m: float = 1e-4,
     max_orientation_error_rad: float = 1e-3,
+    ik_position_tolerance_m: float | None = None,
+    ik_reference_weight: float = 1e-4,
 ) -> tuple[JointTrajectory, ValidationReport]:
     if not trajectory.samples:
         raise ValueError("Cartesian trajectory is empty")
+    ik_position_tolerance_m = (
+        max_position_error_m * 0.5 if ik_position_tolerance_m is None else ik_position_tolerance_m
+    )
+    if not 0.0 < ik_position_tolerance_m <= max_position_error_m:
+        raise ValueError("IK position tolerance must be positive and within final FK validation limit")
+    if not math.isfinite(ik_reference_weight) or ik_reference_weight < 0.0:
+        raise ValueError("IK reference weight must be finite and non-negative")
     points = []
     previous = np.asarray(trajectory.samples[0].reference_joint_positions_rad, dtype=float)
     for sample in trajectory.samples:
@@ -383,8 +392,9 @@ def solve_cartesian_trajectory(
             previous,
             reference=sample.reference_joint_positions_rad,
             joint_limits=joint_limits,
-            position_tolerance_m=max_position_error_m * 0.5,
+            position_tolerance_m=ik_position_tolerance_m,
             orientation_tolerance_rad=max_orientation_error_rad * 0.5,
+            reference_weight=ik_reference_weight,
         )
         points.append(JointTrajectoryPoint(
             sample.t_ns,
