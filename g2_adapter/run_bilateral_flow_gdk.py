@@ -319,6 +319,8 @@ def parse_args(argv=None) -> argparse.Namespace:
     parser.add_argument("--spacemouse-speed-mm-s", type=float, default=30.0)
     parser.add_argument("--spacemouse-rotation-deg-s", type=float, default=20.0)
     parser.add_argument("--spacemouse-deadzone", type=float, default=0.12)
+    parser.add_argument("--repeat-grasp-demo", action="store_true",
+                        help="终端按 1/2/3 选择重复抓取演示；q 在本轮放回后结束。")
     parser.add_argument("--from-stage", choices=stage_names(), default=None, help="从指定阶段开始（调试用）。")
     parser.add_argument("--through-stage", choices=stage_names(), default=None,
                         help="执行完指定阶段后正常结束（调试用，包含该阶段）。")
@@ -337,7 +339,7 @@ def print_stage_plan() -> None:
 
 
 def teach_enabled(args: argparse.Namespace) -> bool:
-    return bool(getattr(args, "teach_enable", False))
+    return bool(getattr(args, "teach_enable", False)) and not bool(getattr(args, "repeat_grasp_demo", False))
 
 
 def vlm_enabled(args: argparse.Namespace) -> bool:
@@ -426,6 +428,9 @@ def validate_args(args: argparse.Namespace) -> int | None:
         return 2
     if args.device is None or not str(args.device).startswith("/dev/"):
         print("--device 必须是 /dev/hidrawN 路径或 udev 固定别名。", file=sys.stderr)
+        return 2
+    if args.repeat_grasp_demo and (args.from_stage is not None or args.through_stage is not None):
+        print("重复抓取演示不能与 --from-stage/--through-stage 共用。", file=sys.stderr)
         return 2
     if args.from_stage is not None and args.through_stage is not None:
         order = stage_names()
@@ -1173,6 +1178,7 @@ def run_flow(args: argparse.Namespace) -> int:
     cameras: list = []
     worker = None
     keyboard = None
+    demo_selection = None
     dianpi = None
     web: BilateralWeb | None = None
     runtime: BilateralRuntime | None = None
@@ -1231,7 +1237,15 @@ def run_flow(args: argparse.Namespace) -> int:
             event_sink=flow_event_sink,
         )
         worker.start()
-        keyboard = KeyboardStageAdvance(worker)
+        if args.repeat_grasp_demo:
+            try:
+                from .repeated_grasp_demo import DemoKeyboard, DemoModeSelection
+            except ImportError:
+                from repeated_grasp_demo import DemoKeyboard, DemoModeSelection
+            demo_selection = DemoModeSelection()
+            keyboard = DemoKeyboard(demo_selection)
+        else:
+            keyboard = KeyboardStageAdvance(worker)
         keyboard.start()
 
         head_camera = agibot_gdk.Camera([agibot_gdk.CameraType.kHeadColor, agibot_gdk.CameraType.kHeadDepth])
@@ -1326,6 +1340,12 @@ def run_flow(args: argparse.Namespace) -> int:
             services.put('vlm_gripper_monitor', monitor)
             controller.automatic_guard = monitor.raise_if_regrasp_requested
             monitor.start()
+        if args.repeat_grasp_demo:
+            try:
+                from .repeated_grasp_demo import run_repeated_demo
+            except ImportError:
+                from repeated_grasp_demo import run_repeated_demo
+            return run_repeated_demo(ctx, demo_selection)
         return _drive(ctx, args)
     finally:
         if services is not None:

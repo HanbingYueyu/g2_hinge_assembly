@@ -3005,6 +3005,7 @@ def run_left_cycle(*, services=None, argv=None) -> int:
         post_grasp_verify_samples: list[dict] = []
         post_grasp_verified = False
         post_grasp_lift_monitor: dict | None = None
+        demo_grasp_pose: CartesianPoseTarget | None = None
         # One fresh same-target frame must confirm the part is still held after
         # the monitored lift before the arm moves toward the hole.
         post_grasp_hole_monitor: dict | None = None
@@ -3683,6 +3684,8 @@ def run_left_cycle(*, services=None, argv=None) -> int:
                             "nonblocking": True,
                         })
                         post_grasp_hole_monitor = None
+                        if services is not None and demo_grasp_pose is not None:
+                            services.put('left_demo_grasp_pose', demo_grasp_pose)
                         if action == "defer_hole_move":
                             json_record(log, {
                                 "event": complete_event,
@@ -5326,6 +5329,7 @@ def run_left_cycle(*, services=None, argv=None) -> int:
                                 force_preview_stop = force_preview_thread = None
                                 force_preview_phase = None
                                 verify_origin = measured_left_end_link_pose(controller)
+                                demo_grasp_pose = verify_origin
                                 verify_target = CartesianPoseTarget(
                                     base_position_after_delta(
                                         verify_origin.position_m,

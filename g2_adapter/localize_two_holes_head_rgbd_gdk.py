@@ -12,14 +12,15 @@ from pathlib import Path
 import cv2
 import numpy as np
 
-from .build_head_rgbd_two_hole_dataset import CLASS_NAMES, ROI
+from .build_head_rgbd_two_hole_dataset import CLASS_NAMES
+from .build_head_rgbd_two_hole_v2 import ROI
 from .camera import align_depth_to_color, decode_color_rgb, decode_depth_u16, intrinsic_to_dict, transform_to_dict
 from .two_hole_rgbd import base_from_head_at, localize_box
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--model", type=Path, default=Path("models/two_hole_head_rgbd_yolo/best.pt"))
+    parser.add_argument("--model", type=Path, default=Path("models/two_hole_head_rgbd_yolo_v2/best.pt"))
     parser.add_argument("--count", type=int, default=1, help="Successful samples; 0 runs until Ctrl-C")
     parser.add_argument("--interval", type=float, default=0.25)
     parser.add_argument("--confidence", type=float, default=0.5)

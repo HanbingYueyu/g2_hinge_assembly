@@ -50,6 +50,10 @@ class OrchestratorCliTests(unittest.TestCase):
         self.assertFalse(args.vlm_enable)
         self.assertFalse(args.teach_enable)
 
+    def test_repeat_demo_does_not_enable_taught_placement(self):
+        args = flow.parse_args(['--repeat-grasp-demo', '--teach-enable', 'true'])
+        self.assertFalse(flow.teach_enabled(args))
+
     def test_feature_switches_accept_explicit_boolean_values(self):
         args = flow.parse_args(["--vlm-enable", "true", "--teach-enable", "false"])
         self.assertTrue(args.vlm_enable)

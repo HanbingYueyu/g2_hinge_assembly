@@ -85,7 +85,12 @@ class VlmTtsAnnouncer:
         self._thread.start()
 
     def handle_event(self, event: dict) -> bool:
-        """Queue a supported semantic result once; warnings are never spoken."""
+        """Queue a supported semantic result once per run or demo round."""
+        if event.get("event") == "demo_round_start" and str(event.get("mode")) == "3":
+            with self._lock:
+                self._spoken_or_queued.discard(("fixture", "True"))
+                self._spoken_or_queued.discard(("fixture", "False"))
+                self._spoken_or_queued.discard(("flow", str(("right_pr1_premove_arrived", "RR1"))))
         if event.get("event") == "vlm_regrasp_requested":
             with self._lock:
                 self._spoken_or_queued.discard(_result_message({"event": "left_stage_complete_above_hole"})[0])

@@ -51,6 +51,22 @@ class LeftSeatMotionTests(unittest.TestCase):
         self.assertEqual(result["stop_reason"], "max_distance")
         self.assertAlmostEqual(result["descent_mm"], 10.0)
 
+    def test_demo_descent_can_finish_near_saved_pose_without_exact_100_mm(self):
+        poses = iter([
+            CartesianPoseTarget((0.4, 0.1, 0.8), (0, 0, 0, 1)),
+            CartesianPoseTarget((0.4, 0.1, 0.704), (0, 0, 0, 1)),
+        ])
+        with patch.object(left_seat_motion, "measured_left_end_link_pose", side_effect=lambda _c: next(poses)), \
+             patch.object(left_seat_motion, "capture_left_force_baseline", return_value=np.zeros(3)), \
+             patch.object(left_seat_motion, "read_left_force", return_value=np.array([0.0, 0.0, 0.2])):
+            result = left_seat_motion.force_guarded_left_descent(
+                self.controller, object(), max_distance_mm=100, force_threshold_n=2,
+                speed_mm_s=10, completion_tolerance_mm=5, timeout_s=30,
+                sleep=lambda _s: None,
+            )
+        self.assertEqual(result['stop_reason'], 'max_distance')
+        self.assertAlmostEqual(result['descent_mm'], 96.0)
+
     def test_release_retract_moves_up_exactly_100_mm(self):
         start = CartesianPoseTarget((0.4, 0.1, 0.7), (0, 0, 0, 1))
         with patch.object(left_seat_motion, "measured_left_end_link_pose", return_value=start), \

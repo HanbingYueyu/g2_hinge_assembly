@@ -39,6 +39,8 @@ def capture_left_force_baseline(robot, *, samples: int = 20, sample_period_s: fl
 
 def force_guarded_left_descent(controller, robot, *, max_distance_mm: float,
                                force_threshold_n: float, speed_mm_s: float,
+                               completion_tolerance_mm: float = 0.5,
+                               timeout_s: float | None = None,
                                sleep=time.sleep, clock=time.monotonic) -> dict:
     """Descend in base_link -Z until distance or relative resultant force wins."""
     if not math.isfinite(max_distance_mm) or not 0.0 < max_distance_mm <= 100.0:
@@ -47,6 +49,10 @@ def force_guarded_left_descent(controller, robot, *, max_distance_mm: float,
         raise ValueError("force_threshold_n must be in (0, 50]")
     if not math.isfinite(speed_mm_s) or not 0.0 < speed_mm_s <= 50.0:
         raise ValueError("speed_mm_s must be in (0, 50]")
+    if not math.isfinite(completion_tolerance_mm) or not 0.0 < completion_tolerance_mm <= 10.0:
+        raise ValueError("completion_tolerance_mm must be in (0, 10]")
+    if timeout_s is not None and (not math.isfinite(timeout_s) or not 1.0 <= timeout_s <= 120.0):
+        raise ValueError("timeout_s must be in [1, 120]")
 
     origin = measured_left_end_link_pose(controller)
     baseline = capture_left_force_baseline(robot, sleep=sleep)
@@ -58,7 +64,8 @@ def force_guarded_left_descent(controller, robot, *, max_distance_mm: float,
         origin, rate_hz=50.0, life_time_s=0.10,
         max_translation_velocity_mps=speed_mm_s / 1000.0,
     )
-    deadline = clock() + max_distance_mm / speed_mm_s + 3.0
+    allowed_s = max_distance_mm / speed_mm_s + 3.0 if timeout_s is None else float(timeout_s)
+    deadline = clock() + allowed_s
     actual = origin
     stop_reason = None
     delta_force_n = 0.0
@@ -71,10 +78,15 @@ def force_guarded_left_descent(controller, robot, *, max_distance_mm: float,
             delta_force_n = float(np.linalg.norm(read_left_force(robot) - baseline))
             if delta_force_n >= force_threshold_n:
                 stop_reason = "force_threshold"
-            elif descent_mm >= max_distance_mm - 0.5:
+            elif descent_mm >= max_distance_mm - completion_tolerance_mm:
                 stop_reason = "max_distance"
             elif clock() >= deadline:
-                raise SafetyError("左臂力保护下探未在限定时间内到达距离或力阈值")
+                raise SafetyError(
+                    f"左臂力保护下探在 {allowed_s:.1f} s 内未到原位或力阈值："
+                    f"目标 {max_distance_mm:.1f} mm，实测 {descent_mm:.1f} mm，"
+                    f"力差 {delta_force_n:.3f} N，允许剩余 {completion_tolerance_mm:.1f} mm；"
+                    "已停止并保持夹持"
+                )
             else:
                 sleep(0.02)
         hold = CartesianPoseTarget(actual.position_m, origin.orientation_xyzw)
@@ -91,6 +103,8 @@ def force_guarded_left_descent(controller, robot, *, max_distance_mm: float,
         "delta_force_n": round(delta_force_n, 3),
         "force_threshold_n": float(force_threshold_n),
         "max_distance_mm": float(max_distance_mm),
+        "completion_tolerance_mm": float(completion_tolerance_mm),
+        "timeout_s": float(allowed_s),
     }
 
 

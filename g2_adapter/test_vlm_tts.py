@@ -117,6 +117,17 @@ class VlmTtsTests(unittest.TestCase):
                     announcer.close()
                 self.assertEqual(interaction.messages.count('现在插入铰链'), 2)
 
+    def test_new_screwdriver_demo_round_can_announce_fixture_result_again(self):
+        announcer = load_module().VlmTtsAnnouncer(interaction := FakeInteraction())
+        result = {'event': 'vlm_right_fixture_grasp_result', 'ok': True,
+                  'result': {'decision': '抓住'}}
+        self.assertTrue(announcer.handle_event(result))
+        self.assertFalse(announcer.handle_event(result))
+        self.assertFalse(announcer.handle_event({'event': 'demo_round_start', 'mode': '3'}))
+        self.assertTrue(announcer.handle_event(result))
+        announcer.close()
+        self.assertEqual(interaction.messages, ['电批抓取成功', '电批抓取成功'])
+
     def test_semantic_checks_speak_only_final_decisions(self):
         announcer = load_module().VlmTtsAnnouncer(interaction := FakeInteraction())
         self.assertFalse(announcer.handle_event({'event': 'vlm_convex_inserted_result', 'ok': True,
