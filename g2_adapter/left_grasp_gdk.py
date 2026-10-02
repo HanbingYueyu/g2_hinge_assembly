@@ -52,7 +52,7 @@ try:
     )
     from .safety import SafetyError
     from .sam_crop import center_crop_bounds, center_crop_image, draw_crop_box, expand_crop_masks
-    from .visual_servo import base_position_after_delta, empirical_horizontal_base_delta_from_pixel_error, relief_translation_speed_mps, anchored_descent_xy_target
+    from .visual_servo import base_position_after_delta, empirical_horizontal_base_delta_from_pixel_error, relief_translation_speed_mps, anchored_descent_xy_target, LargeDescentXYErrorGuard, NearContactForceHold
     from .xy_mapping import choose_candidate_by_left_rank
     from .yolo_hinge import associate_shaft_to_hinge, infer_yolo_masks, load_yolo_segmentation_model, review_matches, reviewed_target_matches_selected, split_yolo_candidates
     from .record_pose import DEFAULT_OUTPUT as DEFAULT_POSES_OUTPUT
@@ -91,7 +91,7 @@ except ImportError:
     )
     from safety import SafetyError
     from sam_crop import center_crop_bounds, center_crop_image, draw_crop_box, expand_crop_masks
-    from visual_servo import base_position_after_delta, empirical_horizontal_base_delta_from_pixel_error, relief_translation_speed_mps, anchored_descent_xy_target
+    from visual_servo import base_position_after_delta, empirical_horizontal_base_delta_from_pixel_error, relief_translation_speed_mps, anchored_descent_xy_target, LargeDescentXYErrorGuard, NearContactForceHold
     from xy_mapping import choose_candidate_by_left_rank
     from yolo_hinge import associate_shaft_to_hinge, infer_yolo_masks, load_yolo_segmentation_model, review_matches, reviewed_target_matches_selected, split_yolo_candidates
     from record_pose import DEFAULT_OUTPUT as DEFAULT_POSES_OUTPUT
@@ -709,8 +709,8 @@ def parse_args(argv=None) -> argparse.Namespace:
     parser.add_argument(
         "--final-descent-visual-tolerance-mm",
         type=float,
-        default=2.0,
-        help="下探视觉伺服的估计水平误差死区，默认 2 mm；超过后暂停 Z 并发送 XY 修正。",
+        default=5.0,
+        help="下探视觉伺服的估计水平误差死区，默认 5 mm；超过后发送受限 XY 修正。",
     )
     parser.add_argument(
         "--final-descent-visual-max-step-m",
@@ -1397,12 +1397,11 @@ def recover_for_visual_regrasp(
     }
 
 
-def request_descent_xy_hold(position_stream, *, visual_error_m: float,
-                            tolerance_m: float, already_pending: bool) -> bool:
-    """Keep Z paused until fresh vision confirms XY is inside the same deadband."""
-    pending = already_pending or not math.isfinite(visual_error_m) or visual_error_m > tolerance_m
-    position_stream.set_xy_priority(pending)
-    return pending
+def configure_final_descent_stream(position_stream, *, visual_servo_enabled: bool,
+                                   xy_only: bool = False) -> None:
+    """Slew XY independently; pause Z only for a confirmed large error."""
+    position_stream.set_independent_xy_z_slew(visual_servo_enabled)
+    position_stream.set_xy_priority(visual_servo_enabled and xy_only)
 
 
 def publish_web_preview(
@@ -4424,7 +4423,9 @@ def run_left_cycle(*, services=None, argv=None) -> int:
                             if args.step_profile is not None:
                                 position_stream.set_translation_velocity(args.xy_speed_mm_s / 1000 if step.camera_delta_m is not None else parameters.final_descent_speed_mps)
                             if step.is_final_descent:
-                                position_stream.set_independent_xy_z_slew(args.final_descent_visual_servo)
+                                configure_final_descent_stream(
+                                    position_stream, visual_servo_enabled=args.final_descent_visual_servo,
+                                )
                             position_stream.update_target(target)
                             last_end_link_target = target
                             if args.step_profile is not None and step.camera_delta_m is not None and not args.single_xy_step:
@@ -4469,8 +4470,6 @@ def run_left_cycle(*, services=None, argv=None) -> int:
                                         visual_tolerance_m=args.final_descent_visual_tolerance_mm / 1000.0,
                                         allow_xy_correction=True,
                                         target_pixel_provider=height_target_provider,
-                                        error_filter_alpha=0.4,
-                                        correction_gain=0.5,
                                     ) if args.final_descent_visual_servo else None)
                                     # Start after the frame used to initiate
                                     # descent; an old frame must not count as
@@ -4492,6 +4491,11 @@ def run_left_cycle(*, services=None, argv=None) -> int:
                                     latest_hits = 0
                                     force_relief_completed = False
                                     final_descent_retry_reason: str | None = None
+                                    large_xy_error_guard = LargeDescentXYErrorGuard()
+                                    near_force_hold = NearContactForceHold(
+                                        pause_delta_n=contact_detector.parameters.force_delta_threshold_n * 0.5,
+                                        release_delta_n=contact_detector.parameters.force_delta_threshold_n * 0.4,
+                                    )
                                     descent_origin_m = np.asarray(
                                         record["end_link_target_before_base_link"], dtype=np.float64
                                     )
@@ -4499,17 +4503,9 @@ def run_left_cycle(*, services=None, argv=None) -> int:
                                     descent_progress_reference_m = 0.0
                                     descent_progress_reference_at = time.monotonic()
                                     last_progress_read = 0.0
-                                    xy_priority_pending = False
-                                    xy_aligned_frames = 0
-                                    xy_pause_s = 0.0
-                                    last_descent_tick = time.monotonic()
                                     while True:
                                         position_stream.raise_if_failed()
                                         progress_now = time.monotonic()
-                                        tick_elapsed_s = progress_now - last_descent_tick
-                                        last_descent_tick = progress_now
-                                        if xy_priority_pending:
-                                            xy_pause_s += tick_elapsed_s
                                         if progress_now - last_progress_read >= 0.1:
                                             progress_pose = measured_left_end_link_pose(controller)
                                             descent_actual_delta_m = (
@@ -4526,11 +4522,13 @@ def run_left_cycle(*, services=None, argv=None) -> int:
                                                 "actual_down_m": descent_actual_down_m,
                                                 "actual_lateral_m": descent_actual_lateral_m,
                                                 "completion_tolerance_m": descent_completion_tolerance_m,
-                                                "xy_pause_time_s": xy_pause_s,
                                                 "stall_time_s": descent_stall_s,
+                                                "xy_only": large_xy_error_guard.xy_only,
+                                                "force_hold": near_force_hold.holding,
                                             }
                                             if (
-                                                not xy_priority_pending
+                                                not large_xy_error_guard.xy_only
+                                                and not near_force_hold.holding
                                                 and (
                                                     descent_actual_down_m
                                                     >= descent_distance_m - descent_completion_tolerance_m
@@ -4548,8 +4546,8 @@ def run_left_cycle(*, services=None, argv=None) -> int:
                                             if descent_actual_down_m > descent_progress_reference_m + 0.001:
                                                 descent_progress_reference_m = descent_actual_down_m
                                                 descent_progress_reference_at = progress_now
-                                            elif xy_priority_pending:
-                                                # Deliberate XY alignment is not a stalled Z descent.
+                                            elif large_xy_error_guard.xy_only or near_force_hold.holding:
+                                                # Z is intentionally paused while XY aligns or force releases.
                                                 descent_progress_reference_at = progress_now
                                             elif (
                                                 progress_now - descent_progress_reference_at
@@ -4563,15 +4561,14 @@ def run_left_cycle(*, services=None, argv=None) -> int:
                                         latest_hits = hits
                                         maximum_delta_force_n = max(maximum_delta_force_n, delta_force_n)
                                         if detected:
-                                            position_stream.set_xy_priority(False)
-                                            if xy_priority_pending:
+                                            if large_xy_error_guard.xy_only or near_force_hold.holding:
                                                 hold_pose = measured_left_end_link_pose(controller)
                                                 last_end_link_target = CartesianPoseTarget(
                                                     hold_pose.position_m, last_end_link_target.orientation_xyzw,
                                                 )
                                                 position_stream.rebase_to_measured_pose()
                                                 position_stream.update_target(last_end_link_target)
-                                                final_descent_retry_reason = "contact_before_xy_alignment"
+                                                final_descent_retry_reason = "contact_before_large_xy_alignment"
                                                 break
                                             # Cancel the queued downward goal
                                             # immediately.  Do not wait for a
@@ -4804,6 +4801,15 @@ def run_left_cycle(*, services=None, argv=None) -> int:
                                                     )
                                                 final_descent_retry_reason = "force_relief_failed_retracted_retry"
                                             break
+                                        if large_xy_error_guard.xy_only or near_force_hold.holding:
+                                            was_holding = near_force_hold.holding
+                                            if near_force_hold.update(delta_force_n) != was_holding:
+                                                position_stream.set_force_hold(near_force_hold.holding)
+                                                visual_corrections.append({
+                                                    "accepted": False,
+                                                    "reason": "near_contact_force_hold" if near_force_hold.holding else "near_contact_force_released",
+                                                    "delta_force_n": float(delta_force_n),
+                                                })
                                         # Force is the primary guard.  Do not
                                         # accept visual corrections once the
                                         # force magnitude is even approaching
@@ -4819,7 +4825,6 @@ def run_left_cycle(*, services=None, argv=None) -> int:
                                                     "event": "final_descent_xy_observation",
                                                     "utc": datetime.now(timezone.utc).isoformat(),
                                                     "observation": correction,
-                                                    "xy_priority_pending": xy_priority_pending,
                                                     "actual_position_m": list(measured_left_end_link_pose(controller).position_m),
                                                     "requested_position_m": list(last_end_link_target.position_m),
                                                     "position_stream": position_stream.pose_snapshot(),
@@ -4854,9 +4859,7 @@ def run_left_cycle(*, services=None, argv=None) -> int:
                                                     })
                                                     break
                                                 if correction.get("valid") is None:
-                                                    xy_aligned_frames = 0
-                                                    xy_priority_pending = True
-                                                    position_stream.set_xy_priority(True)
+                                                    large_xy_error_guard.update(None)
                                                     # A distinct fresh frame
                                                     # missed the locked target,
                                                     # but the configured
@@ -4869,19 +4872,26 @@ def run_left_cycle(*, services=None, argv=None) -> int:
                                                         "lost_frames": correction.get("lost_frames"),
                                                     })
                                                     continue
+                                                visual_error_m = correction.get("visual_error_m")
+                                                if visual_error_m is None and correction.get("base_xy_error_m") is not None:
+                                                    visual_error_m = float(np.linalg.norm(correction["base_xy_error_m"]))
+                                                was_xy_only = large_xy_error_guard.xy_only
+                                                xy_only = large_xy_error_guard.update(visual_error_m)
+                                                if xy_only != was_xy_only:
+                                                    configure_final_descent_stream(
+                                                        position_stream, visual_servo_enabled=True,
+                                                        xy_only=xy_only,
+                                                    )
+                                                    if xy_only and near_force_hold.update(delta_force_n):
+                                                        position_stream.set_force_hold(True)
+                                                    visual_corrections.append({
+                                                        "sequence": visual_mailbox_sequence,
+                                                        "accepted": False,
+                                                        "reason": "large_xy_xy_only_started" if xy_only else "large_xy_aligned_resume_z",
+                                                        "visual_error_m": visual_error_m,
+                                                        "action": "pause_z_correct_xy" if xy_only else "resume_z_descent",
+                                                    })
                                                 if "delta_base_m" not in correction:
-                                                    xy_aligned_frames += 1
-                                                    if xy_priority_pending:
-                                                        aligned_pose = measured_left_end_link_pose(controller)
-                                                        last_end_link_target = CartesianPoseTarget(
-                                                            (aligned_pose.position_m[0], aligned_pose.position_m[1],
-                                                             last_end_link_target.position_m[2]),
-                                                            last_end_link_target.orientation_xyzw,
-                                                        )
-                                                        position_stream.update_target(last_end_link_target)
-                                                    if xy_aligned_frames >= 3:
-                                                        xy_priority_pending = False
-                                                        position_stream.set_xy_priority(False)
                                                     # The locked target is
                                                     # healthy and already in
                                                     # the XY tolerance band.
@@ -4895,16 +4905,15 @@ def run_left_cycle(*, services=None, argv=None) -> int:
                                                         "visual_error_m": correction.get("visual_error_m"),
                                                     })
                                                     continue
-                                                xy_aligned_frames = 0
-                                                if delta_force_n >= contact_detector.parameters.force_delta_threshold_n * 0.5:
-                                                    position_stream.set_xy_priority(False)
-                                                    hold_pose = measured_left_end_link_pose(controller)
-                                                    last_end_link_target = CartesianPoseTarget(
-                                                        hold_pose.position_m, last_end_link_target.orientation_xyzw,
-                                                    )
-                                                    position_stream.rebase_to_measured_pose()
-                                                    position_stream.update_target(last_end_link_target)
-                                                    final_descent_retry_reason = "xy_misaligned_near_contact"
+                                                if near_force_hold.holding:
+                                                    visual_corrections.append({
+                                                        "sequence": visual_mailbox_sequence,
+                                                        "accepted": False,
+                                                        "reason": "force_near_contact_waiting_release",
+                                                        "visual_error_m": visual_error_m,
+                                                        "delta_force_n": float(delta_force_n),
+                                                    })
+                                                elif delta_force_n >= contact_detector.parameters.force_delta_threshold_n * 0.5:
                                                     visual_corrections.append({
                                                         "sequence": visual_mailbox_sequence,
                                                         "accepted": False,
@@ -4912,7 +4921,6 @@ def run_left_cycle(*, services=None, argv=None) -> int:
                                                         "delta_force_n": float(delta_force_n),
                                                         "suggested_delta_base_m": correction["delta_base_m"],
                                                     })
-                                                    break
                                                 else:
                                                     proposed_total = visual_total_base_delta + np.asarray(
                                                         correction["delta_base_m"], dtype=np.float64
@@ -4950,12 +4958,6 @@ def run_left_cycle(*, services=None, argv=None) -> int:
                                                         })
                                                         break
                                                     else:
-                                                        xy_priority_pending = request_descent_xy_hold(
-                                                            position_stream,
-                                                            visual_error_m=correction.get("visual_error_m", float("inf")),
-                                                            tolerance_m=args.final_descent_visual_tolerance_mm / 1000.0,
-                                                            already_pending=xy_priority_pending,
-                                                        )
                                                         correction_pose = measured_left_end_link_pose(controller)
                                                         correction_target = CartesianPoseTarget(
                                                             anchored_descent_xy_target(
@@ -4974,20 +4976,22 @@ def run_left_cycle(*, services=None, argv=None) -> int:
                                                         visual_total_base_delta += accepted_delta
                                                         visual_corrections.append({
                                                             "sequence": visual_mailbox_sequence,
-                                                        "accepted": True,
-                                                        "selected_mask_index": correction["selected_mask_index"],
-                                                        "pixel_error_px": correction["pixel_error_px"],
-                                                        "visual_error_m": correction.get("visual_error_m"),
-                                                        "delta_base_m": accepted_delta.tolist(),
+                                                            "accepted": True,
+                                                            "selected_mask_index": correction["selected_mask_index"],
+                                                            "pixel_error_px": correction["pixel_error_px"],
+                                                            "visual_error_m": correction.get("visual_error_m"),
+                                                            "delta_base_m": accepted_delta.tolist(),
                                                             "cumulative_horizontal_m": float(np.linalg.norm(visual_total_base_delta[:2])),
                                                         })
                                         time.sleep(contact_detector.parameters.sample_period_s)
-                                    position_stream.set_independent_xy_z_slew(False)
-                                    position_stream.set_xy_priority(False)
+                                    position_stream.set_force_hold(False)
+                                    configure_final_descent_stream(position_stream, visual_servo_enabled=False)
                                     record["final_descent_visual_servo"] = {
                                         "enabled": visual_mailbox is not None,
                                         "target_lock": "same YOLO target nearest to pre-descent selection; never re-rank left/right during descent",
                                         "max_step_m": args.final_descent_visual_max_step_m,
+                                        "large_displacement_threshold_m": large_xy_error_guard.threshold_m,
+                                        "large_displacement_resume_m": large_xy_error_guard.resume_tolerance_m,
                                         "tolerance_m": args.final_descent_visual_tolerance_mm / 1000.0,
                                         "max_total_horizontal_m": (
                                             None
@@ -4995,6 +4999,7 @@ def run_left_cycle(*, services=None, argv=None) -> int:
                                             else args.final_descent_visual_max_total_m
                                         ),
                                         "force_freeze_delta_n": contact_detector.parameters.force_delta_threshold_n * 0.5,
+                                        "force_resume_delta_n": near_force_hold.release_delta_n,
                                         "accepted_total_base_delta_m": [float(value) for value in visual_total_base_delta],
                                         "corrections": visual_corrections,
                                     }

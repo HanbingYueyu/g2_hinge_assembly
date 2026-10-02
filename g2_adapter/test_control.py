@@ -1041,6 +1041,80 @@ class ControlTests(unittest.TestCase):
         finally:
             stream.stop()
 
+    def test_grasp_descent_enables_xy_slew_without_pausing_z(self):
+        import left_grasp_gdk
+        configure_final_descent_stream = getattr(left_grasp_gdk, "configure_final_descent_stream", None)
+        self.assertIsNotNone(configure_final_descent_stream)
+
+        robot = FakeRobot()
+        controller = G2Controller(FakeGdk, robot, allow_motion=True)
+        initial = CartesianPoseTarget((0.1, 0.2, 0.3), (0.0, 0.0, 0.0, 1.0))
+        stream = controller.start_left_end_effector_position_stream(
+            initial, max_translation_velocity_mps=0.03,
+        )
+        try:
+            configure_final_descent_stream(stream, visual_servo_enabled=True)
+            stream.update_target(CartesianPoseTarget((0.101, 0.2, 0.05), initial.orientation_xyzw))
+            time.sleep(0.2)
+            sent = robot.requests[-1].left_end_effector_pose.position
+            self.assertGreater(sent.x, 0.1003)
+            self.assertLess(sent.z, 0.3)
+            self.assertFalse(stream.pose_snapshot()["xy_priority"])
+        finally:
+            stream.stop()
+
+    def test_grasp_descent_xy_only_moves_xy_then_resumes_z(self):
+        from left_grasp_gdk import configure_final_descent_stream
+
+        robot = FakeRobot()
+        controller = G2Controller(FakeGdk, robot, allow_motion=True)
+        initial = CartesianPoseTarget((0.1, 0.2, 0.3), (0.0, 0.0, 0.0, 1.0))
+        stream = controller.start_left_end_effector_position_stream(
+            initial, max_translation_velocity_mps=0.03,
+        )
+        try:
+            configure_final_descent_stream(stream, visual_servo_enabled=True, xy_only=True)
+            stream.update_target(CartesianPoseTarget((0.105, 0.2, 0.05), initial.orientation_xyzw))
+            time.sleep(0.2)
+            paused = robot.requests[-1].left_end_effector_pose.position
+            self.assertGreater(paused.x, 0.101)
+            self.assertAlmostEqual(paused.z, 0.3)
+            configure_final_descent_stream(stream, visual_servo_enabled=True, xy_only=False)
+            time.sleep(0.15)
+            self.assertLess(robot.requests[-1].left_end_effector_pose.position.z, 0.299)
+        finally:
+            stream.stop()
+
+    def test_left_stream_force_hold_freezes_xyz_and_resumes_pending_target(self):
+        robot = FakeRobot()
+        controller = G2Controller(FakeGdk, robot, allow_motion=True)
+        initial = CartesianPoseTarget((0.1, 0.2, 0.3), (0.0, 0.0, 0.0, 1.0))
+        stream = controller.start_left_end_effector_position_stream(
+            initial, max_translation_velocity_mps=0.03,
+        )
+        try:
+            stream.set_independent_xy_z_slew(True)
+            stream.set_xy_priority(True)
+            stream.update_target(CartesianPoseTarget((0.11, 0.2, 0.05), initial.orientation_xyzw))
+            time.sleep(0.12)
+            stream.set_force_hold(True)
+            held = stream.pose_snapshot()["commanded_position_m"]
+            stale_proposal = CartesianPoseTarget((0.2, 0.2, 0.05), initial.orientation_xyzw)
+            self.assertEqual(
+                stream._refresh_target_before_send(stale_proposal).position_m,
+                tuple(held),
+            )
+            time.sleep(0.15)
+            current = stream.pose_snapshot()["commanded_position_m"]
+            for before, after in zip(held, current):
+                self.assertAlmostEqual(before, after, places=5)
+            self.assertTrue(stream.pose_snapshot()["force_hold"])
+            stream.set_force_hold(False)
+            time.sleep(0.15)
+            self.assertGreater(stream.pose_snapshot()["commanded_position_m"][0], current[0])
+        finally:
+            stream.stop()
+
     def test_left_stream_holds_z_until_xy_priority_is_released(self):
         robot = FakeRobot()
         controller = G2Controller(FakeGdk, robot, allow_motion=True)

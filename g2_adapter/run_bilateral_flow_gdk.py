@@ -229,8 +229,8 @@ def parse_args(argv=None) -> argparse.Namespace:
     parser.add_argument("--head-localize-timeout-s", type=float, default=60.0)
     parser.add_argument("--yolo-center-fraction", type=float, default=0.70,
                         help="左手 D405 YOLO 全图推理时中央有效目标区域宽高比例，默认 0.70。")
-    parser.add_argument("--final-descent-visual-tolerance-mm", type=float, default=2.0,
-                        help="下探视觉伺服的估计水平误差死区，默认 2 mm；超差时暂停 Z，先对准 XY。")
+    parser.add_argument("--final-descent-visual-tolerance-mm", type=float, default=5.0,
+                        help="下探视觉伺服的估计水平误差死区，默认 5 mm；超差时发送受限 XY 修正。")
     parser.add_argument("--post-grasp-target-lost-timeout-s", type=float, default=1.0,
                         help="抓取后同一目标连续不可见多久才重新抓取，默认 1 秒。")
     parser.add_argument("--relief-extra-lift-mm", type=float, default=None,

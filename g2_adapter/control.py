@@ -259,6 +259,7 @@ class LeftEndEffectorPositionStream:
         self._max_translation_velocity_mps = float(max_translation_velocity_mps)
         self._independent_xy_z_slew = False
         self._xy_priority = False
+        self._force_hold = False
         self._allow_orientation_change = bool(allow_orientation_change)
         self._max_angular_velocity_rad_s = float(max_angular_velocity_rad_s)
         self._soft_follow_error_m = float(soft_follow_error_m)
@@ -299,6 +300,7 @@ class LeftEndEffectorPositionStream:
             self._desired = initial_target
             self._actual = None
             self._actual_at = 0.0
+            self._force_hold = False
             self._feedback_sequence = 0
             self._fixed_orientation = initial_target.orientation_xyzw
             self._target_generation = 0
@@ -340,6 +342,15 @@ class LeftEndEffectorPositionStream:
         with self._lock:
             self._xy_priority = bool(enabled)
 
+    def set_force_hold(self, enabled: bool) -> None:
+        """Hold the measured pose until near-contact force has fallen."""
+        with self._lock:
+            if enabled and not self._force_hold and self._actual is not None:
+                self._commanded = CartesianPoseTarget(
+                    self._actual.position_m, self._fixed_orientation,
+                )
+            self._force_hold = bool(enabled)
+
     def pose_snapshot(self) -> dict:
         """Expose the last sent point alongside desired and measured feedback."""
         with self._lock:
@@ -349,6 +360,7 @@ class LeftEndEffectorPositionStream:
                 "actual_position_m": None if self._actual is None else list(self._actual.position_m),
                 "feedback_age_s": time.monotonic() - self._actual_at,
                 "xy_priority": self._xy_priority,
+                "force_hold": self._force_hold,
             }
 
     def rebase_to_measured_pose(self) -> None:
@@ -544,10 +556,15 @@ class LeftEndEffectorPositionStream:
         """Replace a pre-pause proposal with a measured hold after manual motion."""
         gate = self._controller.motion_gate
         if gate is None:
+            with self._lock:
+                if self._force_hold and self._commanded is not None:
+                    return self._commanded
             return proposed
         generation = gate.pause_generation
         with self._lock:
             if generation == self._gate_generation:
+                if self._force_hold and self._commanded is not None:
+                    return self._commanded
                 return proposed
             if self._pending_rebase_generation != generation:
                 # Establish the feedback baseline only after this pause has
@@ -626,6 +643,7 @@ class LeftEndEffectorPositionStream:
                 gripper_joint_positions = self._gripper_joint_positions
                 independent_xy_z_slew = self._independent_xy_z_slew
                 xy_priority = self._xy_priority
+                force_hold = self._force_hold
             if commanded is None or desired is None:
                 return
             if actual is None:
@@ -650,7 +668,7 @@ class LeftEndEffectorPositionStream:
             orientation_angle = 2.0 * math.acos(min(1.0, max(-1.0, orientation_dot)))
             max_angle_step = self._max_angular_velocity_rad_s * self._period_s
             can_advance = actual_follow_error_m <= self._soft_follow_error_m
-            if not can_advance:
+            if force_hold or not can_advance:
                 next_target = commanded
             else:
                 if xy_priority:

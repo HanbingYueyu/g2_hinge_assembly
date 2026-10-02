@@ -8,6 +8,59 @@ from typing import Sequence
 import numpy as np
 
 
+class NearContactForceHold:
+    """Hysteresis for waiting at a measured hold pose near force contact."""
+
+    def __init__(self, *, pause_delta_n: float, release_delta_n: float):
+        if (not math.isfinite(pause_delta_n) or pause_delta_n <= 0
+                or not math.isfinite(release_delta_n)
+                or not 0 <= release_delta_n < pause_delta_n):
+            raise ValueError("near-contact force hold thresholds must be ordered and finite")
+        self.pause_delta_n = float(pause_delta_n)
+        self.release_delta_n = float(release_delta_n)
+        self.holding = False
+
+    def update(self, force_delta_n: float) -> bool:
+        if not math.isfinite(force_delta_n):
+            self.holding = True
+        elif self.holding:
+            self.holding = force_delta_n > self.release_delta_n
+        else:
+            self.holding = force_delta_n >= self.pause_delta_n
+        return self.holding
+
+
+class LargeDescentXYErrorGuard:
+    """Pause descent for confirmed large errors until XY is aligned again."""
+
+    def __init__(self, *, threshold_m: float = 0.015, resume_tolerance_m: float = 0.005,
+                 consecutive_frames: int = 2):
+        if (not math.isfinite(threshold_m) or threshold_m <= 0
+                or not math.isfinite(resume_tolerance_m)
+                or not 0 < resume_tolerance_m < threshold_m
+                or consecutive_frames < 1):
+            raise ValueError("large descent XY error guard needs a positive threshold and frame count")
+        self.threshold_m = float(threshold_m)
+        self.resume_tolerance_m = float(resume_tolerance_m)
+        self.consecutive_frames = int(consecutive_frames)
+        self.large_frames = 0
+        self.xy_only = False
+
+    def update(self, error_m: float | None) -> bool:
+        if error_m is None or not math.isfinite(error_m):
+            self.large_frames = 0
+            return self.xy_only
+        if self.xy_only:
+            if error_m <= self.resume_tolerance_m:
+                self.xy_only = False
+                self.large_frames = 0
+            return self.xy_only
+        self.large_frames = self.large_frames + 1 if error_m > self.threshold_m else 0
+        if self.large_frames >= self.consecutive_frames:
+            self.xy_only = True
+        return self.xy_only
+
+
 def anchored_descent_xy_target(requested, actual, delta, *, max_lookahead_m=0.005):
     """Advance the existing XY goal without rebasing it onto measured drift."""
     goal = np.asarray(requested, dtype=np.float64).copy()

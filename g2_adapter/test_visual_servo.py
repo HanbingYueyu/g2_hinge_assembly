@@ -1,6 +1,7 @@
 import unittest
 
 import numpy as np
+import visual_servo
 
 from visual_servo import (
     base_position_after_delta,
@@ -13,6 +14,28 @@ from visual_servo import (
 
 
 class HorizontalVisualServoTests(unittest.TestCase):
+    def test_near_contact_waits_for_force_to_fall_before_resuming_xy(self):
+        guard_type = getattr(visual_servo, "NearContactForceHold", None)
+        self.assertIsNotNone(guard_type)
+        guard = guard_type(pause_delta_n=1.0, release_delta_n=0.8)
+        self.assertFalse(guard.update(0.9))
+        self.assertTrue(guard.update(1.1))
+        self.assertTrue(guard.update(0.9))
+        self.assertFalse(guard.update(0.7))
+
+    def test_large_descent_error_enters_xy_only_after_two_frames_and_resumes_at_five_mm(self):
+        LargeDescentXYErrorGuard = getattr(visual_servo, "LargeDescentXYErrorGuard", None)
+        self.assertIsNotNone(LargeDescentXYErrorGuard)
+        guard = LargeDescentXYErrorGuard(threshold_m=.015, consecutive_frames=2)
+        self.assertFalse(guard.update(.040))
+        self.assertTrue(guard.update(.057))
+        self.assertTrue(guard.update(.012))
+        self.assertTrue(guard.update(None))
+        self.assertFalse(guard.update(.003))
+        self.assertFalse(guard.update(.040))
+        self.assertFalse(guard.update(None))
+        self.assertFalse(guard.update(.050))
+
     def test_descent_goal_does_not_follow_opposite_measured_drift(self):
         goal = (0.5, 0.399, 0.7)
         for actual_y in (0.402, 0.406, 0.410):

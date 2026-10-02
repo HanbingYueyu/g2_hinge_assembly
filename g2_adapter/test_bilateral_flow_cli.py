@@ -273,7 +273,7 @@ class StageArgvTests(unittest.TestCase):
         # them makes the final descent miss the live XY visual servo.
         argv = self.settings.left_argv()
         self.assertIn("--final-descent-visual-servo", argv)
-        self.assertEqual(argv[argv.index("--final-descent-visual-tolerance-mm") + 1], "2.0")
+        self.assertEqual(argv[argv.index("--final-descent-visual-tolerance-mm") + 1], "5.0")
         self.assertEqual(argv[argv.index("--yolo-center-fraction") + 1], "0.7")
         self.assertEqual(argv[argv.index("--post-grasp-target-lost-timeout-s") + 1], "1.0")
 
