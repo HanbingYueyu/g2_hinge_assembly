@@ -1025,6 +1025,43 @@ class ControlTests(unittest.TestCase):
         finally:
             stream.stop()
 
+    def test_left_stream_xy_remains_responsive_during_long_descent(self):
+        robot = FakeRobot()
+        controller = G2Controller(FakeGdk, robot, allow_motion=True)
+        initial = CartesianPoseTarget((0.1, 0.2, 0.3), (0.0, 0.0, 0.0, 1.0))
+        stream = controller.start_left_end_effector_position_stream(
+            initial, max_translation_velocity_mps=0.03,
+        )
+        try:
+            stream.set_independent_xy_z_slew(True)
+            stream.update_target(CartesianPoseTarget((0.101, 0.2, 0.05), initial.orientation_xyzw))
+            time.sleep(0.2)
+            self.assertGreater(robot.requests[-1].left_end_effector_pose.position.x, 0.1003)
+            self.assertLess(robot.requests[-1].left_end_effector_pose.position.z, 0.3)
+        finally:
+            stream.stop()
+
+    def test_left_stream_holds_z_until_xy_priority_is_released(self):
+        robot = FakeRobot()
+        controller = G2Controller(FakeGdk, robot, allow_motion=True)
+        initial = CartesianPoseTarget((0.1, 0.2, 0.3), (0.0, 0.0, 0.0, 1.0))
+        stream = controller.start_left_end_effector_position_stream(
+            initial, max_translation_velocity_mps=0.03,
+        )
+        try:
+            stream.set_independent_xy_z_slew(True)
+            stream.set_xy_priority(True)
+            stream.update_target(CartesianPoseTarget((0.101, 0.2, 0.05), initial.orientation_xyzw))
+            time.sleep(0.2)
+            positions = [request.left_end_effector_pose.position for request in robot.requests]
+            self.assertGreater(positions[-1].x, 0.1009)
+            self.assertTrue(all(abs(position.z - 0.3) < 1e-9 for position in positions))
+            stream.set_xy_priority(False)
+            time.sleep(0.15)
+            self.assertLess(robot.requests[-1].left_end_effector_pose.position.z, 0.299)
+        finally:
+            stream.stop()
+
     def test_left_stream_does_not_report_arrival_from_command_only(self):
         robot = FakeRobot()
         robot.left_end_pose.position.x, robot.left_end_pose.position.y, robot.left_end_pose.position.z = (0.1, 0.2, 0.3)

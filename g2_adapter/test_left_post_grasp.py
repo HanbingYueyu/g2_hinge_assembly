@@ -7,8 +7,8 @@ from run_left_post_grasp_sequence import PRE_P4_LIFT_M, load_presets
 
 
 class LeftPostGraspSequenceTests(unittest.TestCase):
-    def test_pre_p4_lift_is_150_mm(self):
-        self.assertAlmostEqual(PRE_P4_LIFT_M, 0.15)
+    def test_pre_p4_lift_is_100_mm(self):
+        self.assertAlmostEqual(PRE_P4_LIFT_M, 0.10)
 
     def test_loads_p3_then_p4(self):
         document = {

@@ -202,7 +202,7 @@ def _move_left_to_saved_pose(ctx) -> None:
     except ImportError:
         from left_seat_motion import move_left_vertical
     ctx.runtime.emit_event(move_left_vertical(
-        controller, distance_mm=150.0, speed_mm_s=ctx.args.auto_speed_mm_s,
+        controller, distance_mm=100.0, speed_mm_s=ctx.args.auto_speed_mm_s,
     ))
 
 

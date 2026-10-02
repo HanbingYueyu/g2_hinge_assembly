@@ -8,6 +8,45 @@ from typing import Sequence
 import numpy as np
 
 
+def anchored_descent_xy_target(requested, actual, delta, *, max_lookahead_m=0.005):
+    """Advance the existing XY goal without rebasing it onto measured drift."""
+    goal = np.asarray(requested, dtype=np.float64).copy()
+    actual = np.asarray(actual, dtype=np.float64)
+    delta = np.asarray(delta, dtype=np.float64)
+    # Impedance tracking leaves a steady residual: do not require sub-mm
+    # arrival before advancing. Keep the goal anchored and limit lookahead.
+    proposed = goal[:2] + delta[:2]
+    if np.linalg.norm(proposed - actual[:2]) <= max_lookahead_m:
+        goal[:2] = proposed
+    return tuple(goal)
+
+
+class ReverseXYMotionGuard:
+    """Detect measured travel opposite a persistent requested XY direction."""
+
+    def __init__(self):
+        self.started = None
+        self.origin = None
+        self.direction = None
+
+    def update(self, now, actual, requested):
+        actual = np.asarray(actual, dtype=np.float64)[:2]
+        pending = np.asarray(requested, dtype=np.float64)[:2] - actual
+        distance = float(np.linalg.norm(pending))
+        if distance < 0.001:
+            self.started = None
+            return False
+        direction = pending / distance
+        if self.started is None or float(np.dot(direction, self.direction)) < 0.5:
+            self.started, self.origin, self.direction = now, actual.copy(), direction
+            return False
+        if now - self.started < 0.8:
+            return False
+        reverse = float(np.dot(actual - self.origin, self.direction)) < -0.003
+        self.started, self.origin, self.direction = now, actual.copy(), direction
+        return reverse
+
+
 def relief_translation_speed_mps(automatic_speed_mps: float) -> float:
     """Return the unloading-lift speed used after force contact.
 

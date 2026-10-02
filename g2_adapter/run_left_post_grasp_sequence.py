@@ -3,7 +3,7 @@
 
 P4 is a deliberately operator-recorded workcell pose.  This program never
 opens, closes, or otherwise commands the Omnipicker.  It first makes one
-local, fixed-orientation 150 mm upward end-link motion, then sends only the
+local, fixed-orientation 100 mm upward end-link motion, then sends only the
 seven left-arm joints through GDK's planned joint request and verifies each
 arrival. Omitting ``--allow-motion`` is a complete read-only preflight.
 """
@@ -29,7 +29,7 @@ except ImportError:
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 PRESETS = ("left_p3", "left_p4")
 LEFT_END_LINK = "arm_l_end_link"
-PRE_P4_LIFT_M = 0.15
+PRE_P4_LIFT_M = 0.10
 PRE_P4_LIFT_SPEED_MPS = 0.01
 PRE_P4_LIFT_TOLERANCE_M = 0.01
 
@@ -68,13 +68,13 @@ def write_log(stream, event: dict) -> None:
 
 
 def lift_before_p4(controller: G2Controller) -> dict:
-    """Raise the measured left flange 150 mm in base +Z before P4.
+    """Raise the measured left flange 100 mm in base +Z before P4.
 
     This uses GDK's mode-3 end-effector position stream at the same 50 Hz as
     the grasp servo. It preserves the current flange orientation and never
     includes an end-effector-joint request, so the held gripper state is left
     untouched. P4 is not requested unless the measured lift is within 10 mm
-    of the requested 150 mm and has negligible lateral drift.
+    of the requested 100 mm and has negligible lateral drift.
     """
     before = controller.read_end_effector_pose(LEFT_END_LINK)
     target = CartesianPoseTarget(
@@ -91,7 +91,7 @@ def lift_before_p4(controller: G2Controller) -> dict:
         stream.update_target(target)
         timeout_s = PRE_P4_LIFT_M / PRE_P4_LIFT_SPEED_MPS + 0.50
         if not stream.wait_until_target(timeout_s):
-            raise RuntimeError("P4 前 150 mm 上抬的 GDK 位姿流未在限定时间内发送到目标；拒绝请求 P4")
+            raise RuntimeError("P4 前 100 mm 上抬的 GDK 位姿流未在限定时间内发送到目标；拒绝请求 P4")
         time.sleep(0.10)
         after = controller.read_end_effector_pose(LEFT_END_LINK)
         delta = tuple(float(actual - origin) for actual, origin in zip(after.position_m, before.position_m))
@@ -178,7 +178,7 @@ def main() -> int:
             lift_event = lift_before_p4(controller)
             lift_event["utc"] = datetime.now(timezone.utc).isoformat()
             write_log(log, lift_event)
-            print("P4 前已实测上抬 150 mm；开始依次请求 P3、P4，夹爪未操作。")
+            print("P4 前已实测上抬 100 mm；开始依次请求 P3、P4，夹爪未操作。")
             for name, target in presets:
                 controller.move_preset("left", target, velocity_rad_s=args.velocity_rad_s, life_time_s=args.timeout_per_preset_s, detail=f"traditional held-object {name}")
                 write_log(log, {"event": "request_sent", "preset": name, "utc": datetime.now(timezone.utc).isoformat(), "target_rad": target})
@@ -193,7 +193,7 @@ def main() -> int:
                     time.sleep(0.10)
                 else:
                     raise RuntimeError(f"{name} 在 {args.timeout_per_preset_s:.1f} s 内未到位；停止后续命令，夹爪未操作")
-        print("P4 前已上抬 150 mm，P3、P4 已依次到位；夹爪状态保持原样，未启动检测或力控。")
+        print("P4 前已上抬 100 mm，P3、P4 已依次到位；夹爪状态保持原样，未启动检测或力控。")
         return 0
     except Exception as exc:
         print(f"左手 P4 运输失败：{exc}", file=sys.stderr)

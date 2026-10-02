@@ -28,6 +28,9 @@ def _result_message(event: dict) -> tuple[tuple[str, str], str] | None:
     if event_name == "vlm_regrasp_requested":
         return ("gripper", "lost"), "铰链脱落，重新抓取"
     if event_name == "left_visual_regrasp_requested":
+        reason = event.get("regrasp_reason")
+        if reason is not None and reason != "post_grasp_target_lost_timeout":
+            return None
         return ("visual_regrasp", str(event.get("regrasp_attempt"))), "铰链脱落，重新抓取"
     if event_name == "vlm_gripper_result":
         if event.get("workflow_phase") != "post_grasp" or event.get("ok") is False:
@@ -80,12 +83,16 @@ class VlmTtsAnnouncer:
         self._queue: queue.Queue[str | None] = queue.Queue()
         self._lock = threading.Lock()
         self._spoken_or_queued: set[tuple[str, str]] = set()
+        self._demo_mode: str | None = None
         self._closed = False
         self._thread = threading.Thread(target=self._run, name="vlm-tts", daemon=True)
         self._thread.start()
 
     def handle_event(self, event: dict) -> bool:
         """Queue a supported semantic result once per run or demo round."""
+        if event.get("event") == "demo_round_start":
+            with self._lock:
+                self._demo_mode = str(event.get("mode"))
         if event.get("event") == "demo_round_start" and str(event.get("mode")) == "3":
             with self._lock:
                 self._spoken_or_queued.discard(("fixture", "True"))
@@ -105,6 +112,10 @@ class VlmTtsAnnouncer:
             with self._lock:
                 self._spoken_or_queued.discard(_result_message({"event": "left_stage_complete_above_hole"})[0])
                 self._spoken_or_queued.discard(("gripper", "attached"))
+        if event.get("event") == "left_stage_complete_above_hole":
+            with self._lock:
+                if self._demo_mode == "2":
+                    return False
         parsed = _result_message(event)
         if parsed is None:
             return False

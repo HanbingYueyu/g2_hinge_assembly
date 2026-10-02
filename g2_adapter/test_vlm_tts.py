@@ -98,6 +98,36 @@ class VlmTtsTests(unittest.TestCase):
         self.assertEqual(interaction.messages, ['铰链抓取成功', '铰链脱落，重新抓取',
                                                 '铰链抓取成功', '铰链脱落，重新抓取'])
 
+    def test_pre_grasp_visual_retry_does_not_claim_hinge_dropped(self):
+        announcer = load_module().VlmTtsAnnouncer(interaction := FakeInteraction())
+        try:
+            self.assertFalse(announcer.handle_event({
+                'event': 'left_visual_regrasp_requested', 'regrasp_attempt': 1,
+                'regrasp_reason': 'xy_misaligned_near_contact',
+            }))
+            self.assertTrue(announcer.handle_event({
+                'event': 'left_visual_regrasp_requested', 'regrasp_attempt': 2,
+                'regrasp_reason': 'post_grasp_target_lost_timeout',
+            }))
+        finally:
+            announcer.close()
+        self.assertEqual(interaction.messages, ['铰链脱落，重新抓取'])
+
+    def test_mode_two_keeps_hole_arrival_silent_without_muting_normal_flow(self):
+        arrival = {'event': 'left_stage_complete_above_hole'}
+        demo = load_module().VlmTtsAnnouncer(demo_interaction := FakeInteraction())
+        normal = load_module().VlmTtsAnnouncer(normal_interaction := FakeInteraction())
+        try:
+            demo.handle_event({'event': 'demo_round_start', 'mode': '2', 'round': 1})
+            self.assertTrue(demo.handle_event({'event': 'left_above_hinge_arrived'}))
+            self.assertFalse(demo.handle_event(arrival))
+            self.assertTrue(normal.handle_event(arrival))
+        finally:
+            demo.close()
+            normal.close()
+        self.assertEqual(demo_interaction.messages, ['现在开始抓取铰链'])
+        self.assertEqual(normal_interaction.messages, ['现在插入铰链'])
+
     def test_regrasp_allows_insertion_announcement_again_at_next_hole_arrival(self):
         for regrasp in (
             {'event': 'vlm_regrasp_requested'},

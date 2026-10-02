@@ -257,6 +257,8 @@ class LeftEndEffectorPositionStream:
         self._feedback_period_s = 1.0 / float(feedback_rate_hz)
         self._life_time_s = float(life_time_s)
         self._max_translation_velocity_mps = float(max_translation_velocity_mps)
+        self._independent_xy_z_slew = False
+        self._xy_priority = False
         self._allow_orientation_change = bool(allow_orientation_change)
         self._max_angular_velocity_rad_s = float(max_angular_velocity_rad_s)
         self._soft_follow_error_m = float(soft_follow_error_m)
@@ -327,6 +329,27 @@ class LeftEndEffectorPositionStream:
             self._target_generation += 1
             self._actual_arrival_stable_samples = 0
             self._at_target.clear()
+
+    def set_independent_xy_z_slew(self, enabled: bool) -> None:
+        """Let a short XY correction remain responsive during a long Z descent."""
+        with self._lock:
+            self._independent_xy_z_slew = bool(enabled)
+
+    def set_xy_priority(self, enabled: bool) -> None:
+        """Hold commanded Z while fresh visual feedback requests XY alignment."""
+        with self._lock:
+            self._xy_priority = bool(enabled)
+
+    def pose_snapshot(self) -> dict:
+        """Expose the last sent point alongside desired and measured feedback."""
+        with self._lock:
+            return {
+                "commanded_position_m": None if self._commanded is None else list(self._commanded.position_m),
+                "desired_position_m": None if self._desired is None else list(self._desired.position_m),
+                "actual_position_m": None if self._actual is None else list(self._actual.position_m),
+                "feedback_age_s": time.monotonic() - self._actual_at,
+                "xy_priority": self._xy_priority,
+            }
 
     def rebase_to_measured_pose(self) -> None:
         """Re-anchor the internal commanded point on the latest measured pose.
@@ -601,6 +624,8 @@ class LeftEndEffectorPositionStream:
                 actual_at = self._actual_at
                 gripper_joint_names = self._gripper_joint_names
                 gripper_joint_positions = self._gripper_joint_positions
+                independent_xy_z_slew = self._independent_xy_z_slew
+                xy_priority = self._xy_priority
             if commanded is None or desired is None:
                 return
             if actual is None:
@@ -628,8 +653,19 @@ class LeftEndEffectorPositionStream:
             if not can_advance:
                 next_target = commanded
             else:
-                if distance <= max_step_m:
+                if xy_priority:
+                    xy_distance = float(np.linalg.norm(delta[:2]))
+                    xy_step = delta[:2] * min(1.0, max_step_m / xy_distance) if xy_distance else np.zeros(2)
+                    next_position = current_position + np.asarray((xy_step[0], xy_step[1], 0.0))
+                elif distance <= max_step_m:
                     next_position = desired_position
+                elif independent_xy_z_slew:
+                    xy_distance = float(np.linalg.norm(delta[:2]))
+                    xy_step = delta[:2] * min(1.0, max_step_m / xy_distance) if xy_distance else np.zeros(2)
+                    z_budget = math.sqrt(max(0.0, max_step_m ** 2 - float(np.dot(xy_step, xy_step))))
+                    z_step = math.copysign(min(abs(float(delta[2])), z_budget), float(delta[2]))
+                    step = np.asarray((xy_step[0], xy_step[1], z_step), dtype=np.float64)
+                    next_position = current_position + step
                 else:
                     next_position = current_position + delta * (max_step_m / distance)
                 if orientation_angle <= max_angle_step:

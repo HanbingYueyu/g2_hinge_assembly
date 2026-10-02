@@ -7,10 +7,43 @@ from visual_servo import (
     empirical_horizontal_base_delta_from_pixel_error,
     horizontal_base_delta_from_camera_displacement,
     relief_translation_speed_mps,
+    anchored_descent_xy_target,
+    ReverseXYMotionGuard,
 )
 
 
 class HorizontalVisualServoTests(unittest.TestCase):
+    def test_descent_goal_does_not_follow_opposite_measured_drift(self):
+        goal = (0.5, 0.399, 0.7)
+        for actual_y in (0.402, 0.406, 0.410):
+            goal = anchored_descent_xy_target(goal, (0.5, actual_y, 0.9), (0, -.001, 0))
+            self.assertLessEqual(goal[1], .399)
+        np.testing.assert_allclose(goal, (0.5, .398, .7))
+
+    def test_descent_goal_advances_with_impedance_tracking_residual(self):
+        goal = anchored_descent_xy_target((.5, .398, .7), (.5, .4, .9), (0, -.001, 0))
+        np.testing.assert_allclose(goal, (.5, .397, .7))
+        held = anchored_descent_xy_target(goal, (.5, .41, .9), (0, -.001, 0))
+        np.testing.assert_allclose(held, goal)
+
+    def test_descent_goal_advances_after_robot_catches_up(self):
+        goal = anchored_descent_xy_target((.5, .399, .7), (.5, .399, .9), (0, -.001, 0))
+        np.testing.assert_allclose(goal, (.5, .398, .7))
+
+    def test_reverse_guard_detects_persistent_opposite_motion(self):
+        guard = ReverseXYMotionGuard()
+        goal = (.5, .395, .7)
+        self.assertFalse(guard.update(0.0, (.5, .4, .9), goal))
+        self.assertFalse(guard.update(.4, (.5, .402, .9), goal))
+        self.assertTrue(guard.update(.9, (.5, .404, .9), goal))
+
+    def test_reverse_guard_accepts_forward_motion_and_direction_changes(self):
+        guard = ReverseXYMotionGuard()
+        self.assertFalse(guard.update(0, (.5, .4, .9), (.5, .395, .7)))
+        self.assertFalse(guard.update(.9, (.5, .397, .9), (.5, .395, .7)))
+        self.assertFalse(guard.update(1, (.5, .397, .9), (.5, .405, .7)))
+        self.assertFalse(guard.update(1.9, (.5, .4, .9), (.5, .405, .7)))
+
     def test_identity_camera_preserves_expected_horizontal_direction(self):
         result = horizontal_base_delta_from_camera_displacement(
             (0.002, -0.001, 0.0), (0.01, -0.02, 0.20),

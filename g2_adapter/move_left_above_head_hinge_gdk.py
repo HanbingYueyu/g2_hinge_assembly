@@ -473,6 +473,10 @@ def wait_preset(controller: G2Controller, target: list[float], timeout_s: float 
     raise RuntimeError("左手抓取姿态预设未在限定时间内到位")
 
 
+class LeftTargetArrivalTimeout(RuntimeError):
+    """Measured left end-link pose did not reach the requested target in time."""
+
+
 def wait_actual_left_target(controller, stream, target: CartesianPoseTarget, *, timeout_s: float,
                             tolerance_m: float, orientation_tolerance_deg: float | None = None,
                             stable_samples: int = 3) -> CartesianPoseTarget:
@@ -504,7 +508,7 @@ def wait_actual_left_target(controller, stream, target: CartesianPoseTarget, *, 
             consecutive = 0
         time.sleep(0.10)
     status = controller.motion_status_summary()
-    raise RuntimeError(
+    raise LeftTargetArrivalTimeout(
         f"左手实际末端未稳定到位：last_error_mm={error_m*1000.0:.1f}, "
         f"last_orientation_error_deg={orientation_error_deg:.2f}, "
         f"target={list(target.position_m)}, actual={list(actual.position_m)}, status={status}"
