@@ -1575,7 +1575,8 @@ def execute_local_grasp(
         stream.stop()
 
 
-def return_screwdriver(controller, saved_pose, config, emit, *, release: bool = True) -> None:
+def return_screwdriver(controller, saved_pose, config, emit, *, release: bool = True,
+                       joint_velocity_rad_s: float | None = None) -> None:
     """Return via base +Z clearance; optionally keep the gripper closed.
 
     The staged flow passes ``release=False`` so the electric screwdriver is
@@ -1589,14 +1590,26 @@ def return_screwdriver(controller, saved_pose, config, emit, *, release: bool = 
     local = require_mapping(config.get("local_motion"), "local_motion")
     speed = get_number(auto, "speed_mps", minimum=0.001)
     angular = get_number(auto, "angular_speed_deg_s", minimum=0.1)
-    current = controller.read_end_effector_pose("arm_r_end_link")
+    if joint_velocity_rad_s is not None:
+        try:
+            from .right_hole_joint_move import move_right_hole_joint_target
+        except ImportError:
+            from right_hole_joint_move import move_right_hole_joint_target
+        current = move_right_hole_joint_target(
+            controller, above, velocity_rad_s=joint_velocity_rad_s,
+        )
+        emit({"event": "right_return_arrived", "stage": "above_grasp", "position_m": list(current.position_m)})
+        targets = (("original_grasp", saved_pose),)
+    else:
+        current = controller.read_end_effector_pose("arm_r_end_link")
+        targets = (("above_grasp", above), ("original_grasp", saved_pose))
     stream = controller.start_right_end_effector_position_stream(
         current, rate_hz=50.0, life_time_s=0.10,
         max_translation_velocity_mps=speed, allow_orientation_change=True,
         max_angular_velocity_rad_s=math.radians(angular),
     )
     try:
-        for stage, target in (("above_grasp", above), ("original_grasp", saved_pose)):
+        for stage, target in targets:
             distance = float(np.linalg.norm(np.asarray(target.position_m) - current.position_m))
             duration = max(distance / speed, quaternion_angle_deg(current.orientation_xyzw, target.orientation_xyzw) / angular)
             stream.update_target(target)

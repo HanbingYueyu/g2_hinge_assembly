@@ -224,6 +224,7 @@ def move_right_tool_above_hole(
     roll_deg: float,
     speed_mm_s: float,
     lift_before_move: bool = True,
+    joint_velocity_rad_s: float | None = None,
 ) -> dict:
     """Move to the hole offset, optionally performing the initial grasp lift."""
     lift = (lift_after_grasp(controller, saved_grasp_end, speed_mps=speed_mm_s / 1000.0)
@@ -237,26 +238,33 @@ def move_right_tool_above_hole(
         tool_axis_target_base_m=axis_target,
         target_orientation_xyzw=orientation,
     )
-    speed_mps = float(speed_mm_s) / 1000.0
-    stream = controller.start_right_end_effector_position_stream(
-        current, rate_hz=50.0, life_time_s=0.10,
-        max_translation_velocity_mps=speed_mps,
-        allow_orientation_change=True,
-        max_angular_velocity_rad_s=math.radians(20.0),
-    )
-    try:
-        stream.update_target(target)
-        distance = float(np.linalg.norm(np.asarray(target.position_m) - np.asarray(current.position_m)))
-        angle = quaternion_angle_deg(current.orientation_xyzw, target.orientation_xyzw)
-        timeout_s = distance / speed_mps + angle / 20.0 + 5.0
-        actual = stream.wait_until_actual_target(
-            target, timeout_s, position_tolerance_m=0.005,
-            orientation_tolerance_deg=0.5, stable_samples=3,
+    if joint_velocity_rad_s is not None:
+        try:
+            from .right_hole_joint_move import move_right_hole_joint_target
+        except ImportError:
+            from right_hole_joint_move import move_right_hole_joint_target
+        move_right_hole_joint_target(controller, target, velocity_rad_s=joint_velocity_rad_s)
+    else:
+        speed_mps = float(speed_mm_s) / 1000.0
+        stream = controller.start_right_end_effector_position_stream(
+            current, rate_hz=50.0, life_time_s=0.10,
+            max_translation_velocity_mps=speed_mps,
+            allow_orientation_change=True,
+            max_angular_velocity_rad_s=math.radians(20.0),
         )
-        if actual is None:
-            raise RuntimeError("右手批头未在限定时间内到达 hole 偏移点")
-    finally:
-        stream.stop()
+        try:
+            stream.update_target(target)
+            distance = float(np.linalg.norm(np.asarray(target.position_m) - np.asarray(current.position_m)))
+            angle = quaternion_angle_deg(current.orientation_xyzw, target.orientation_xyzw)
+            timeout_s = distance / speed_mps + angle / 20.0 + 5.0
+            actual = stream.wait_until_actual_target(
+                target, timeout_s, position_tolerance_m=0.005,
+                orientation_tolerance_deg=0.5, stable_samples=3,
+            )
+            if actual is None:
+                raise RuntimeError("右手批头未在限定时间内到达 hole 偏移点")
+        finally:
+            stream.stop()
     return {
         "event": "right_tool_above_hole_arrived",
         "tool_axis_target_base_m": [float(value) for value in axis_target],

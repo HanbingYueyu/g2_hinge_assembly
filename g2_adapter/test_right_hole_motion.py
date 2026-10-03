@@ -15,6 +15,22 @@ from right_hole_motion import (
 
 
 class RightHoleTargetTests(unittest.TestCase):
+    def test_hole_transport_uses_endpoint_joint_plan_after_grasp_lift(self):
+        saved = CartesianPoseTarget((.4, -.2, .6), (0., 0., 0., 1.))
+        controller = Mock()
+        with patch('right_hole_motion.lift_after_grasp') as lift, \
+             patch('right_hole_joint_move.move_right_hole_joint_target', return_value=saved) as move:
+            result = move_right_tool_above_hole(
+                controller, saved, np.eye(4), [.5, .2, .8],
+                x_mm=0, y_mm=60, z_mm=100,
+                yaw_deg=55, pitch_deg=0, roll_deg=0,
+                speed_mm_s=30, joint_velocity_rad_s=.1,
+            )
+        lift.assert_called_once()
+        self.assertEqual(move.call_args.kwargs['velocity_rad_s'], .1)
+        controller.start_right_end_effector_position_stream.assert_not_called()
+        self.assertEqual(result['event'], 'right_tool_above_hole_arrived')
+
     def test_observation_move_skips_grasp_lift_and_waits_for_target(self):
         pose = CartesianPoseTarget((0.4, -0.2, 0.6), (0., 0., 0., 1.))
         controller = Mock()

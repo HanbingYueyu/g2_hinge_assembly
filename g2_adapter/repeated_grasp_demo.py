@@ -25,6 +25,7 @@ MODE_LABELS = {
     '1': '抓取铰链',
     '2': '抓取铰链并移动',
     '3': '抓取电批',
+    '4': '抓取电批并移动',
 }
 
 
@@ -39,7 +40,7 @@ class DemoModeSelection:
 
     def choose(self, key: str) -> str:
         if key not in (*MODE_LABELS, 'q'):
-            raise ValueError('请选择 1、2、3 或 q')
+            raise ValueError('请选择 1、2、3、4 或 q')
         with self._lock:
             self.pending = key
             self._ready.set()
@@ -65,7 +66,7 @@ class DemoModeSelection:
 
 
 class DemoKeyboard:
-    """Read 1/2/3/q without sending robot motion from the input thread."""
+    """Read 1/2/3/4/q without sending robot motion from the input thread."""
 
     def __init__(self, selection: DemoModeSelection, stream=None):
         self.selection = selection
@@ -137,9 +138,14 @@ def run_demo_round(mode: str, actions: dict[str, callable]) -> None:
             actions['to_hole']()
         actions['left_return']()
     else:
+        if mode == '4':
+            actions['head']()
+            actions['require_hole']()
         actions['right_pick']()
         actions['right_vlm']()
         actions['right_lift']()
+        if mode == '4':
+            actions['right_to_hole']()
         actions['right_return']()
 
 
@@ -248,6 +254,28 @@ def _lift_right(ctx) -> None:
     ))
 
 
+def _move_right_to_hole(ctx) -> None:
+    try:
+        from .right_hole_motion import move_right_tool_above_hole
+    except ImportError:
+        from right_hole_motion import move_right_tool_above_hole
+    saved = ctx.services.get('right_saved_grasp_pose')
+    workpiece = ctx.services.get('right_saved_workpiece_pose')
+    hole = (ctx.services.get('head_targets') or {}).get('hole')
+    if saved is None or workpiece is None or hole is None:
+        raise SafetyError('缺少电批抓取位姿、工件位姿或 hole 位置；保持夹持并停止演示')
+    transport = move_right_tool_above_hole(
+        ctx.services.controller, saved, workpiece, hole['position_base_link_m'],
+        x_mm=ctx.args.right_hole_x_mm, y_mm=ctx.args.right_hole_y_mm,
+        z_mm=ctx.args.right_hole_z_mm,
+        yaw_deg=ctx.args.right_hole_yaw_deg, pitch_deg=ctx.args.right_hole_pitch_deg,
+        roll_deg=ctx.args.right_hole_roll_deg,
+        speed_mm_s=ctx.args.auto_speed_mm_s, lift_before_move=False,
+        joint_velocity_rad_s=ctx.args.auto_preset_velocity_rad_s / 2.0,
+    )
+    ctx.runtime.emit_event(transport)
+
+
 def _return_right(ctx) -> None:
     try:
         from .right_apriltag_grasp_gdk import return_screwdriver
@@ -257,7 +285,10 @@ def _return_right(ctx) -> None:
     config = ctx.services.get('right_config')
     if saved is None or config is None:
         raise SafetyError('缺少电批抓取位姿或配置；拒绝放回')
-    return_screwdriver(ctx.services.controller, saved, config, ctx.runtime.emit_event, release=True)
+    return_screwdriver(
+        ctx.services.controller, saved, config, ctx.runtime.emit_event, release=True,
+        joint_velocity_rad_s=ctx.args.auto_preset_velocity_rad_s / 2.0,
+    )
     try:
         from .right_hole_motion import lift_right_before_return
     except ImportError:
@@ -279,7 +310,7 @@ def run_repeated_demo(ctx, selection: DemoModeSelection) -> int:
         from run_bilateral_flow_gdk import (
             stage_home, stage_head_localize, stage_left_grasp, stage_left_to_hole_offset,
         )
-    print('演示选项：1.抓取铰链  2.抓取铰链并移动  3.抓取电批；按 q 完成本轮后结束。', flush=True)
+    print('演示选项：1.抓取铰链  2.抓取铰链并移动  3.抓取电批  4.抓取电批并移动；按 q 完成本轮后结束。', flush=True)
     mode = selection.wait_first()
     if mode is None:
         return 0
@@ -304,6 +335,7 @@ def run_repeated_demo(ctx, selection: DemoModeSelection) -> int:
                 'right_pick': lambda: _run_right_pick(ctx),
                 'right_vlm': lambda: _check_right_vlm(ctx),
                 'right_lift': lambda: _lift_right(ctx),
+                'right_to_hole': lambda: _move_right_to_hole(ctx),
                 'right_return': lambda: _return_right(ctx),
             }
             run_demo_round(mode, actions)
@@ -345,4 +377,4 @@ def _head_localize(ctx, stage):
 
 def _require_hole(ctx):
     if (ctx.services.get('head_targets') or {}).get('hole') is None:
-        raise SafetyError('头部未定位到 hole；本轮不抓取铰链')
+        raise SafetyError('头部未定位到 hole；本轮不开始抓取')

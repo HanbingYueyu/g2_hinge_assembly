@@ -673,9 +673,11 @@ class DispatchTests(unittest.TestCase):
         with patch.object(right_apriltag_grasp_gdk, "run_right_grasp_stage", side_effect=successful_grasp), patch(
             "right_hole_motion.move_right_tool_above_hole",
             return_value={"event": "right_tool_above_hole_arrived"},
-        ):
+        ) as transport:
             result = flow.stage_right_grasp(context)
         self.assertEqual(result["transport"], "right_tool_above_hole_arrived")
+        self.assertEqual(transport.call_args.kwargs["joint_velocity_rad_s"],
+                         context.args.auto_preset_velocity_rad_s / 2.0)
 
     def test_right_teach_runs_only_after_hole_transport_arrives(self):
         from bilateral_web import BilateralWeb, RawPaneFeed

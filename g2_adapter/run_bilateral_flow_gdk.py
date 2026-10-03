@@ -321,7 +321,7 @@ def parse_args(argv=None) -> argparse.Namespace:
     parser.add_argument("--spacemouse-rotation-deg-s", type=float, default=20.0)
     parser.add_argument("--spacemouse-deadzone", type=float, default=0.12)
     parser.add_argument("--repeat-grasp-demo", action="store_true",
-                        help="终端按 1/2/3 选择重复抓取演示；q 在本轮放回后结束。")
+                        help="终端按 1/2/3/4 选择重复抓取演示；q 在本轮放回后结束。")
     parser.add_argument("--from-stage", choices=stage_names(), default=None, help="从指定阶段开始（调试用）。")
     parser.add_argument("--through-stage", choices=stage_names(), default=None,
                         help="执行完指定阶段后正常结束（调试用，包含该阶段）。")
@@ -1044,6 +1044,7 @@ def stage_right_grasp(ctx: FlowContext) -> dict:
         pitch_deg=ctx.args.right_hole_pitch_deg,
         roll_deg=ctx.args.right_hole_roll_deg,
         speed_mm_s=ctx.args.auto_speed_mm_s,
+        joint_velocity_rad_s=ctx.args.auto_preset_velocity_rad_s / 2.0,
     )
     ctx.runtime.emit_event(transport)
     result = {
@@ -1096,10 +1097,12 @@ def stage_right_return(ctx: FlowContext) -> dict:
             yaw_deg=ctx.args.right_hole_yaw_deg, pitch_deg=ctx.args.right_hole_pitch_deg,
             roll_deg=ctx.args.right_hole_roll_deg, speed_mm_s=ctx.args.auto_speed_mm_s,
             lift_before_move=False,
+            joint_velocity_rad_s=ctx.args.auto_preset_velocity_rad_s / 2.0,
         ))
     four_screws = _one_shot_four_screws_check(ctx, phase="before_right_return")
     return_screwdriver(
         ctx.services.controller, saved, config, events.append, release=False,
+        joint_velocity_rad_s=ctx.args.auto_preset_velocity_rad_s / 2.0,
     )
     return {
         "four_screws": four_screws,

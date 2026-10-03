@@ -1,7 +1,12 @@
 import os
 import time
 import unittest
+from types import SimpleNamespace
+from unittest.mock import Mock, patch
 
+import numpy as np
+
+import repeated_grasp_demo as demo
 from repeated_grasp_demo import DemoKeyboard, DemoModeSelection, check_left_return_arrival, run_demo_round
 
 
@@ -51,8 +56,16 @@ class DemoModeSelectionTests(unittest.TestCase):
         self.assertEqual(selection.wait_first(), '1')
         selection.choose('3')
         with self.assertRaises(ValueError):
-            selection.choose('4')
+            selection.choose('5')
         self.assertEqual(selection.next_round(), '3')
+
+    def test_four_selects_screwdriver_transport_for_next_round(self):
+        selection = DemoModeSelection()
+        selection.choose('3')
+        self.assertEqual(selection.wait_first(), '3')
+        self.assertEqual(selection.choose('4'), '抓取电批并移动')
+        self.assertEqual(selection.active, '3')
+        self.assertEqual(selection.next_round(), '4')
 
 
 class LeftReturnTests(unittest.TestCase):
@@ -97,3 +110,37 @@ class DemoRoundTests(unittest.TestCase):
         )}
         run_demo_round('3', actions)
         self.assertEqual(events, ['right_pick', 'right_vlm', 'right_lift', 'right_return'])
+
+    def test_screwdriver_transport_locates_hole_before_pick_and_returns_after_arrival(self):
+        events = []
+        actions = {name: (lambda name=name: events.append(name)) for name in (
+            'head', 'require_hole', 'right_pick', 'right_vlm', 'right_lift',
+            'right_to_hole', 'right_return',
+        )}
+        run_demo_round('4', actions)
+        self.assertEqual(events, [
+            'head', 'require_hole', 'right_pick', 'right_vlm', 'right_lift',
+            'right_to_hole', 'right_return',
+        ])
+
+    def test_screwdriver_hole_transport_uses_half_joint_speed_without_second_lift(self):
+        saved = object()
+        workpiece = np.eye(4)
+        services = Mock()
+        services.get.side_effect = lambda key: {
+            'right_saved_grasp_pose': saved,
+            'right_saved_workpiece_pose': workpiece,
+            'head_targets': {'hole': {'position_base_link_m': [.5, .2, .8]}},
+        }.get(key)
+        args = SimpleNamespace(
+            right_hole_x_mm=0, right_hole_y_mm=60, right_hole_z_mm=100,
+            right_hole_yaw_deg=55, right_hole_pitch_deg=0, right_hole_roll_deg=0,
+            auto_speed_mm_s=30, auto_preset_velocity_rad_s=.2,
+        )
+        ctx = SimpleNamespace(services=services, args=args, runtime=Mock())
+        with patch('right_hole_motion.move_right_tool_above_hole', return_value={'event': 'right_tool_above_hole_arrived'}) as transport:
+            demo._move_right_to_hole(ctx)
+        self.assertEqual(transport.call_args.args[1:4], (saved, workpiece, [.5, .2, .8]))
+        self.assertEqual(transport.call_args.kwargs['joint_velocity_rad_s'], .1)
+        self.assertFalse(transport.call_args.kwargs['lift_before_move'])
+        ctx.runtime.emit_event.assert_called_once_with({'event': 'right_tool_above_hole_arrived'})

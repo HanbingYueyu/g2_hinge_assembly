@@ -192,6 +192,27 @@ class ManualFinishTests(unittest.TestCase):
         self.assertEqual(events[-1]["event"], "right_return_complete_gripper_held")
         self.assertEqual([event["event"] for event in events].count("right_return_arrived"), 2)
 
+    def test_return_uses_joint_plan_to_above_grasp_then_descends(self):
+        saved = CartesianPoseTarget((0.4, -0.3, 0.8), (0, 0, 0, 1))
+        above = CartesianPoseTarget((0.4, -0.3, 0.9), saved.orientation_xyzw)
+        controller = Mock()
+        stream = controller.start_right_end_effector_position_stream.return_value
+        stream.wait_until_actual_target.side_effect = lambda target, *_a, **_k: target
+        config = {
+            "autonomous_approach": {"speed_mps": 0.018, "angular_speed_deg_s": 18},
+            "local_motion": {"final_actual_position_tolerance_m": 0.0005,
+                             "final_actual_orientation_tolerance_deg": 0.5},
+        }
+        events = []
+        with patch("right_hole_joint_move.move_right_hole_joint_target", return_value=above) as move:
+            return_screwdriver(controller, saved, config, events.append,
+                               release=False, joint_velocity_rad_s=.1)
+        self.assertEqual(move.call_args.args[1], above)
+        self.assertEqual(move.call_args.kwargs["velocity_rad_s"], .1)
+        stream.update_target.assert_called_once_with(saved)
+        self.assertEqual([event.get("stage") for event in events[:2]],
+                         ["above_grasp", "original_grasp"])
+
     def test_parse_args_accepts_an_explicit_argv_and_the_staged_stop_flag(self):
         from right_apriltag_grasp_gdk import parse_args
         args = parse_args(["--execute", "--allow-motion", "--stop-after-transport",
