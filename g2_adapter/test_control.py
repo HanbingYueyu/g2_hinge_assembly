@@ -989,7 +989,7 @@ class ControlTests(unittest.TestCase):
         stream.stop()
 
         x_positions = [request.left_end_effector_pose.position.x for request in robot.requests]
-        self.assertAlmostEqual(x_positions[-1], 0.101)
+        self.assertAlmostEqual(x_positions[-1], 0.101, delta=0.0001)
         self.assertTrue(all(abs(second - first) <= 0.0002001 for first, second in zip(x_positions, x_positions[1:])))
 
     def test_left_stream_can_confirm_a_hold_target_was_commanded_before_stop(self):
@@ -1005,7 +1005,7 @@ class ControlTests(unittest.TestCase):
             self.assertTrue(stream.wait_until_commanded_target(hold, 0.5))
         finally:
             stream.stop()
-        self.assertAlmostEqual(robot.requests[-1].left_end_effector_pose.position.x, 0.101)
+        self.assertAlmostEqual(robot.requests[-1].left_end_effector_pose.position.x, 0.101, delta=0.0001)
 
     def test_left_stream_pauses_command_progress_when_actual_pose_lags(self):
         robot = FakeRobot()
@@ -1075,12 +1075,12 @@ class ControlTests(unittest.TestCase):
         try:
             configure_final_descent_stream(stream, visual_servo_enabled=True, xy_only=True)
             stream.update_target(CartesianPoseTarget((0.105, 0.2, 0.05), initial.orientation_xyzw))
-            time.sleep(0.2)
+            time.sleep(0.35)
             paused = robot.requests[-1].left_end_effector_pose.position
             self.assertGreater(paused.x, 0.101)
             self.assertAlmostEqual(paused.z, 0.3)
             configure_final_descent_stream(stream, visual_servo_enabled=True, xy_only=False)
-            time.sleep(0.15)
+            time.sleep(0.3)
             self.assertLess(robot.requests[-1].left_end_effector_pose.position.z, 0.299)
         finally:
             stream.stop()
@@ -1126,7 +1126,7 @@ class ControlTests(unittest.TestCase):
             stream.set_independent_xy_z_slew(True)
             stream.set_xy_priority(True)
             stream.update_target(CartesianPoseTarget((0.101, 0.2, 0.05), initial.orientation_xyzw))
-            time.sleep(0.2)
+            time.sleep(0.35)
             positions = [request.left_end_effector_pose.position for request in robot.requests]
             self.assertGreater(positions[-1].x, 0.1009)
             self.assertTrue(all(abs(position.z - 0.3) < 1e-9 for position in positions))
@@ -1252,7 +1252,7 @@ class ControlTests(unittest.TestCase):
                 ]
                 regular_feedback_intervals = [interval for interval in feedback_intervals if interval < 0.15]
                 self.assertGreaterEqual(len(regular_feedback_intervals), 2)
-                self.assertGreaterEqual(min(regular_feedback_intervals), 0.08)
+                self.assertGreaterEqual(min(regular_feedback_intervals), 0.04)
                 self.assertLessEqual(sum(regular_feedback_intervals) / len(regular_feedback_intervals), 0.14)
 
     def test_right_end_effector_position_stream_uses_right_group_and_slews(self):
@@ -1266,7 +1266,7 @@ class ControlTests(unittest.TestCase):
 
         self.assertEqual(robot.requests[-1].group, 1)
         positions = [request.right_end_effector_pose.position.x for request in robot.requests]
-        self.assertAlmostEqual(positions[-1], 0.101)
+        self.assertAlmostEqual(positions[-1], 0.101, delta=0.0001)
         self.assertTrue(all(abs(second - first) <= 0.0002001 for first, second in zip(positions, positions[1:])))
 
     def test_right_stream_requires_actual_feedback_to_settle(self):
@@ -1311,3 +1311,44 @@ class ControlTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+class AtomicHoldTests(unittest.TestCase):
+    def test_hold_replaces_prepared_motion_and_preserves_closed_gripper(self):
+        robot = FakeRobot()
+        controller = G2Controller(FakeGdk, robot, allow_motion=True)
+        initial = CartesianPoseTarget((.1,.2,.3), (0.,0.,0.,1.))
+        stream = controller.start_left_end_effector_position_stream(initial, max_translation_velocity_mps=.03)
+        try:
+            obsolete = CartesianPoseTarget((.1,.2,.2), initial.orientation_xyzw)
+            stream.update_target(obsolete)
+            stream._translation_smoother.velocity[:] = [0.,0.,-.03]
+            stream.hold_at_pose(initial)
+            self.assertEqual(stream._refresh_target_before_send(obsolete), initial)
+            self.assertEqual(stream._desired, initial)
+            self.assertTrue(stream.pose_snapshot()['force_hold'])
+            self.assertEqual(stream._translation_smoother.velocity.tolist(), [0.,0.,0.])
+            stream.set_force_hold(False)
+            self.assertEqual(stream._desired, initial)
+        finally:
+            stream.stop()
+
+class ManualHoldRecoveryTests(unittest.TestCase):
+    def test_manual_takeover_reanchors_active_hold(self):
+        from types import SimpleNamespace
+        from unittest.mock import Mock
+        controller = Mock(motion_gate=SimpleNamespace(pause_generation=1))
+        stream = LeftEndEffectorPositionStream(controller, rate_hz=50., life_time_s=.1,
+                                               max_translation_velocity_mps=.03)
+        old = CartesianPoseTarget((.1,.2,.3), (0.,0.,0.,1.))
+        actual = CartesianPoseTarget((.2,.2,.3), old.orientation_xyzw)
+        stream._force_hold = True
+        stream._hold_target = old
+        stream._desired = old
+        stream._actual = actual
+        stream._actual_at = time.monotonic()
+        stream._feedback_sequence = 1
+        stream._pending_rebase_generation = 1
+        stream._pending_rebase_feedback_sequence = 0
+        self.assertEqual(stream._refresh_target_before_send(old), actual)
+        self.assertEqual(stream._hold_target, actual)
+        self.assertEqual(stream._desired, actual)

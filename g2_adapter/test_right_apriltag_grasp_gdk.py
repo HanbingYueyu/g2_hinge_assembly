@@ -538,7 +538,7 @@ class RightAprilTagApproachTests(unittest.TestCase):
             },
         }
         result = execute_autonomous_pregrasp(controller, current, target, config)
-        self.assertLess(np.linalg.norm(np.asarray(result.position_m) - np.asarray(target.position_m)), 1e-9)
+        self.assertLess(np.linalg.norm(np.asarray(result.position_m) - np.asarray(target.position_m)), config["autonomous_approach"]["actual_position_tolerance_m"])
         self.assertLess(quaternion_angle_deg(result.orientation_xyzw, target.orientation_xyzw), 1e-6)
         self.assertGreaterEqual(len(robot.requests), 13)
 

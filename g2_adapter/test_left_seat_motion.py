@@ -29,9 +29,10 @@ class LeftSeatMotionTests(unittest.TestCase):
             )
         self.assertEqual(result["stop_reason"], "force_threshold")
         self.assertAlmostEqual(result["descent_mm"], 3.0)
-        hold = self.stream.update_target.call_args_list[-1].args[0]
+        hold = self.stream.hold_at_pose.call_args.args[0]
         self.assertEqual(hold.position_m, (0.4, 0.1, 0.797))
         self.assertEqual(hold.orientation_xyzw, (0, 0, 0, 1))
+        self.stream.hold_at_pose.assert_called_once()
         self.stream.wait_until_commanded_target.assert_called_once()
         self.stream.stop.assert_called_once()
 

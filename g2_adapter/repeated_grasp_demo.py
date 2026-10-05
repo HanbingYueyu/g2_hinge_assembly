@@ -191,7 +191,7 @@ def _move_left_to_saved_pose(ctx) -> None:
     descent = force_guarded_left_descent(
         controller, ctx.services.robot, max_distance_mm=100.0,
         force_threshold_n=float(contact_config['force_delta_threshold_n']),
-        speed_mm_s=min(ctx.args.auto_speed_mm_s, 10.0),
+        speed_mm_s=ctx.args.auto_speed_mm_s,
         completion_tolerance_mm=5.0, timeout_s=30.0,
     )
     ctx.runtime.emit_event(descent)

@@ -48,7 +48,7 @@ class MotionRebasePending(Exception):
 
 
 _FIXED_ORIENTATION_TOLERANCE_DEG = 0.01
-_DEFAULT_FEEDBACK_RATE_HZ = 10.0
+_DEFAULT_FEEDBACK_RATE_HZ = 20.0
 _DEFAULT_SOFT_FOLLOW_ERROR_M = 0.005
 _DEFAULT_FEEDBACK_STALE_TIMEOUT_S = 0.30
 _DEFAULT_ACTUAL_ARRIVAL_POSITION_TOLERANCE_M = 0.005
@@ -213,6 +213,79 @@ class LeftCartesianImpedanceStream:
             self._stop.wait(max(0.0, deadline - time.monotonic()))
 
 
+class VisualVelocityFilter:
+    """Map image corrections to a filtered velocity and 500 ms look-ahead."""
+
+    def __init__(self):
+        self.velocity = np.zeros(3)
+        self.updated_at = None
+
+    def reset(self):
+        self.velocity[:] = 0.0
+        self.updated_at = None
+
+    def update(self, correction, speed, now):
+        correction = np.asarray(correction, dtype=np.float64)
+        velocity = correction * 2.0  # proportional gain, 1/s
+        length = float(np.linalg.norm(velocity))
+        if length > speed:
+            velocity *= speed / length
+        dt = None if self.updated_at is None else now-self.updated_at
+        if dt is None or dt > 0.3 or dt <= 0:
+            self.velocity = velocity
+        else:
+            self.velocity += (velocity-self.velocity) * (dt/(0.08+dt))
+        self.updated_at = now
+        return self.velocity * 0.50
+
+
+class CartesianTranslationSmoother:
+    """Acceleration-limited translation with braking and bounded look-ahead.
+
+    Normal acceleration is 100 mm/s². Safety holds reset velocity immediately.
+    Feedback lag reduces the speed before the existing hard error boundary.
+    """
+
+    def __init__(self):
+        self.velocity = np.zeros(3, dtype=np.float64)
+        self.acceleration_mps2 = 0.1
+
+    def reset(self):
+        self.velocity[:] = 0.0
+
+    def step(self, current, desired, speed, dt, follow_error, error_limit, *, feedback_horizon_s=0.0):
+        current = np.asarray(current, dtype=np.float64)
+        delta = np.asarray(desired, dtype=np.float64) - current
+        distance = float(np.linalg.norm(delta))
+        if follow_error >= error_limit:
+            self.reset()
+            return current.copy()
+        # Begin slowing at 80% of the unchanged hard error limit.
+        scale = min(1.0, max(0.0, (error_limit-follow_error)/(0.2*error_limit)))
+        a = self.acceleration_mps2
+        # Discrete braking includes the next publication interval.
+        braking_speed = max(0.0, math.sqrt((a*dt)**2 + 2*a*distance)-a*dt)
+        goal = delta / distance * min(speed*scale, braking_speed) if distance else np.zeros(3)
+        change = goal-self.velocity
+        change_length = float(np.linalg.norm(change))
+        self.velocity += change * min(1.0, a*dt/change_length) if change_length else change
+        step = self.velocity*dt
+        # No target crossing on the final sub-millimetre step.
+        if distance < 1e-7 or (distance and np.linalg.norm(step) > distance and np.dot(step, delta) > 0):
+            step = delta
+            self.velocity = step/dt
+        if feedback_horizon_s > 0:
+            # Reserve look-ahead budget until the next feedback read. This
+            # prevents a stale cache from causing a full stop/restart cycle.
+            headroom = max(0.0, error_limit-follow_error)
+            step_budget = headroom * min(0.8, dt/max(dt, feedback_horizon_s))
+            step_length = float(np.linalg.norm(step))
+            if step_length > step_budget:
+                step *= step_budget/step_length
+                self.velocity = step/dt
+        return current+step
+
+
 class LeftEndEffectorPositionStream:
     """Keep a mode-3 left end-link target alive at 50 Hz without pose steps.
 
@@ -257,9 +330,15 @@ class LeftEndEffectorPositionStream:
         self._feedback_period_s = 1.0 / float(feedback_rate_hz)
         self._life_time_s = float(life_time_s)
         self._max_translation_velocity_mps = float(max_translation_velocity_mps)
+        self._translation_smoother = CartesianTranslationSmoother()
+        self._publication_count = 0
+        self._last_publication_at = None
+        self._max_publication_interval_s = 0.0
+        self._follow_hold_cycles = 0
         self._independent_xy_z_slew = False
         self._xy_priority = False
         self._force_hold = False
+        self._hold_target = None
         self._allow_orientation_change = bool(allow_orientation_change)
         self._max_angular_velocity_rad_s = float(max_angular_velocity_rad_s)
         self._soft_follow_error_m = float(soft_follow_error_m)
@@ -296,11 +375,13 @@ class LeftEndEffectorPositionStream:
                 raise RuntimeError("end-effector position stream is already started")
             self._thread = None
             self._feedback_thread = None
+            self._translation_smoother.reset()
             self._commanded = initial_target
             self._desired = initial_target
             self._actual = None
             self._actual_at = 0.0
             self._force_hold = False
+            self._hold_target = None
             self._feedback_sequence = 0
             self._fixed_orientation = initial_target.orientation_xyzw
             self._target_generation = 0
@@ -332,6 +413,27 @@ class LeftEndEffectorPositionStream:
             self._actual_arrival_stable_samples = 0
             self._at_target.clear()
 
+    def hold_at_pose(self, target: CartesianPoseTarget) -> None:
+        """Atomically freeze progression and replace old goals with a hold.
+
+        The send-time refresh also observes force_hold, so a proposal already
+        prepared by the sender is replaced before writing to GDK.
+        """
+        self.raise_if_failed()
+        with self._lock:
+            if self._stop.is_set() or self._thread is None:
+                raise RuntimeError("end-effector position stream is not running")
+            if quaternion_angle_deg(target.orientation_xyzw, self._fixed_orientation) > _FIXED_ORIENTATION_TOLERANCE_DEG:
+                raise SafetyError("hold must retain the initial end-link orientation")
+            self._force_hold = True
+            self._hold_target = target
+            self._translation_smoother.reset()
+            self._commanded = target
+            self._desired = target
+            self._target_generation += 1
+            self._actual_arrival_stable_samples = 0
+            self._at_target.clear()
+
     def set_independent_xy_z_slew(self, enabled: bool) -> None:
         """Let a short XY correction remain responsive during a long Z descent."""
         with self._lock:
@@ -350,6 +452,9 @@ class LeftEndEffectorPositionStream:
                     self._actual.position_m, self._fixed_orientation,
                 )
             self._force_hold = bool(enabled)
+            if enabled:
+                self._hold_target = self._commanded
+                self._translation_smoother.reset()
 
     def pose_snapshot(self) -> dict:
         """Expose the last sent point alongside desired and measured feedback."""
@@ -361,6 +466,10 @@ class LeftEndEffectorPositionStream:
                 "feedback_age_s": time.monotonic() - self._actual_at,
                 "xy_priority": self._xy_priority,
                 "force_hold": self._force_hold,
+                "translation_velocity_mps": self._translation_smoother.velocity.tolist(),
+                "publication_count": self._publication_count,
+                "max_publication_interval_s": self._max_publication_interval_s,
+                "follow_hold_cycles": self._follow_hold_cycles,
             }
 
     def rebase_to_measured_pose(self) -> None:
@@ -379,6 +488,7 @@ class LeftEndEffectorPositionStream:
                 and time.monotonic() - self._actual_at <= self._feedback_stale_timeout_s
             ):
                 self._commanded = self._actual
+                self._translation_smoother.reset()
 
     def wait_until_target(self, timeout_s: float) -> bool:
         """Wait until actual end-link feedback reaches the current target."""
@@ -557,14 +667,14 @@ class LeftEndEffectorPositionStream:
         gate = self._controller.motion_gate
         if gate is None:
             with self._lock:
-                if self._force_hold and self._commanded is not None:
-                    return self._commanded
+                if self._force_hold and self._hold_target is not None:
+                    return self._hold_target
             return proposed
         generation = gate.pause_generation
         with self._lock:
             if generation == self._gate_generation:
-                if self._force_hold and self._commanded is not None:
-                    return self._commanded
+                if self._force_hold and self._hold_target is not None:
+                    return self._hold_target
                 return proposed
             if self._pending_rebase_generation != generation:
                 # Establish the feedback baseline only after this pause has
@@ -589,6 +699,10 @@ class LeftEndEffectorPositionStream:
             # increments the gate again and remains pending for the next send.
             self._gate_generation = generation
             self._pending_rebase_generation = None
+            self._translation_smoother.reset()
+            if self._force_hold:
+                self._hold_target = actual
+                self._desired = actual
         return actual
 
     def _feedback_loop(self) -> None:
@@ -620,7 +734,7 @@ class LeftEndEffectorPositionStream:
                             self._arrived_generation = min(self._arrived_generation, generation - 1)
                             self._at_target.clear()
                     if (
-                        self._actual_arrival_stable_samples >= _DEFAULT_ACTUAL_ARRIVAL_STABLE_SAMPLES
+                        self._actual_arrival_stable_samples >= math.ceil(0.30 / self._feedback_period_s)
                     ):
                         self._arrived_generation = max(self._arrived_generation, generation)
                         if generation == self._target_generation:
@@ -667,25 +781,28 @@ class LeftEndEffectorPositionStream:
             )))
             orientation_angle = 2.0 * math.acos(min(1.0, max(-1.0, orientation_dot)))
             max_angle_step = self._max_angular_velocity_rad_s * self._period_s
-            can_advance = actual_follow_error_m <= self._soft_follow_error_m
+            can_advance = actual_follow_error_m < self._soft_follow_error_m
             if force_hold or not can_advance:
+                if not can_advance:
+                    self._follow_hold_cycles += 1
+                self._translation_smoother.reset()
                 next_target = commanded
             else:
+                smooth_goal = desired_position.copy()
                 if xy_priority:
-                    xy_distance = float(np.linalg.norm(delta[:2]))
-                    xy_step = delta[:2] * min(1.0, max_step_m / xy_distance) if xy_distance else np.zeros(2)
-                    next_position = current_position + np.asarray((xy_step[0], xy_step[1], 0.0))
-                elif distance <= max_step_m:
-                    next_position = desired_position
-                elif independent_xy_z_slew:
-                    xy_distance = float(np.linalg.norm(delta[:2]))
-                    xy_step = delta[:2] * min(1.0, max_step_m / xy_distance) if xy_distance else np.zeros(2)
-                    z_budget = math.sqrt(max(0.0, max_step_m ** 2 - float(np.dot(xy_step, xy_step))))
-                    z_step = math.copysign(min(abs(float(delta[2])), z_budget), float(delta[2]))
-                    step = np.asarray((xy_step[0], xy_step[1], z_step), dtype=np.float64)
-                    next_position = current_position + step
-                else:
-                    next_position = current_position + delta * (max_step_m / distance)
+                    smooth_goal[2] = current_position[2]
+                    self._translation_smoother.velocity[2] = 0.0
+                elif independent_xy_z_slew and float(np.linalg.norm(delta[:2])) > max_step_m:
+                    # Reserve a bounded Z share while keeping XY responsive.
+                    z_lookahead = min(abs(float(delta[2])), float(np.linalg.norm(delta[:2])) * 0.5)
+                    smooth_goal[2] = current_position[2] + math.copysign(z_lookahead, float(delta[2]))
+                next_position = self._translation_smoother.step(
+                    current_position, smooth_goal, self._max_translation_velocity_mps,
+                    self._period_s, actual_follow_error_m, self._soft_follow_error_m,
+                    feedback_horizon_s=max(
+                        self._period_s, self._feedback_period_s-(time.monotonic()-actual_at),
+                    ),
+                )
                 if orientation_angle <= max_angle_step:
                     next_orientation = desired.orientation_xyzw
                 else:
@@ -715,7 +832,16 @@ class LeftEndEffectorPositionStream:
                 self._set_error(exc)
                 return
             with self._lock:
-                self._commanded = next_target
+                published_at = time.monotonic()
+                if self._last_publication_at is not None:
+                    self._max_publication_interval_s = max(
+                        self._max_publication_interval_s, published_at-self._last_publication_at,
+                    )
+                self._last_publication_at = published_at
+                self._publication_count += 1
+                # A hold may arrive while GDK is writing a previously
+                # refreshed request. Do not let its completion erase the hold.
+                self._commanded = self._hold_target if self._force_hold and self._hold_target is not None else next_target
             deadline += self._period_s
             now = time.monotonic()
             if deadline <= now:
@@ -770,6 +896,11 @@ class RightEndEffectorPositionStream:
         self._feedback_period_s = 1.0 / float(feedback_rate_hz)
         self._life_time_s = float(life_time_s)
         self._max_translation_velocity_mps = float(max_translation_velocity_mps)
+        self._translation_smoother = CartesianTranslationSmoother()
+        self._publication_count = 0
+        self._last_publication_at = None
+        self._max_publication_interval_s = 0.0
+        self._follow_hold_cycles = 0
         self._allow_orientation_change = bool(allow_orientation_change)
         self._max_angular_velocity_rad_s = float(max_angular_velocity_rad_s)
         self._soft_follow_error_m = float(soft_follow_error_m)
@@ -806,6 +937,7 @@ class RightEndEffectorPositionStream:
                 raise RuntimeError("right end-effector position stream is already started")
             self._thread = None
             self._feedback_thread = None
+            self._translation_smoother.reset()
             self._commanded = initial_target
             self._desired = initial_target
             self._actual = None
@@ -857,6 +989,7 @@ class RightEndEffectorPositionStream:
                 and time.monotonic() - self._actual_at <= self._feedback_stale_timeout_s
             ):
                 self._commanded = self._actual
+                self._translation_smoother.reset()
 
     def set_right_gripper_target(self, position_rad: float) -> None:
         """Synchronize the right Omnipicker with this 50-Hz pose stream.
@@ -1037,6 +1170,7 @@ class RightEndEffectorPositionStream:
         with self._lock:
             self._gate_generation = generation
             self._pending_rebase_generation = None
+            self._translation_smoother.reset()
         return actual
 
     def _feedback_loop(self) -> None:
@@ -1068,7 +1202,7 @@ class RightEndEffectorPositionStream:
                             self._arrived_generation = min(self._arrived_generation, generation - 1)
                             self._at_target.clear()
                     if (
-                        self._actual_arrival_stable_samples >= _DEFAULT_ACTUAL_ARRIVAL_STABLE_SAMPLES
+                        self._actual_arrival_stable_samples >= math.ceil(0.30 / self._feedback_period_s)
                     ):
                         self._arrived_generation = max(self._arrived_generation, generation)
                         if generation == self._target_generation:
@@ -1111,14 +1245,23 @@ class RightEndEffectorPositionStream:
             )))
             orientation_angle_rad = 2.0 * math.acos(min(1.0, max(-1.0, orientation_dot)))
             max_angle_step_rad = self._max_angular_velocity_rad_s * self._period_s
-            can_advance = actual_follow_error_m <= self._soft_follow_error_m
+            can_advance = actual_follow_error_m < self._soft_follow_error_m
             if not can_advance:
+                self._follow_hold_cycles += 1
+                self._translation_smoother.reset()
                 next_target = commanded
             else:
                 if distance <= max_step_m:
                     next_position = wanted
                 else:
                     next_position = current + delta * (max_step_m / distance)
+                next_position = self._translation_smoother.step(
+                    current, wanted, self._max_translation_velocity_mps,
+                    self._period_s, actual_follow_error_m, self._soft_follow_error_m,
+                    feedback_horizon_s=max(
+                        self._period_s, self._feedback_period_s-(time.monotonic()-actual_at),
+                    ),
+                )
                 if not self._allow_orientation_change or orientation_angle_rad <= max_angle_step_rad:
                     next_orientation = desired.orientation_xyzw
                 else:
@@ -1126,7 +1269,7 @@ class RightEndEffectorPositionStream:
                         commanded.orientation_xyzw, desired.orientation_xyzw,
                         max_angle_step_rad / orientation_angle_rad,
                     )
-                if distance <= max_step_m and orientation_angle_rad <= max_angle_step_rad:
+                if np.linalg.norm(wanted-next_position) < 1e-12 and orientation_angle_rad <= max_angle_step_rad:
                     next_target = desired
                 else:
                     next_target = CartesianPoseTarget(
@@ -1160,6 +1303,13 @@ class RightEndEffectorPositionStream:
                 self._set_error(exc)
                 return
             with self._lock:
+                published_at = time.monotonic()
+                if self._last_publication_at is not None:
+                    self._max_publication_interval_s = max(
+                        self._max_publication_interval_s, published_at-self._last_publication_at,
+                    )
+                self._last_publication_at = published_at
+                self._publication_count += 1
                 self._commanded = next_target
             deadline += self._period_s
             now = time.monotonic()

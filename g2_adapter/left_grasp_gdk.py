@@ -1175,6 +1175,11 @@ def json_record(stream, payload: dict) -> None:
     # payload only for discrete lifecycle events; the frame timeline uses the
     # same compact summary shown in the terminal.
     stored = compact_record(payload) if payload.get("event") == "frame" else payload
+    if payload.get("event") == "frame":
+        for key in ("motion_smoothing", "visual_velocity_mps", "visual_motion_held_for_reacquisition",
+                    "visual_motion_resumed_from_measured_pose"):
+            if key in payload:
+                stored[key] = payload[key]
     stream.write(json.dumps(stored, ensure_ascii=False) + "\n")
     stream.flush()
 
@@ -1456,6 +1461,33 @@ def compact_detection(statistics: list[dict], index: int | None) -> dict | None:
         "valid_depth_px": item.get("valid_depth_px"),
         "depth_median_m": item.get("depth_median_m"),
     }
+
+
+def continuous_visual_xy_delta(pixel_error, jacobian, velocity_filter, *, speed_mps, now):
+    # The old 2 mm single-step budget is for discrete corrections. Applying
+    # it before velocity filtering prevents large errors from reaching cruise.
+    correction = empirical_horizontal_base_delta_from_pixel_error(
+        pixel_error, jacobian, max_step_m=speed_mps * 0.5,
+    )
+    return velocity_filter.update(correction, speed_mps, now)
+
+
+def hold_visual_motion_for_reacquisition(controller, stream, last_target, velocity_filter):
+    actual = measured_left_end_link_pose(controller)
+    hold = CartesianPoseTarget(actual.position_m, last_target.orientation_xyzw)
+    stream.hold_at_pose(hold)
+    velocity_filter.reset()
+    return hold
+
+
+def settle_visual_alignment(controller, stream, target, velocity_filter, step, held):
+    if step.reason == "xy_center_confirmation" and not held:
+        target = hold_visual_motion_for_reacquisition(controller, stream, target, velocity_filter)
+        held = True
+    elif step.camera_delta_m is not None and held:
+        stream.set_force_hold(False)
+        held = False
+    return held, target
 
 
 def rgb_mask_statistics(mask: np.ndarray) -> dict:
@@ -2888,6 +2920,13 @@ def run_left_cycle(*, services=None, argv=None) -> int:
     owns_camera = True
     owns_worker = True
     perception: PersistentPerception | None = None
+    try:
+        from .control import VisualVelocityFilter
+    except ImportError:
+        from control import VisualVelocityFilter
+    visual_velocity_filter = VisualVelocityFilter()
+    visual_motion_waiting_for_target = False
+    visual_alignment_held = False
     position_stream: LeftEndEffectorPositionStream | None = None
     initial_gripper_open_stream: LeftEndEffectorPositionStream | None = None
     post_grasp_regrasp_open_stream: LeftEndEffectorPositionStream | None = None
@@ -4053,6 +4092,17 @@ def run_left_cycle(*, services=None, argv=None) -> int:
                     })
                     if selected is None:
                         if (
+                            args.allow_motion and position_stream is not None
+                            and state is not None and state.phase != GraspPhase.GRASPED
+                            and not visual_motion_waiting_for_target
+                        ):
+                            last_end_link_target = hold_visual_motion_for_reacquisition(
+                                controller, position_stream, last_end_link_target, visual_velocity_filter,
+                            )
+                            visual_motion_waiting_for_target = True
+                            visual_alignment_held = False
+                            record["visual_motion_held_for_reacquisition"] = True
+                        if (
                             args.allow_motion
                             and state is not None
                             and state.phase == GraspPhase.GRASPED
@@ -4141,6 +4191,17 @@ def run_left_cycle(*, services=None, argv=None) -> int:
                         json_record(log, record)
                         print_compact_record(record)
                         continue
+                    if visual_motion_waiting_for_target:
+                        if position_stream is not None:
+                            last_end_link_target = hold_visual_motion_for_reacquisition(
+                                controller, position_stream, last_end_link_target, visual_velocity_filter,
+                            )
+                        if state is not None:
+                            state.reset_alignment()
+                        if position_stream is not None:
+                            position_stream.set_force_hold(False)
+                        visual_motion_waiting_for_target = False
+                        record["visual_motion_resumed_from_measured_pose"] = True
                     item = statistics[selected]
                     post_grasp_target_lost_since = None
                     coarse_active = state is not None and state.coarse_active
@@ -4225,6 +4286,11 @@ def run_left_cycle(*, services=None, argv=None) -> int:
                         target_pixel_px=(float(parameters.target_u_px), float(parameters.target_v_px)),
                     )
                     step = state.update(observation, now=time.monotonic())
+                    if args.step_profile is None and args.allow_motion and position_stream is not None:
+                        visual_alignment_held, last_end_link_target = settle_visual_alignment(
+                            controller, position_stream, last_end_link_target,
+                            visual_velocity_filter, step, visual_alignment_held,
+                        )
                     if args.step_profile is not None and step.camera_delta_m is None and step_xy_pending is not None and not gripper_closing:
                         # Entering the tolerance band: cancel the outstanding
                         # lookahead, hold measured position, then reconfirm.
@@ -4268,6 +4334,12 @@ def run_left_cycle(*, services=None, argv=None) -> int:
                             if args.step_metric_xy and not coarse_active:
                                 command_source = "gdk_end_effector_pose_mode3_step_metric_xy"
                                 record["base_xy_error_m"] = item["step_pose"]["base_xy_error_m"]
+                            if args.step_profile is None and not args.single_xy_step:
+                                delta_base = continuous_visual_xy_delta(
+                                    pixel_error, empirical_pixel_jacobian, visual_velocity_filter,
+                                    speed_mps=parameters.final_descent_speed_mps, now=time.monotonic(),
+                                )
+                                record["visual_velocity_mps"] = visual_velocity_filter.velocity.tolist()
                             record["pixel_error_px"] = [float(value) for value in pixel_error]
                             record["xy_step_limit_mm"] = parameters.max_xy_step_m * 1000.0
                             record["pixel_jacobian_px_per_m"] = empirical_pixel_jacobian.tolist()
@@ -4297,6 +4369,9 @@ def run_left_cycle(*, services=None, argv=None) -> int:
                             # orientation change, so use the measured
                             # position as the final-descent origin while
                             # retaining its original fixed orientation.
+                            if visual_alignment_held:
+                                position_stream.set_force_hold(False)
+                                visual_alignment_held = False
                             measured_pose = measured_left_end_link_pose(controller)
                             last_end_link_target = CartesianPoseTarget(
                                 measured_pose.position_m,
@@ -4418,6 +4493,7 @@ def run_left_cycle(*, services=None, argv=None) -> int:
                                     position_stream, visual_servo_enabled=args.final_descent_visual_servo,
                                 )
                             position_stream.update_target(target)
+                            record["motion_smoothing"] = position_stream.pose_snapshot()
                             last_end_link_target = target
                             if args.step_profile is not None and step.camera_delta_m is not None and not args.single_xy_step:
                                 step_xy_pending = (np.asarray(target.position_m), time.monotonic() + max(2.0, float(np.linalg.norm(delta_base)) / parameters.final_descent_speed_mps + 1.0))

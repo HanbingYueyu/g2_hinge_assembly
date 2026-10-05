@@ -144,3 +144,26 @@ class DemoRoundTests(unittest.TestCase):
         self.assertEqual(transport.call_args.kwargs['joint_velocity_rad_s'], .1)
         self.assertFalse(transport.call_args.kwargs['lift_before_move'])
         ctx.runtime.emit_event.assert_called_once_with({'event': 'right_tool_above_hole_arrived'})
+
+
+class ReturnMotionTests(unittest.TestCase):
+    def test_left_return_uses_configured_speed(self):
+        import tempfile
+        from pathlib import Path
+        from control import CartesianPoseTarget
+        saved = CartesianPoseTarget((.4, .1, .7), (0, 0, 0, 1))
+        upper = CartesianPoseTarget((.4, .1, .8), saved.orientation_xyzw)
+        services = Mock()
+        services.get.side_effect = lambda key: saved if key == 'left_demo_grasp_pose' else None
+        services.controller.read_end_effector_pose.side_effect = [upper, upper, saved]
+        with tempfile.TemporaryDirectory() as directory:
+            config = Path(directory) / 'left.json'
+            config.write_text('{"contact":{"force_delta_threshold_n":3}}')
+            ctx = SimpleNamespace(services=services, runtime=Mock(), args=SimpleNamespace(
+                left_config=config, auto_speed_mm_s=30, auto_preset_velocity_rad_s=.2))
+            with patch('left_hole_joint_move.move_left_hole_joint_target'), \
+                 patch('left_seat_motion.force_guarded_left_descent', return_value={'stop_reason':'max_distance'}) as descent, \
+                 patch('left_seat_motion.move_left_vertical', return_value={}):
+                demo._move_left_to_saved_pose(ctx)
+            self.assertEqual(descent.call_args.kwargs['speed_mm_s'], 30)
+            ctx.runtime.open_left_gripper.assert_called_once()

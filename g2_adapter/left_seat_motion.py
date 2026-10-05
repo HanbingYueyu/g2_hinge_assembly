@@ -89,8 +89,10 @@ def force_guarded_left_descent(controller, robot, *, max_distance_mm: float,
                 )
             else:
                 sleep(0.02)
+        # Contact and arrival are safety boundaries: discard the downward
+        # velocity before publishing the measured-pose hold.
         hold = CartesianPoseTarget(actual.position_m, origin.orientation_xyzw)
-        stream.update_target(hold)
+        stream.hold_at_pose(hold)
         hold_timeout_s = max(0.5, max_distance_mm / speed_mm_s + 0.5)
         if not stream.wait_until_commanded_target(hold, hold_timeout_s):
             raise SafetyError("左臂力保护下探停止后，保持位姿未确认发送")

@@ -66,3 +66,46 @@ class LeftRgbPerceptionTests(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+class VisualReacquisitionTests(unittest.TestCase):
+    def test_large_image_error_has_velocity_lookahead(self):
+        from control import VisualVelocityFilter
+        delta = flow.continuous_visual_xy_delta(
+            np.array([100., 0.]), np.eye(2)*1000.,
+            VisualVelocityFilter(), speed_mps=.03, now=1.)
+        self.assertGreater(np.linalg.norm(delta), .002)
+        self.assertLessEqual(np.linalg.norm(delta), .015001)
+
+    def test_reacquisition_hold_discards_old_velocity_and_target(self):
+        from unittest.mock import Mock
+        from control import CartesianPoseTarget, VisualVelocityFilter
+        controller = Mock()
+        measured = CartesianPoseTarget((.4,.2,.9), (0,0,0,1))
+        controller.read_end_effector_pose.return_value = measured
+        stream = Mock()
+        filt = VisualVelocityFilter()
+        filt.update(np.ones(3), .03, 1.)
+        with patch.object(flow, 'measured_left_end_link_pose', return_value=measured):
+            held = flow.hold_visual_motion_for_reacquisition(controller, stream, measured, filt)
+        stream.hold_at_pose.assert_called_once_with(held)
+        np.testing.assert_array_equal(filt.velocity, np.zeros(3))
+        self.assertIsNone(filt.updated_at)
+
+class VisualAlignmentSettlingTests(unittest.TestCase):
+    def test_center_confirmation_cancels_lookahead_until_new_correction(self):
+        from unittest.mock import Mock
+        from control import CartesianPoseTarget, VisualVelocityFilter
+        pose = CartesianPoseTarget((.4,.2,.9), (0,0,0,1))
+        stream = Mock()
+        filt = VisualVelocityFilter()
+        center = SimpleNamespace(reason='xy_center_confirmation', camera_delta_m=None)
+        with patch.object(flow, 'measured_left_end_link_pose', return_value=pose):
+            held, target = flow.settle_visual_alignment(Mock(), stream, pose, filt, center, False)
+            self.assertTrue(held)
+            self.assertEqual(target, pose)
+            flow.settle_visual_alignment(Mock(), stream, pose, filt, center, True)
+        stream.hold_at_pose.assert_called_once()
+        correction = SimpleNamespace(reason='xy_correction', camera_delta_m=(.01,0,0))
+        held, _ = flow.settle_visual_alignment(Mock(), stream, pose, filt, correction, True)
+        self.assertFalse(held)
+        stream.set_force_hold.assert_called_once_with(False)
