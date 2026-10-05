@@ -1253,7 +1253,7 @@ def run_flow(args: argparse.Namespace) -> int:
         keyboard.start()
 
         head_camera = agibot_gdk.Camera([agibot_gdk.CameraType.kHeadColor, agibot_gdk.CameraType.kHeadDepth])
-        left_camera = agibot_gdk.Camera([agibot_gdk.CameraType.kHandLeftColor, agibot_gdk.CameraType.kHandLeftDepth])
+        left_camera = agibot_gdk.Camera([agibot_gdk.CameraType.kHandLeftColor])
         right_camera = agibot_gdk.Camera([agibot_gdk.CameraType.kHandRightColor])
         cameras = [head_camera, left_camera, right_camera]
         tf = agibot_gdk.TF()

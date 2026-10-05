@@ -687,7 +687,7 @@ def parse_args(argv=None) -> argparse.Namespace:
         "--track-max-depth-jump-m",
         type=float,
         default=0.06,
-        help="仅记录跟踪期间相对首次锁定深度的异常跳变阈值；不参与运动决策，默认 60 mm。",
+        help=argparse.SUPPRESS,  # Accepted only for old launch commands.
     )
     parser.add_argument("--track-hold-frames", type=int, default=12)
     parser.add_argument("--warmup", type=int, default=5)
@@ -764,7 +764,7 @@ def parse_args(argv=None) -> argparse.Namespace:
         "--post-grasp-verify-depth-change-m",
         type=float,
         default=0.015,
-        help="验夹中同一实例允许的相对深度变化，默认 15 mm；用于抵抗夹爪遮挡造成的掩膜面积变化。",
+        help=argparse.SUPPRESS,  # RGB verification no longer uses this value.
     )
     parser.add_argument(
         "--post-grasp-monitor-max-stale-s",
@@ -1458,6 +1458,32 @@ def compact_detection(statistics: list[dict], index: int | None) -> dict | None:
     }
 
 
+def rgb_mask_statistics(mask: np.ndarray) -> dict:
+    """Image geometry for RGB tracking; no synthetic depth or 3D point."""
+    rows, cols = np.where(np.asarray(mask, dtype=bool))
+    result = {"area_px": int(rows.size), "valid_depth_px": 0,
+              "depth_median_m": None, "xyz_color_camera_m": None,
+              "xyz_left_arm_end_link_m": None}
+    if rows.size:
+        result.update(center_px=[float(cols.mean()), float(rows.mean())],
+                      bbox_xyxy=[int(cols.min()), int(rows.min()), int(cols.max()), int(rows.max())])
+    return result
+
+
+def rgb_grasp_verification(samples: list[dict], args) -> dict:
+    center_delta = float(np.median([sample["center_delta_px"] for sample in samples]))
+    area_change = float(np.median([sample["area_fraction_change"] for sample in samples]))
+    area_stable = area_change <= args.post_grasp_verify_area_change_fraction
+    held = center_delta <= args.post_grasp_verify_center_drift_px and area_stable
+    return {"lift_m": args.post_grasp_verify_lift_m, "frames": len(samples),
+            "median_center_delta_px": center_delta,
+            "max_center_delta_px": args.post_grasp_verify_center_drift_px,
+            "median_area_fraction_change": area_change,
+            "max_area_fraction_change": args.post_grasp_verify_area_change_fraction,
+            "area_stable": area_stable, "held_with_gripper": held,
+            "action": "transport" if held else "regrasp"}
+
+
 class PersistentPerception:
     """The sole owner of the hand camera, YOLO model, and left web pane.
 
@@ -1522,7 +1548,7 @@ class PersistentPerception:
     def _run(self) -> None:
         color_intrinsic = depth_intrinsic = depth_to_color = end_link_transform = None
         intrinsic_retry_started = time.monotonic()
-        previous_step_timestamp = None
+        previous_color_timestamp = None
         step_trackers = OcclusionTrackerPool()
         last_sam_review_at = float("-inf")
         sam_review: dict = {"accepted": False, "fresh": False, "reason": "awaiting_first_sam_review"}
@@ -1530,18 +1556,18 @@ class PersistentPerception:
             while not self._stop.is_set():
                 started = time.monotonic()
                 color = self.camera.get_latest_image(self.color_type, 1000.0)
+                if color.timestamp_ns == previous_color_timestamp:
+                    self._stop.wait(.002)
+                    continue
+                previous_color_timestamp = color.timestamp_ns
                 color_rgb = decode_color_rgb(color, self.gdk)
                 if self.shared is not None and hasattr(self.shared, 'publish_raw'):
                     raw_ok, raw_jpeg = cv2.imencode('.jpg', cv2.cvtColor(color_rgb, cv2.COLOR_RGB2BGR))
                     if raw_ok:
                         self.shared.publish_raw(raw_jpeg.tobytes(), {'frame_read_started_s': started, 'state': 'left_raw_camera'})
                 use_step = getattr(self.args, "step_profile", None) is not None
-                if use_step:
-                    if color.timestamp_ns == previous_step_timestamp:
-                        time.sleep(.01)
-                        continue
-                    previous_step_timestamp = color.timestamp_ns
-                if not use_step:
+                use_depth = self.args.detector != "yolo" and not use_step
+                if use_depth:
                     depth = self.camera.get_nearest_image(self.depth_type, int(color.timestamp_ns), 1000.0)
                     depth_u16 = decode_depth_u16(depth, self.gdk)
                 if color_intrinsic is None:
@@ -1552,7 +1578,7 @@ class PersistentPerception:
                         )
                         candidate_depth_intrinsic = None
                         candidate_depth_to_color = None
-                        if not use_step:
+                        if use_depth:
                             candidate_depth_intrinsic = intrinsic_to_dict(
                                 self.camera.get_camera_intrinsic(self.depth_type),
                                 width=int(depth.width), height=int(depth.height),
@@ -1560,7 +1586,7 @@ class PersistentPerception:
                             candidate_depth_to_color = transform_to_dict(self.tf.get_tf_from_sensor(
                                 self.gdk.SensorExtrinsicType.kLeftHandDepthToLeftHandColor
                             ))
-                        elif not self.args.step_metric_xy and candidate_color_intrinsic != self.args.step_alignment["intrinsic"]:
+                        elif use_step and not self.args.step_metric_xy and candidate_color_intrinsic != self.args.step_alignment["intrinsic"]:
                             raise RuntimeError("STEP reference camera calibration differs; recapture reference")
                         candidate_end_link_transform = transform_to_dict(self.tf.get_tf_from_sensor(
                             self.gdk.SensorExtrinsicType.kLeftHandRGBDToArmLEndLink
@@ -1582,7 +1608,11 @@ class PersistentPerception:
                     depth_intrinsic = candidate_depth_intrinsic
                     depth_to_color = candidate_depth_to_color
                     end_link_transform = candidate_end_link_transform
-                aligned_depth = np.zeros(color_rgb.shape[:2], dtype=np.uint16) if use_step else align_depth_to_color(depth_u16, depth_intrinsic=depth_intrinsic, color_intrinsic=color_intrinsic, depth_to_color=depth_to_color, depth_scale_m=DEPTH_SCALE_M)
+                aligned_depth = (align_depth_to_color(depth_u16, depth_intrinsic=depth_intrinsic,
+                    color_intrinsic=color_intrinsic, depth_to_color=depth_to_color,
+                    depth_scale_m=DEPTH_SCALE_M) if use_depth else None)
+                if self.args.detector != "yolo" and aligned_depth is None:
+                    aligned_depth = np.zeros(color_rgb.shape[:2], dtype=np.uint16)
                 screen_target_pixel_px = screen_gripper_target_pixel(color_rgb.shape)
                 with self._condition:
                     if self._target_pixel_override is not None:
@@ -1628,6 +1658,7 @@ class PersistentPerception:
                         device=self.args.yolo_device,
                     )
                     statistics = [
+                        rgb_mask_statistics(mask) if self.args.detector == "yolo" else
                         stats_for_mask(mask, aligned_depth, DEPTH_SCALE_M, color_intrinsic, end_link_transform)
                         for mask in masks
                     ]
@@ -2490,7 +2521,6 @@ def move_left_above_hole(*, controller: G2Controller, hole_base_m, args, log, li
         "gripper_pitch_deg": args.hole_gripper_pitch_deg,
         "gripper_roll_deg": args.hole_gripper_roll_deg,
     }
-    print(json.dumps(start, ensure_ascii=False), flush=True)
     json_record(log, start)
     try:
         from .left_hole_joint_move import move_left_hole_joint_target
@@ -2511,7 +2541,6 @@ def move_left_above_hole(*, controller: G2Controller, hole_base_m, args, log, li
         "grasp_center_xyz_error_mm": round(xyz_error_mm, 2),
         "actual_end_link_base_m": [float(value) for value in actual.position_m],
     }
-    print(json.dumps(arrived, ensure_ascii=False), flush=True)
     json_record(log, arrived)
     return arrived
 
@@ -2659,7 +2688,6 @@ def run_left_cycle(*, services=None, argv=None) -> int:
         and args.warmup >= 0
         and args.max_frames >= 0
         and args.track_max_distance_px > 0
-        and 0.0 < args.track_max_depth_jump_m <= 0.20
         and args.track_hold_frames >= 0
         and 0 <= args.web_port <= 65535
         and 0.0 < args.preset_velocity_rad_s
@@ -2680,7 +2708,6 @@ def run_left_cycle(*, services=None, argv=None) -> int:
         and 2 <= args.post_grasp_verify_frames <= 10
         and 1.0 <= args.post_grasp_verify_center_drift_px <= 80.0
         and 0.02 <= args.post_grasp_verify_area_change_fraction <= 0.50
-        and 0.002 <= args.post_grasp_verify_depth_change_m <= 0.050
         and 0.50 <= args.post_grasp_monitor_max_stale_s <= 5.0
         and 0.0 <= args.post_grasp_lift_area_grace_s <= 10.0
         and 2 <= args.post_grasp_lift_area_window_frames <= 60
@@ -3005,7 +3032,7 @@ def run_left_cycle(*, services=None, argv=None) -> int:
         owns_camera = services is None or services.left_camera is None
         camera = (
             services.left_camera if not owns_camera
-            else agibot_gdk.Camera([camera_type] if args.step_profile is not None else [camera_type, depth_type])
+            else agibot_gdk.Camera([camera_type] if args.detector == "yolo" or args.step_profile is not None else [camera_type, depth_type])
         )
         processor = None
         yolo_model = services.left_yolo if services is not None and services.left_yolo is not None else None
@@ -3032,7 +3059,6 @@ def run_left_cycle(*, services=None, argv=None) -> int:
         state = None if parameters is None else LeftGraspState(parameters, coarse_parameters)
         color_intrinsic = depth_intrinsic = depth_to_color = end_link_transform = None
         tracked_center: np.ndarray | None = None
-        tracked_depth_m: float | None = None
         last_height_target_pixel: np.ndarray | None = None
         last_height_target_detail: dict | None = None
         if height_samples:
@@ -3212,16 +3238,6 @@ def run_left_cycle(*, services=None, argv=None) -> int:
                         source = "head_base_target_and_actual_end_link"
                     except Exception:
                         distance_m = None
-                if distance_m is None and item is not None:
-                    xyz = item.get("xyz_color_camera_m")
-                    if xyz is not None:
-                        try:
-                            candidate = float(np.linalg.norm(np.asarray(xyz, dtype=np.float64)))
-                            if math.isfinite(candidate) and candidate > 0.0:
-                                distance_m = candidate
-                                source = "left_hand_depth"
-                        except (TypeError, ValueError):
-                            pass
                 if distance_m is None:
                     if last_height_target_pixel is None:
                         return None
@@ -3361,7 +3377,7 @@ def run_left_cycle(*, services=None, argv=None) -> int:
                         last_end_link_target = CartesianPoseTarget(resumed_pose.position_m, recovery["orientation_xyzw"])
                         state.reset_for_regrasp()
                         regrasp_attempts += 1
-                        tracked_center = tracked_depth_m = None
+                        tracked_center = None
                         missed_frames = 0
                         gripper_sent_at = adaptive_hold_target_rad = adaptive_hold_sent_at = None
                         gripper_position_samples.clear()
@@ -3923,8 +3939,6 @@ def run_left_cycle(*, services=None, argv=None) -> int:
                     statistics = snapshot["statistics"]
                     candidates = snapshot["candidates"]
                     color_intrinsic = snapshot["color_intrinsic"]
-                    depth_intrinsic = snapshot["depth_intrinsic"]
-                    depth_to_color = snapshot["depth_to_color"]
                     end_link_transform = snapshot["end_link_transform"]
                     screen_target_pixel_px = np.asarray(snapshot["screen_gripper_target_pixel_px"], dtype=np.float64)
                     height_target = current_height_reference_target(
@@ -3970,28 +3984,14 @@ def run_left_cycle(*, services=None, argv=None) -> int:
                         }
                         for index in range(len(statistics))
                     ]
-                    depth_jump_rejected: list[int] = []
                     if tracked_center is not None:
                         nearby = [index for index in candidates if float(np.linalg.norm(np.asarray(statistics[index]["center_px"]) - tracked_center)) <= args.track_max_distance_px]
                         if nearby:
-                            # Image-space identity is authoritative for this
-                            # visual/force grasp.  Metallic holes and
-                            # reflections can make a D405 mask depth jump to
-                            # the background, so depth must never cause the
-                            # tracker to substitute a different SAM mask.
+                            # Keep the same RGB target by image-space proximity.
                             selected = min(nearby, key=lambda index: float(np.linalg.norm(np.asarray(statistics[index]["center_px"]) - tracked_center)))
-                            raw_selected_depth = statistics[selected].get("depth_median_m")
-                            selected_depth_m = None if raw_selected_depth is None else float(raw_selected_depth)
-                            depth_outlier = (
-                                tracked_depth_m is not None
-                                and selected_depth_m is not None
-                                and abs(selected_depth_m - tracked_depth_m) > args.track_max_depth_jump_m
-                            )
-                            if depth_outlier:
-                                depth_jump_rejected = [selected]
                             tracked_center = np.asarray(statistics[selected]["center_px"], dtype=np.float64)
                             missed_frames = 0
-                            tracking = "locked_depth_outlier" if depth_outlier else "locked"
+                            tracking = "locked"
                         else:
                             missed_frames += 1
                             selected = None
@@ -4001,15 +4001,11 @@ def run_left_cycle(*, services=None, argv=None) -> int:
                                 missed_frames = 0
                                 selected = choose_candidate(statistics, candidates, args.selection)
                                 tracking = "reacquired" if selected is not None else "no_target"
-                                if selected is not None and statistics[selected].get("depth_median_m") is not None:
-                                    tracked_depth_m = float(statistics[selected]["depth_median_m"])
                     else:
                         selected = choose_candidate(statistics, candidates, args.selection)
                         tracking = "acquired" if selected is not None else "no_target"
                     if selected is not None and tracked_center is None:
                         tracked_center = np.asarray(statistics[selected]["center_px"], dtype=np.float64)
-                        if statistics[selected].get("depth_median_m") is not None:
-                            tracked_depth_m = float(statistics[selected]["depth_median_m"])
                     if args.detector == "yolo-sam":
                         yolo_sam_review = dict(snapshot["sam_review"])
                         record["sam_review"] = {key: value for key, value in yolo_sam_review.items() if key != "timestamp_monotonic"}
@@ -4028,7 +4024,6 @@ def run_left_cycle(*, services=None, argv=None) -> int:
                             # temporary association miss can lock onto an
                             # unreviewed hinge and fail this gate forever.
                             tracked_center = None
-                            tracked_depth_m = None
                             missed_frames = 0
                             record["tracking_lock_reset"] = True
                     shaft_association = (
@@ -4047,9 +4042,6 @@ def run_left_cycle(*, services=None, argv=None) -> int:
                         record["yolo"]["shaft_association"] = shaft_association
                     record.update({
                         "tracking": tracking,
-                        "tracking_depth_anchor_m": tracked_depth_m,
-                        "tracking_depth_max_jump_m": args.track_max_depth_jump_m,
-                        "depth_outlier_candidate_indices": [int(index) for index in depth_jump_rejected],
                         "selected_mask_index": selected,
                         "mask_count": len(statistics),
                         "selected": None if selected is None else statistics[selected],
@@ -4097,7 +4089,7 @@ def run_left_cycle(*, services=None, argv=None) -> int:
                                 )
                                 regrasp_attempts += 1
                                 state.reset_for_regrasp()
-                                tracked_center = tracked_depth_m = None
+                                tracked_center = None
                                 missed_frames = 0
                                 gripper_sent_at = adaptive_hold_target_rad = adaptive_hold_sent_at = None
                                 gripper_position_samples.clear()
@@ -4223,10 +4215,9 @@ def run_left_cycle(*, services=None, argv=None) -> int:
                         record["target_reacquired_reset_to_xy_alignment"] = True
                     observation = Observation(
                         tuple(float(value) for value in servo_pixel(item)),
-                        # The empirical pixel Jacobian below is the only XY
-                        # controller.  Depth is diagnostic/optional and no
-                        # longer filters out the visually leftmost hinge.
-                        float(item["depth_median_m"] if item.get("depth_median_m") is not None else 1.0),
+                        # Runtime replaces the compatibility camera delta
+                        # with the empirical pixel-J correction below.
+                        1.0,  # Compatibility field; empirical pixel-J controls XY.
                         float(color_intrinsic["fx"]), float(color_intrinsic["fy"]),
                         float(color_intrinsic["ppx"]), float(color_intrinsic["ppy"]),
                         base_xy_error_m=item.get("step_pose", {}).get("base_xy_error_m"),
@@ -5034,7 +5025,7 @@ def run_left_cycle(*, services=None, argv=None) -> int:
                                         )
                                         regrasp_attempts += 1
                                         state.reset_for_regrasp()
-                                        tracked_center = tracked_depth_m = None
+                                        tracked_center = None
                                         missed_frames = 0
                                         yolo_sam_review = {
                                             "accepted": False,
@@ -5245,13 +5236,6 @@ def run_left_cycle(*, services=None, argv=None) -> int:
                             post_grasp_verify_samples.append({
                                 "center_delta_px": center_delta_px,
                                 "area_fraction_change": area_fraction_change,
-                                "depth_change_m": abs(
-                                    float(item["depth_median_m"])
-                                    - float(post_grasp_verify_baseline["depth_median_m"])
-                                ) if (
-                                    item.get("depth_median_m") is not None
-                                    and post_grasp_verify_baseline.get("depth_median_m") is not None
-                                ) else None,
                                 "center_px": item["center_px"],
                                 "area_px": item["area_px"],
                             })
@@ -5267,46 +5251,8 @@ def run_left_cycle(*, services=None, argv=None) -> int:
                                 json_record(log, record)
                                 print_compact_record(record)
                                 continue
-                            median_center_delta_px = float(np.median([
-                                sample["center_delta_px"] for sample in post_grasp_verify_samples
-                            ]))
-                            median_area_fraction_change = float(np.median([
-                                sample["area_fraction_change"] for sample in post_grasp_verify_samples
-                            ]))
-                            depth_changes = [
-                                sample["depth_change_m"] for sample in post_grasp_verify_samples
-                                if sample["depth_change_m"] is not None
-                            ]
-                            median_depth_change_m = (
-                                None if not depth_changes else float(np.median(depth_changes))
-                            )
-                            area_stable = median_area_fraction_change <= args.post_grasp_verify_area_change_fraction
-                            depth_stable = (
-                                median_depth_change_m is not None
-                                and median_depth_change_m <= args.post_grasp_verify_depth_change_m
-                            )
-                            held_with_gripper = (
-                                median_center_delta_px <= args.post_grasp_verify_center_drift_px
-                                # A correctly gripped hinge is frequently partly hidden
-                                # by the closing fingers.  Its YOLO mask geometry can
-                                # change during the controlled +Z verification lift;
-                                # these values are retained for diagnosis only.
-                                and (area_stable or depth_stable)
-                            )
-                            verification = {
-                                "lift_m": args.post_grasp_verify_lift_m,
-                                "frames": args.post_grasp_verify_frames,
-                                "median_center_delta_px": median_center_delta_px,
-                                "max_center_delta_px": args.post_grasp_verify_center_drift_px,
-                                "median_area_fraction_change": median_area_fraction_change,
-                                "max_area_fraction_change": args.post_grasp_verify_area_change_fraction,
-                                "median_depth_change_m": median_depth_change_m,
-                                "max_depth_change_m": args.post_grasp_verify_depth_change_m,
-                                "area_stable": area_stable,
-                                "depth_stable": depth_stable,
-                                "held_with_gripper": held_with_gripper,
-                            }
-                            verification["action"] = "transport" if held_with_gripper else "regrasp"
+                            verification = rgb_grasp_verification(post_grasp_verify_samples, args)
+                            held_with_gripper = verification["held_with_gripper"]
                             post_grasp_verify_baseline = None
                             post_grasp_verify_samples.clear()
                             record["post_grasp_verify"] = verification
@@ -5328,7 +5274,7 @@ def run_left_cycle(*, services=None, argv=None) -> int:
                                 )
                                 regrasp_attempts += 1
                                 state.reset_for_regrasp()
-                                tracked_center = tracked_depth_m = None
+                                tracked_center = None
                                 missed_frames = 0
                                 gripper_sent_at = adaptive_hold_target_rad = adaptive_hold_sent_at = None
                                 gripper_position_samples.clear()
@@ -5385,7 +5331,7 @@ def run_left_cycle(*, services=None, argv=None) -> int:
                                     )
                                     regrasp_attempts += 1
                                     state.reset_for_regrasp()
-                                    tracked_center = tracked_depth_m = None
+                                    tracked_center = None
                                     missed_frames = 0
                                     gripper_sent_at = adaptive_hold_target_rad = adaptive_hold_sent_at = None
                                     gripper_position_samples.clear()
@@ -5484,7 +5430,6 @@ def run_left_cycle(*, services=None, argv=None) -> int:
                                     "baseline": {
                                         "center_px": [float(value) for value in item["center_px"]],
                                         "area_px": int(item["area_px"]),
-                                        "depth_median_m": item.get("depth_median_m"),
                                     },
                                 }
                                 record.update({
@@ -5623,7 +5568,7 @@ def run_left_cycle(*, services=None, argv=None) -> int:
                             )
                             regrasp_attempts += 1
                             state.reset_for_regrasp()
-                            tracked_center = tracked_depth_m = None
+                            tracked_center = None
                             missed_frames = 0
                             gripper_sent_at = adaptive_hold_target_rad = adaptive_hold_sent_at = None
                             gripper_position_samples.clear()

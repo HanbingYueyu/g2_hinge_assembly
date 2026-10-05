@@ -1,4 +1,5 @@
 import inspect
+import contextlib
 import io
 import pathlib
 import re
@@ -102,6 +103,14 @@ def make_args(**overrides) -> Namespace:
 
 
 class LeftAboveHoleTests(unittest.TestCase):
+    def test_successful_hole_move_logs_details_without_terminal_json(self):
+        terminal = io.StringIO()
+        with contextlib.redirect_stdout(terminal):
+            self._run()
+        self.assertEqual(terminal.getvalue(), "")
+        self.assertIn('"event": "left_above_hole_motion_start"', self.log.getvalue())
+        self.assertIn('"event": "left_above_hole_arrived"', self.log.getvalue())
+
     def test_head_approach_uses_endpoint_ik_and_preset_velocity(self):
         args = left_grasp_gdk.parse_args([])
         args.auto_preset_velocity_rad_s = .23

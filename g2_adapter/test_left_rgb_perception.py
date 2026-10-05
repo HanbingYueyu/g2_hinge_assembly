@@ -1,0 +1,68 @@
+import unittest
+from types import SimpleNamespace
+from unittest.mock import patch
+
+import numpy as np
+import left_grasp_gdk as flow
+
+
+class LeftRgbPerceptionTests(unittest.TestCase):
+    def test_full_flow_perception_reads_only_color_and_skips_duplicate_frames(self):
+        from run_bilateral_flow_gdk import StageSettings, parse_args
+        args = flow.parse_args(StageSettings(parse_args([])).left_argv())
+        args.min_area = 1
+        frames = iter([1, 1, 2])
+
+        class Camera:
+            def get_latest_image(self, *_):
+                return SimpleNamespace(timestamp_ns=next(frames), width=20, height=20)
+
+            def get_nearest_image(self, *_):
+                raise AssertionError('Left RGB flow requested depth')
+
+            def get_camera_intrinsic(self, kind):
+                if kind != 'color':
+                    raise AssertionError('Left RGB flow requested depth calibration')
+                return None
+
+        class Tf:
+            def get_tf_from_sensor(self, kind):
+                if kind != 'color_to_end':
+                    raise AssertionError('Left RGB flow requested depth extrinsics')
+                return None
+
+        gdk = SimpleNamespace(SensorExtrinsicType=SimpleNamespace(
+            kLeftHandRGBDToArmLEndLink='color_to_end'))
+        worker = flow.PersistentPerception(camera=Camera(), color_type='color',
+            depth_type='depth', gdk=gdk, tf=Tf(), processor=None,
+            yolo_model=SimpleNamespace(names={0: 'hinge'}), args=args,
+            shared=None, yolo_model_path=args.yolo_model)
+        mask = np.zeros((20, 20), dtype=bool)
+        mask[6:14, 6:14] = True
+        with patch.object(flow, 'decode_color_rgb', return_value=np.zeros((20, 20, 3), dtype=np.uint8)), \
+             patch.object(flow, 'intrinsic_to_dict', return_value={}), \
+             patch.object(flow, 'transform_to_dict', return_value={}), \
+             patch.object(flow, 'align_depth_to_color', side_effect=AssertionError('Unexpected alignment')), \
+             patch.object(flow, 'infer_yolo_masks', return_value=([mask], [.9], [0])) as infer:
+            worker._run()
+        self.assertIsInstance(worker._failure, StopIteration)
+        self.assertEqual(worker._sequence, 2)
+        self.assertEqual(infer.call_count, 2)
+        self.assertEqual(worker._latest['statistics'][0]['area_px'], 64)
+        self.assertEqual(worker._latest['statistics'][0]['center_px'], [9.5, 9.5])
+
+    def test_rgb_verification_rejects_unstable_area_even_with_stable_depth(self):
+        args = flow.parse_args([])
+        samples = [dict(center_delta_px=0., area_fraction_change=.5, depth_change_m=0.)] * 3
+        report = flow.rgb_grasp_verification(samples, args)
+        self.assertFalse(report['held_with_gripper'])
+
+    def test_rgb_verification_accepts_stable_held_mask_without_depth(self):
+        args = flow.parse_args([])
+        samples = [dict(center_delta_px=1., area_fraction_change=.01)] * 3
+        report = flow.rgb_grasp_verification(samples, args)
+        self.assertTrue(report['held_with_gripper'])
+
+
+if __name__ == '__main__':
+    unittest.main()
