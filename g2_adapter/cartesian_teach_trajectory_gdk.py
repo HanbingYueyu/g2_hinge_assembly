@@ -324,6 +324,11 @@ def _parser() -> argparse.ArgumentParser:
     combined.add_argument("--side", choices=("left", "right"), required=True)
     combined.add_argument("--raw-output", type=Path, required=True)
     combined.add_argument("--output", type=Path, required=True, help="优化后的 *_cartesian_solved.json")
+    combined.add_argument("--spline-output", type=Path, help="B 样条关节轨迹，默认同目录 *_bspline_solved.json")
+    combined.add_argument("--comparison-output", type=Path, help="对比图，默认同目录 *_comparison.png")
+    combined.add_argument("--bspline-control-points", type=int, default=6)
+    combined.add_argument("--bspline-strength", type=float, default=0.1)
+    combined.add_argument("--no-show", action="store_true", help="只保存对比图，不打开窗口")
     combined.add_argument("--rate-hz", type=float, default=100.0)
     combined.add_argument("--duration-s", type=float)
     combined.add_argument("--urdf", type=Path, default=DEFAULT_URDF)
@@ -415,8 +420,15 @@ def main(argv=None) -> int:
         if args.command == "record-optimize":
             raw_output = args.raw_output.expanduser().resolve()
             output = args.output.expanduser().resolve()
-            if raw_output == output:
-                raise ValueError("原始轨迹与优化轨迹不能使用同一个输出文件")
+            stem = output.stem.removesuffix("_solved")
+            spline_output = (args.spline_output or output.with_name(stem + "_bspline_solved.json")).expanduser().resolve()
+            comparison_output = (args.comparison_output or output.with_name(stem + "_comparison.png")).expanduser().resolve()
+            spline_cartesian = spline_output.with_name(spline_output.stem + "_cartesian.json")
+            paths = [raw_output, output, spline_output, spline_cartesian, comparison_output]
+            if len(set(paths)) != len(paths):
+                raise ValueError("原始轨迹、两种优化轨迹及对比图必须使用不同的输出文件")
+            if not 4 <= args.bspline_control_points <= 32 or not math.isfinite(args.bspline_strength) or args.bspline_strength < 0:
+                raise ValueError("B 样条控制点须为 4–32，平滑强度须非负且有限")
             record_argv = [
                 "record", "--side", args.side, "--output", str(raw_output),
                 "--rate-hz", str(args.rate_hz), "--urdf", str(args.urdf),
@@ -432,8 +444,12 @@ def main(argv=None) -> int:
                 return result
             try:
                 from .optimize_cartesian_teach_trajectory import main as optimize_main
+                from .optimize_bspline_trajectory import main as spline_main
+                from .plot_cartesian_trajectory import main as plot_main
             except ImportError:
                 from optimize_cartesian_teach_trajectory import main as optimize_main
+                from optimize_bspline_trajectory import main as spline_main
+                from plot_cartesian_trajectory import main as plot_main
             optimize_argv = [
                 "--input", str(raw_output), "--output", str(output),
                 "--rate-hz", str(args.rate_hz), "--urdf", str(args.urdf),
@@ -448,7 +464,22 @@ def main(argv=None) -> int:
             ):
                 optimize_argv.extend(("--" + name, str(getattr(args, name.replace("-", "_")))))
             print("原始轨迹已保存并释放 GDK；开始离线优化与整轨 IK。", flush=True)
-            return optimize_main(optimize_argv)
+            result = optimize_main(optimize_argv)
+            spline_result = spline_main([
+                "--input", str(raw_output), "--output", str(spline_output),
+                "--urdf", str(args.urdf), "--rate-hz", str(args.rate_hz),
+                "--control-points", str(args.bspline_control_points),
+                "--strength", str(args.bspline_strength),
+                "--max-velocity-rad-s", str(args.max_velocity_rad_s),
+                "--max-acceleration-rad-s2", str(args.max_acceleration_rad_s2),
+            ])
+            plot_argv = ["--raw", str(raw_output), "--optimized", str(output),
+                         "--spline", str(spline_output), "--urdf", str(args.urdf),
+                         "--output", str(comparison_output)]
+            if not args.no_show:
+                plot_argv.append("--show")
+            plot_result = plot_main(plot_argv)
+            return result or spline_result or plot_result or 0
         if args.command == "solve":
             return _solve(args)
         if args.command == "inspect":

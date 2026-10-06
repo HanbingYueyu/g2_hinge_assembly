@@ -9,7 +9,7 @@ from types import SimpleNamespace
 import numpy as np
 
 from .top_hinge_four_hole_workflow import (
-    LIFT_M, _append_stages, _current_cad_rotation, _first_hole_translation,
+    HOLE_OFFSETS_BASE_LINK_M, LIFT_M, _append_stages, _current_cad_rotation, _first_hole_translation,
     _followup_target,
     _settle_replay_final_joints,
 )
@@ -33,6 +33,33 @@ def _pair(geometry, theta, table=(0.5, 0.1)):
 
 
 class TopHingeFourHoleWorkflowTest(unittest.TestCase):
+    def test_hole_biases_use_robot_axes_without_inheriting_first_hole_bias(self):
+        geometry = measure_top_hinge()
+        nominal_first = np.array((0.45, -0.01286, 0.75))
+        expected_biases = ((0.002, -0.003, 0), (0, 0, 0),
+                           (0, 0, 0), (0.002, -0.003, 0))
+        self.assertEqual(HOLE_OFFSETS_BASE_LINK_M, expected_biases)
+        first = nominal_first + np.asarray(expected_biases[0])
+        # A rotated workpiece must not rotate the robot-relative correction.
+        for theta in (0.0, math.pi / 2, -0.4):
+            rotation, mapping = _current_cad_rotation(
+                geometry, _pair(geometry, 0), _pair(geometry, theta),
+            )
+            stages, _ = _append_stages(
+                geometry, tuple(first), (0, 0, 0, 1), rotation, mapping,
+            )
+            np.testing.assert_allclose(stages[0]["position_base_link_m"],
+                                       first + (0, 0, LIFT_M), atol=1e-12)
+            for index, (_, cad_xy) in enumerate(geometry.next_holes_xy_mm, start=1):
+                nominal_xy = (nominal_first[:2] + rotation @ (
+                    np.asarray(cad_xy) - np.asarray(geometry.green_xy_mm)
+                ) / 1000.0)
+                np.testing.assert_allclose(
+                    stages[index * 3 - 1]["position_base_link_m"],
+                    (*(nominal_xy + np.asarray(expected_biases[index][:2])), nominal_first[2]),
+                    atol=1e-12,
+                )
+
     def test_followup_keeps_stream_start_orientation_after_feedback_changes(self):
         initial = CartesianPoseTarget((0.4, -0.1, 0.74), (0.0, 0.0, 0.0, 1.0))
         settled_feedback = CartesianPoseTarget(

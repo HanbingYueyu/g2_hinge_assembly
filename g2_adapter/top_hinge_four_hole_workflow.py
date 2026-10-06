@@ -41,6 +41,15 @@ SEGMENT_IK_SPACING_M = 0.005
 FIRST_HOLE_MAX_INITIAL_ERROR_M = 0.003
 FIRST_HOLE_ARRIVAL_TOLERANCE_M = 0.001
 FIRST_HOLE_JOINT_TOLERANCE_RAD = 0.003
+# Robot-facing directions in base_link: +X forward, +Y left.
+# Execution order: taught first hole, bottom_middle, top_right, top_left.
+# Includes the additional +2 mm forward correction on all four holes.
+HOLE_OFFSETS_BASE_LINK_M = (
+    (0.002, -0.003, 0.0),
+    (0.0, 0.0, 0.0),
+    (0.0, 0.0, 0.0),
+    (0.002, -0.003, 0.0),
+)
 
 
 def _sha256(path: Path) -> str:
@@ -113,6 +122,11 @@ def _retarget_independent(
     new_end, offset, diagnostics = _first_hole_translation(
         geometry, old_pair, new_pair, taught_end, cad_handedness,
     )
+    nominal_new_end = new_end
+    relocation_offset = offset
+    first_offset = HOLE_OFFSETS_BASE_LINK_M[0]
+    new_end = tuple(value + bias for value, bias in zip(new_end, first_offset))
+    offset = tuple(value + bias for value, bias in zip(offset, first_offset))
     shifted = translate_document(original_raw, offset)
     if not np.allclose(shifted["samples"][-1]["position_m"], new_end, rtol=0, atol=1e-9):
         raise ValueError("First-hole endpoint differs from the taught endpoint plus the two-target offset")
@@ -124,6 +138,7 @@ def _retarget_independent(
         "original_reference": old_pair["reference_dir"],
         "new_reference": new_pair["reference_dir"],
         "translation_base_link_m": list(offset),
+        "hole_offset_base_link_m": list(first_offset),
     }
     raw_output = output / "right_cartesian_raw.json"
     solved_output = output / "right_cartesian_solved.json"
@@ -150,6 +165,9 @@ def _retarget_independent(
         "old_end_base_link_m": list(taught_end),
         "new_start_base_link_m": shifted["samples"][0]["position_m"],
         "new_end_base_link_m": list(new_end),
+        "nominal_new_end_base_link_m": list(nominal_new_end),
+        "relocation_translation_base_link_m": list(relocation_offset),
+        "hole_offsets_base_link_m": [list(value) for value in HOLE_OFFSETS_BASE_LINK_M],
         "constant_translation_base_link_m": list(offset),
         "trajectory_orientation_changed": False,
         "trajectory_z_changed": False,
@@ -247,13 +265,17 @@ def _append_stages(
     rotation = _apply_handedness(rotation, geometry, cad_handedness)
     mapping = {**mapping, "cad_handedness": cad_handedness,
                "cad_to_base_xy_determinant": float(np.linalg.det(rotation))}
-    green_xy = np.asarray(endpoint_xyz_m[:2], dtype=float)
+    # The replay endpoint already includes hole 1's bias. Recover the nominal
+    # CAD anchor, then apply each later bias independently in robot axes.
+    green_xy = (np.asarray(endpoint_xyz_m[:2], dtype=float)
+                - np.asarray(HOLE_OFFSETS_BASE_LINK_M[0][:2]))
     base_z = float(endpoint_xyz_m[2])
-    current_xy = green_xy
+    current_xy = np.asarray(endpoint_xyz_m[:2], dtype=float)
     stages = []
-    for name, cad_xy in geometry.next_holes_xy_mm:
+    for index, (name, cad_xy) in enumerate(geometry.next_holes_xy_mm, start=1):
         cad_offset = np.asarray(cad_xy) - np.asarray(geometry.green_xy_mm)
-        target_xy = green_xy + rotation @ cad_offset / 1000.0
+        target_xy = (green_xy + rotation @ cad_offset / 1000.0
+                     + np.asarray(HOLE_OFFSETS_BASE_LINK_M[index][:2]))
         for stage, point in (
             ("lift_20mm", (current_xy[0], current_xy[1], base_z + LIFT_M)),
             ("xy_at_lifted_z", (target_xy[0], target_xy[1], base_z + LIFT_M)),
@@ -342,6 +364,7 @@ def build_append_plan(
         "mapping": mapping,
         "move_order": [name for name, _ in geometry.next_holes_xy_mm],
         "lift_m": LIFT_M,
+        "hole_offsets_base_link_m": [list(value) for value in HOLE_OFFSETS_BASE_LINK_M],
         "stages": stages,
         "offline_ik": preflight,
     }

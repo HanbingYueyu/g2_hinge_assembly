@@ -22,13 +22,19 @@ class DemoModeSelectionTests(unittest.TestCase):
         self.assertEqual(selection.active, '2')
         self.assertEqual(selection.next_round(), '2')
 
-    def test_stop_is_deferred_until_round_end(self):
+    def test_stop_cancels_active_round_and_can_return_to_menu(self):
         selection = DemoModeSelection()
         selection.choose('3')
         self.assertEqual(selection.wait_first(), '3')
         selection.choose('q')
         self.assertEqual(selection.active, '3')
-        self.assertIsNone(selection.next_round())
+        with self.assertRaises(demo.DemoCancelled):
+            selection.check_cancelled()
+        selection.return_to_menu()
+        self.assertIsNone(selection.active)
+        selection.check_cancelled()
+        selection.choose('2')
+        self.assertEqual(selection.wait_first(), '2')
 
     def test_keyboard_queues_switch_while_round_is_active(self):
         read_fd, write_fd = os.pipe()
@@ -56,7 +62,7 @@ class DemoModeSelectionTests(unittest.TestCase):
         self.assertEqual(selection.wait_first(), '1')
         selection.choose('3')
         with self.assertRaises(ValueError):
-            selection.choose('5')
+            selection.choose('7')
         self.assertEqual(selection.next_round(), '3')
 
     def test_four_selects_screwdriver_transport_for_next_round(self):
@@ -66,6 +72,61 @@ class DemoModeSelectionTests(unittest.TestCase):
         self.assertEqual(selection.choose('4'), '抓取电批并移动')
         self.assertEqual(selection.active, '3')
         self.assertEqual(selection.next_round(), '4')
+
+
+class DemoCancellationTests(unittest.TestCase):
+    def test_cancel_during_action_stops_round_and_returns_to_selection(self):
+        selection = DemoModeSelection()
+        selection.choose('1')
+        controller = SimpleNamespace(motion_gate=None, demo_cancel_guard=None)
+        ctx = SimpleNamespace(
+            services=SimpleNamespace(controller=controller, put=Mock()),
+            runtime=SimpleNamespace(emit=Mock()),
+        )
+        def cancel_round(*_args):
+            selection.choose('q')
+            controller.demo_cancel_guard()
+        def stop(_ctx):
+            self.assertTrue(selection._cancel.is_set())
+        original_wait = selection.wait_first
+        calls = []
+        def wait():
+            calls.append(1)
+            if len(calls) == 2:
+                self.assertIsNone(selection.active)
+                selection.choose('q')
+            return original_wait()
+        with patch.object(selection, 'wait_first', side_effect=wait), \
+             patch('run_bilateral_flow_gdk.stage_home'), \
+             patch('repeated_grasp_demo.run_demo_round', side_effect=cancel_round), \
+             patch('repeated_grasp_demo._stop_cancelled_round', side_effect=stop) as stopped:
+            self.assertEqual(demo.run_repeated_demo(ctx, selection), 0)
+        stopped.assert_called_once_with(ctx)
+        self.assertEqual(len(calls), 2)
+        self.assertIsNone(controller.demo_cancel_guard)
+
+    def test_paused_gate_is_cancelled_without_resuming_motion(self):
+        from spacemouse_takeover import MotionPauseGate
+        import threading
+        selection = DemoModeSelection()
+        selection.choose('1')
+        selection.wait_first()
+        gate = MotionPauseGate()
+        gate.cancel_guard = selection.check_cancelled
+        gate.pause()
+        errors = []
+        def waiting():
+            try:
+                gate.wait_for_auto()
+            except demo.DemoCancelled:
+                errors.append('cancelled')
+        thread = threading.Thread(target=waiting)
+        thread.start()
+        selection.choose('q')
+        thread.join(timeout=.5)
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(errors, ['cancelled'])
+        self.assertTrue(gate.is_paused())
 
 
 class LeftReturnTests(unittest.TestCase):

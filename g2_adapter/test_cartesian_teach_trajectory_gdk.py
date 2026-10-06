@@ -355,7 +355,9 @@ class RecordOptimizeTests(unittest.TestCase):
 
             with patch("cartesian_teach_trajectory_gdk._open_gdk", return_value=(gdk, object())), \
                  patch("cartesian_teach_trajectory_gdk.record_trajectory", return_value=trajectory), \
-                 patch("optimize_cartesian_teach_trajectory.main", side_effect=optimize):
+                 patch("optimize_cartesian_teach_trajectory.main", side_effect=optimize), \
+                 patch("optimize_bspline_trajectory.main", return_value=0) as spline, \
+                 patch("plot_cartesian_trajectory.main", return_value=0) as plot:
                 code = main([
                     "record-optimize", "--side", "left", "--raw-output", str(raw),
                     "--output", str(solved), "--max-acceleration-rad-s2", "20.0",
@@ -363,6 +365,24 @@ class RecordOptimizeTests(unittest.TestCase):
                 ])
             self.assertEqual(code, 0)
             self.assertEqual(events, ["released"])
+            spline_args = spline.call_args.args[0]
+            self.assertEqual(spline_args[spline_args.index("--output") + 1],
+                             str(Path(directory) / "left_bspline_solved.json"))
+            self.assertIn("--show", plot.call_args.args[0])
+
+    def test_output_collision_is_rejected_before_recording(self):
+        with patch("cartesian_teach_trajectory_gdk._open_gdk") as open_gdk:
+            code = main(["record-optimize", "--side", "right",
+                         "--raw-output", "/tmp/raw.json", "--output", "/tmp/solved.json",
+                         "--spline-output", "/tmp/raw.json", "--allow-motion"])
+        self.assertEqual(code, 1)
+        open_gdk.assert_not_called()
+
+    def test_no_show_option(self):
+        args = _parser().parse_args(["record-optimize", "--side", "left",
+                                    "--raw-output", "raw.json", "--output", "solved.json",
+                                    "--no-show"])
+        self.assertTrue(args.no_show)
 
 
 class OfflineCliTests(unittest.TestCase):

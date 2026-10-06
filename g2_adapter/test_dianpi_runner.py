@@ -212,3 +212,21 @@ class DianpiImportFallbackTests(unittest.TestCase):
         names = [event["event"] for event in events]
         self.assertEqual(names.count("dianpi_unavailable"), 1)
         self.assertNotIn("dianpi_error", names)
+
+
+class ReusableCycleStopTests(unittest.TestCase):
+    def test_stop_preserves_connection_and_allows_another_cycle(self):
+        controller = FakeController(block=True)
+        runner, _, _ = make_runner(controller=controller)
+        try:
+            self.assertEqual(runner.trigger(), DianpiTriggerResult.STARTED)
+            self.assertTrue(controller.cycle_started.wait(timeout=1))
+            runner.stop_current_cycle()
+            self.assertFalse(runner.running)
+            self.assertEqual(controller.stop_calls, 1)
+            self.assertEqual(controller.close_calls, 0)
+            self.assertEqual(runner.trigger(), DianpiTriggerResult.STARTED)
+            wait_until(lambda: not runner.running)
+            self.assertEqual(controller.open_calls, 1)
+        finally:
+            runner.close()

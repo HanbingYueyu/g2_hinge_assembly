@@ -16,6 +16,7 @@ class DianpiTriggerResult(str, Enum):
     STARTED = "started"
     BUSY = "busy"
     ERROR = "error"
+    DISABLED = "disabled"
 
 
 def _default_controller_factory():
@@ -62,6 +63,8 @@ class DianpiCycleRunner:
         self._running = False
         self._closed = False
         self._last_error: BaseException | None = None
+        self._trigger_enabled = True
+        self._automatic_only = False
 
     @property
     def running(self) -> bool:
@@ -117,8 +120,19 @@ class DianpiCycleRunner:
                         pass
                 raise
 
-    def trigger(self) -> DianpiTriggerResult:
+    def set_trigger_policy(self, *, enabled: bool, automatic_only: bool) -> tuple[bool, bool]:
         with self._lock:
+            if self._running:
+                raise RuntimeError("电批正在运行，不能切换演示模式")
+            previous = (self._trigger_enabled, self._automatic_only)
+            self._trigger_enabled = bool(enabled)
+            self._automatic_only = bool(automatic_only)
+            return previous
+
+    def trigger(self, *, automatic: bool = False) -> DianpiTriggerResult:
+        with self._lock:
+            if not self._trigger_enabled or (self._automatic_only and not automatic):
+                return DianpiTriggerResult.DISABLED
             if self._closed:
                 self._emit({"event": "dianpi_error", "error": "runner closed"})
                 return DianpiTriggerResult.ERROR
@@ -226,6 +240,9 @@ class DianpiCycleRunner:
             controller = self._ensure_controller()
             self._emit({"event": "dianpi_started"})
             result = controller.run_cycle()
+            if result is False:
+                with self._lock:
+                    self._last_error = RuntimeError("电批运行超时，未确认完成")
             self._emit({"event": "dianpi_timeout" if result is False else "dianpi_finished"})
         except BaseException as exc:
             with self._lock:
@@ -235,6 +252,20 @@ class DianpiCycleRunner:
             with self._lock:
                 self._running = False
                 self._thread = None
+
+    def stop_current_cycle(self, timeout_s: float = 1.0) -> None:
+        """Stop the current tool cycle while preserving the reusable connection."""
+        with self._lock:
+            controller, thread = self._controller, self._thread
+        if thread is None:
+            return
+        if controller is None or not hasattr(controller, "stop_cycle"):
+            raise RuntimeError("电批控制器不支持停止当前周期")
+        controller.stop_cycle()
+        if thread is not threading.current_thread():
+            thread.join(timeout=timeout_s)
+        if thread.is_alive():
+            raise RuntimeError("电批周期停止超时")
 
     def close(self, timeout_s: float = 1.0) -> None:
         with self._lock:

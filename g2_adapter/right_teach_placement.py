@@ -40,7 +40,8 @@ def run_right_teach_sequence(services, args, runtime):
     paths = right_trajectory_paths(args)
     results = []
     for index, path in enumerate(paths, 1):
-        if index > 1:
+        automatic_demo = getattr(runtime, "automatic_demo_mode", None) in {"5", "6"}
+        if index > 1 and not automatic_demo:
             print(f"[右手示教] 等待右键长按2秒开始第 {index}/{len(paths)} 段。", flush=True)
             runtime.wait_for_advance(SimpleNamespace(stage=f"right_teach_gate_{index}"))
         print(f"[右手示教] 开始第 {index}/{len(paths)} 段：{path}", flush=True)
@@ -51,6 +52,10 @@ def run_right_teach_sequence(services, args, runtime):
         result = replay_right_placement(services, segment_args)
         results.append(result)
         runtime.emit("right_teach_segment_complete", segment=index, **result)
+        if automatic_demo:
+            if result.get("interrupted_by_takeover") or result.get("interrupted_by_advance"):
+                raise RuntimeError("示教被接管，未确认螺丝点位到达；停止自动演示")
+            runtime.on_right_teach_point(index, result)
     return results[0] if len(results) == 1 else {"method": "teach", "segments": results}
 
 

@@ -10,6 +10,7 @@ import termios
 import threading
 import tty
 from pathlib import Path
+from copy import copy
 
 import numpy as np
 
@@ -26,7 +27,13 @@ MODE_LABELS = {
     '2': '抓取铰链并移动',
     '3': '抓取电批',
     '4': '抓取电批并移动',
+    '5': '全流程单次（不启动电批）',
+    '6': '全流程单次（启动电批）',
 }
+
+
+class DemoCancelled(SafetyError):
+    """The operator cancelled this round, without ending the GDK session."""
 
 
 class DemoModeSelection:
@@ -37,14 +44,29 @@ class DemoModeSelection:
         self._ready = threading.Event()
         self.active = None
         self.pending = None
+        self._cancel = threading.Event()
 
     def choose(self, key: str) -> str:
         if key not in (*MODE_LABELS, 'q'):
-            raise ValueError('请选择 1、2、3、4 或 q')
+            raise ValueError('请选择 1、2、3、4、5、6 或 q')
         with self._lock:
-            self.pending = key
-            self._ready.set()
-        return '完成当前轮后停止' if key == 'q' else MODE_LABELS[key]
+            if key == 'q' and self.active in MODE_LABELS:
+                self._cancel.set()
+            else:
+                self.pending = key
+                self._ready.set()
+        return '停止当前动作并返回选择界面' if key == 'q' else MODE_LABELS[key]
+
+    def check_cancelled(self):
+        if self._cancel.is_set():
+            raise DemoCancelled('已按 q 取消当前演示')
+
+    def return_to_menu(self):
+        with self._lock:
+            self.active = None
+            self.pending = None
+            self._ready.clear()
+            self._cancel.clear()
 
     def wait_first(self) -> str | None:
         while True:
@@ -58,6 +80,8 @@ class DemoModeSelection:
 
     def next_round(self) -> str | None:
         with self._lock:
+            if self.active in {'5', '6'} and self.pending is None:
+                self.active = None
             if self.pending is not None:
                 self.active = self.pending
                 self.pending = None
@@ -66,7 +90,7 @@ class DemoModeSelection:
 
 
 class DemoKeyboard:
-    """Read 1/2/3/4/q without sending robot motion from the input thread."""
+    """Read 1/2/3/4/5/6/q without sending robot motion from the input thread."""
 
     def __init__(self, selection: DemoModeSelection, stream=None):
         self.selection = selection
@@ -109,7 +133,7 @@ class DemoKeyboard:
                     key = chr(byte).lower()
                     if key in MODE_LABELS or key == 'q':
                         label = self.selection.choose(key)
-                        print(f'\n[演示选择] {label}；当前轮完成后生效。', flush=True)
+                        print(f'\n[演示选择] {label}' + ('。' if key == 'q' else '；当前轮完成后生效。'), flush=True)
             except (OSError, ValueError, TypeError):
                 self.selection.choose('q')
                 return
@@ -129,7 +153,9 @@ def run_demo_round(mode: str, actions: dict[str, callable]) -> None:
     """Complete a whole pick-and-return transaction before the mode can change."""
     if mode not in MODE_LABELS:
         raise ValueError(f'未知演示模式：{mode}')
-    if mode in {'1', '2'}:
+    if mode in {'5', '6'}:
+        actions['full_flow'](mode)
+    elif mode in {'1', '2'}:
         actions['head']()
         if mode == '2':
             actions['require_hole']()
@@ -300,7 +326,147 @@ def _return_right(ctx) -> None:
     ctx.services.controller.prepare_joint_impedance_control(('right',))
 
 
+class AutomaticDemoRuntime:
+    """Skip advance gates while retaining guards and point-arrival waits."""
+
+    def __init__(self, runtime, mode, runner):
+        self._runtime = runtime
+        self.automatic_demo_mode = mode
+        self.runner = runner
+        self._point_generation = None
+
+    def __getattr__(self, name):
+        return getattr(self._runtime, name)
+
+    def wait_for_advance(self, spec, **_kwargs):
+        self.controller.check_automatic_guard()
+        self.emit("demo_automatic_advance", stage=str(getattr(spec, "stage", spec)))
+
+    def on_right_teach_point(self, index, result):
+        try:
+            from .dianpi_runner import DianpiTriggerResult
+        except ImportError:
+            from dianpi_runner import DianpiTriggerResult
+        gate = getattr(self._runtime, 'gate', None)
+        self._point_generation = getattr(gate, 'pause_generation', None)
+        delay_s = 1.0 if self.automatic_demo_mode == '6' else 3.0
+        self.emit('demo_screw_point_hold_start', point=index, mode=self.automatic_demo_mode, dwell_s=delay_s)
+        deadline = self.clock()+delay_s
+        while self.clock() < deadline:
+            self._check_guard()
+            self.sleep(min(.02, max(0.,deadline-self.clock())))
+        if self.automatic_demo_mode == '6':
+            self._check_guard()
+            if gate is not None and isinstance(self._point_generation, int):
+                with gate.automatic_teach_motion(self._point_generation):
+                    outcome = self.runner.trigger(automatic=True)
+            else:
+                outcome = self.runner.trigger(automatic=True)
+            if outcome != DianpiTriggerResult.STARTED:
+                raise SafetyError(f"螺丝点位 {index} 电批未启动：{outcome}")
+            timeout = self.clock()+120.0
+            while True:
+                self._check_guard()
+                running = self.runner.running
+                error = self.runner.last_error
+                if error is not None:
+                    raise SafetyError(f"电批运行失败：{error}")
+                if not running:
+                    break
+                if self.clock() >= timeout:
+                    raise SafetyError("等待电批运行结束超过 120 秒；停止自动演示")
+                self.sleep(.02)
+        self.emit('demo_screw_point_hold_complete', point=index, mode=self.automatic_demo_mode)
+
+    def _check_guard(self):
+        gate = getattr(self._runtime, 'gate', None)
+        if gate is not None and (
+            gate.is_paused() is True
+            or (self._point_generation is not None and gate.pause_generation != self._point_generation)
+        ):
+            raise SafetyError('螺丝点位等待期间发生人工接管；停止自动演示')
+        self.controller.check_automatic_guard()
+        if self.worker is not None:
+            self.worker.raise_if_failed()
+
+
+def _run_full_flow_demo(ctx, mode):
+    try:
+        from .run_bilateral_flow_gdk import _drive
+    except ImportError:
+        from run_bilateral_flow_gdk import _drive
+    args = copy(ctx.args)
+    if not args.teach_enable or len(args.right_teach_trajectories or []) != 4:
+        raise SafetyError('模式 5/6 需要启用示教并指定四段右手轨迹')
+    args.repeat_grasp_demo = False
+    try:
+        from .left_teach_placement import validate_teach_args
+        from .right_teach_placement import validate_right_teach_args
+    except ImportError:
+        from left_teach_placement import validate_teach_args
+        from right_teach_placement import validate_right_teach_args
+    validate_teach_args(args)
+    validate_right_teach_args(args)
+    args.from_stage = 'home'
+    args.through_stage = 'finish'
+    runner = ctx.services.dianpi_runner
+    policy = runner.set_trigger_policy(enabled=mode == '6', automatic_only=True)
+    previous_runtime, previous_args = ctx.runtime, ctx.settings.args
+    ctx.runtime = AutomaticDemoRuntime(previous_runtime, mode, runner)
+    ctx.settings.args = args
+    try:
+        if _drive(ctx, args) != 0:
+            raise SafetyError('自动全流程未完成；停止演示并保持当前状态')
+    finally:
+        ctx.runtime = previous_runtime
+        ctx.settings.args = previous_args
+        runner.set_trigger_policy(enabled=policy[0], automatic_only=policy[1])
+
+
+def print_demo_menu():
+    print(
+        '\n演示选项：\n'
+        '1.抓取铰链\n'
+        '2.抓取铰链并移动\n'
+        '3.抓取电批\n'
+        '4.抓取电批并移动\n'
+        '5.全流程不启动电批（单次）\n'
+        '6.全流程启动电批（单次）\n'
+        'q.结束',
+        flush=True,
+    )
+
+
+def _stop_cancelled_round(ctx):
+    controller = ctx.services.controller
+    runner = ctx.services.dianpi_runner
+    # Streams have unwound before here. Replace any remaining planned goal
+    # with measured joints, retaining both gripper states.
+    with controller.manual_motion():
+        controller.prepare_joint_impedance_control(('left', 'right'))
+        current = tuple(controller.checked_arm_state())
+        for side, positions in (('left', current[:7]), ('right', current[7:])):
+            controller.hold_joint_positions(side, positions)
+    runner.stop_current_cycle()
+
+
 def run_repeated_demo(ctx, selection: DemoModeSelection) -> int:
+    controller = ctx.services.controller
+    gate = controller.motion_gate
+    old_guard = getattr(controller, 'demo_cancel_guard', None)
+    old_gate_guard = getattr(gate, 'cancel_guard', None) if gate is not None else None
+    controller.demo_cancel_guard = selection.check_cancelled
+    if gate is not None:
+        gate.cancel_guard = selection.check_cancelled
+    try:
+        return _run_repeated_demo(ctx, selection)
+    finally:
+        controller.demo_cancel_guard = old_guard
+        if gate is not None:
+            gate.cancel_guard = old_gate_guard
+
+
+def _run_repeated_demo(ctx, selection: DemoModeSelection) -> int:
     """Reuse the full-flow GDK session, models, cameras, motion gate and stages."""
     try:
         from .run_bilateral_flow_gdk import (
@@ -310,7 +476,7 @@ def run_repeated_demo(ctx, selection: DemoModeSelection) -> int:
         from run_bilateral_flow_gdk import (
             stage_home, stage_head_localize, stage_left_grasp, stage_left_to_hole_offset,
         )
-    print('演示选项：1.抓取铰链  2.抓取铰链并移动  3.抓取电批  4.抓取电批并移动；按 q 完成本轮后结束。', flush=True)
+    print_demo_menu()
     mode = selection.wait_first()
     if mode is None:
         return 0
@@ -318,7 +484,7 @@ def run_repeated_demo(ctx, selection: DemoModeSelection) -> int:
     round_number = 0
     while mode is not None:
         try:
-            if mode != previous:
+            if mode != previous and mode not in {'5', '6'}:
                 ctx.runtime.emit('demo_home_start', mode=mode)
                 stage_home(ctx)
             round_number += 1
@@ -327,6 +493,7 @@ def run_repeated_demo(ctx, selection: DemoModeSelection) -> int:
             ctx.services.put('right_saved_grasp_pose', None)
             ctx.services.put('right_saved_workpiece_pose', None)
             actions = {
+                'full_flow': lambda selected_mode: _run_full_flow_demo(ctx, selected_mode),
                 'head': lambda: _head_localize(ctx, stage_head_localize),
                 'require_hole': lambda: _require_hole(ctx),
                 'left_pick': lambda: stage_left_grasp(ctx),
@@ -339,13 +506,38 @@ def run_repeated_demo(ctx, selection: DemoModeSelection) -> int:
                 'right_return': lambda: _return_right(ctx),
             }
             run_demo_round(mode, actions)
+            selection.check_cancelled()
             ctx.runtime.emit('demo_round_complete', mode=mode, round=round_number)
+            print_demo_menu()
         except Exception as exc:
+            if selection._cancel.is_set():
+                # Keep cancellation active until every stage writer has unwound.
+                controller = ctx.services.controller
+                guard = controller.demo_cancel_guard
+                controller.demo_cancel_guard = None
+                try:
+                    _stop_cancelled_round(ctx)
+                except Exception as stop_error:
+                    print(f'[演示停止失败] {stop_error}', file=sys.stderr, flush=True)
+                    return 1
+                finally:
+                    controller.demo_cancel_guard = guard
+                selection.return_to_menu()
+                ctx.runtime.emit('demo_round_cancelled', mode=mode, round=round_number)
+                print('[演示已取消] 保持当前位置，请重新选择模式。', flush=True)
+                print_demo_menu()
+                previous = None
+                mode = selection.wait_first()
+                if mode is None:
+                    return 0
+                continue
             ctx.runtime.emit('demo_round_failed', mode=mode, round=round_number, error=str(exc))
             print(f'[演示停止] {exc}', file=sys.stderr, flush=True)
             return 1
         previous = mode
         mode = selection.next_round()
+        if mode is None and selection.active is None and previous in {'5', '6'}:
+            mode = selection.wait_first()
         if mode != previous and mode is not None:
             print(f'[演示切换] 下一轮：{MODE_LABELS[mode]}', flush=True)
     # A completed cycle has already returned the part and raised the jaw.

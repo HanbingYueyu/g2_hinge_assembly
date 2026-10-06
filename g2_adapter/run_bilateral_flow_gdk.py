@@ -321,7 +321,7 @@ def parse_args(argv=None) -> argparse.Namespace:
     parser.add_argument("--spacemouse-rotation-deg-s", type=float, default=20.0)
     parser.add_argument("--spacemouse-deadzone", type=float, default=0.12)
     parser.add_argument("--repeat-grasp-demo", action="store_true",
-                        help="终端按 1/2/3/4 选择重复抓取演示；q 在本轮放回后结束。")
+                        help="终端按 1/2/3/4 选择循环抓取；5/6 单次自动全流程（不启动/启动电批）；q 本轮结束后退出。")
     parser.add_argument("--from-stage", choices=stage_names(), default=None, help="从指定阶段开始（调试用）。")
     parser.add_argument("--through-stage", choices=stage_names(), default=None,
                         help="执行完指定阶段后正常结束（调试用，包含该阶段）。")
@@ -613,6 +613,9 @@ def _head_live_publisher(ctx: "FlowContext"):
         from move_left_above_head_hinge_gdk import draw_head_targets_overlay
 
     def publish(bgr, masks, scores, classes) -> None:
+        cancel_guard = getattr(ctx.services.controller, 'demo_cancel_guard', None)
+        if cancel_guard is not None:
+            cancel_guard()
         web = getattr(ctx.services, "web", None)
         if web is None:
             return
