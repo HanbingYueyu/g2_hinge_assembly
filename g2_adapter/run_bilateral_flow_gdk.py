@@ -65,6 +65,7 @@ class JsonLineSuppressingStream:
                     if isinstance(record, dict) and record.get("event") in {
                         "left_above_hinge_arrived", "left_stage_complete_above_hole",
                         "right_pr1_premove_arrived", "left_visual_regrasp_requested",
+                        "right_rr1_clearance_start", "right_rr1_clearance_arrived",
                     }:
                         self.event_sink(record)
                     elif isinstance(record, dict) and record.get("state") == "regrasp_reacquiring":
@@ -613,9 +614,6 @@ def _head_live_publisher(ctx: "FlowContext"):
         from move_left_above_head_hinge_gdk import draw_head_targets_overlay
 
     def publish(bgr, masks, scores, classes) -> None:
-        cancel_guard = getattr(ctx.services.controller, 'demo_cancel_guard', None)
-        if cancel_guard is not None:
-            cancel_guard()
         web = getattr(ctx.services, "web", None)
         if web is None:
             return
@@ -723,6 +721,8 @@ def stage_left_to_teach_start(ctx: FlowContext) -> dict:
 
 
 def stage_left_to_ll1_and_seat(ctx: FlowContext) -> dict:
+    _confirm_left_grasp(ctx)
+    ctx.runtime.emit_event({"event": "left_insertion_start"})
     monitor = ctx.services.get('vlm_gripper_monitor')
     try:
         if teach_enabled(ctx.args):
@@ -759,6 +759,50 @@ def stage_left_to_ll1_and_seat(ctx: FlowContext) -> dict:
             monitor.set_phase('idle')
 
 
+class _InsertionReviewJob:
+    """Own a read-only review while the main thread moves the left arm."""
+
+    def __init__(self, web, client, emit):
+        self.done = threading.Event()
+        self.stop = threading.Event()
+        self.records = None
+        self.error = None
+        def publish(record):
+            if self.stop.is_set():
+                raise RuntimeError('铰链插入后台判别已停止')
+            emit(record)
+        def run():
+            try:
+                try:
+                    from .vlm_flow_checks import run_assembly_review
+                except ImportError:
+                    from vlm_flow_checks import run_assembly_review
+                self.records = run_assembly_review(
+                    web, client, publish, include_convex=True,
+                    include_c_hole=False, include_pin=False,
+                )
+            except Exception as exc:
+                self.error = exc
+            finally:
+                self.done.set()
+        self.thread = threading.Thread(target=run, name='vlm-insertion-review', daemon=True)
+        self.thread.start()
+
+
+def _start_insertion_review(ctx):
+    if not vlm_enabled(ctx.args):
+        return
+    previous = ctx.services.get('insertion_review_job')
+    if previous is not None:
+        # Never associate the preceding round's result with a new placement.
+        if not previous.done.is_set():
+            raise SafetyError('上一轮铰链插入判别尚未结束')
+        ctx.services.put('insertion_review_job', None)
+    ctx.services.put('insertion_review_job', _InsertionReviewJob(
+        ctx.services.web, ctx.services.get('vlm_client'), ctx.runtime.emit_event,
+    ))
+
+
 def stage_left_release_lift_to_ll2(ctx: FlowContext) -> dict:
     monitor = ctx.services.get('vlm_gripper_monitor')
     if monitor is not None:
@@ -785,6 +829,7 @@ def stage_left_release_lift_to_ll2(ctx: FlowContext) -> dict:
     except ImportError:
         from left_seat_motion import move_left_vertical
     released = ctx.runtime.open_left_gripper()
+    _start_insertion_review(ctx)
     lift = move_left_vertical(
         ctx.services.controller, distance_mm=100.0, speed_mm_s=ctx.args.auto_speed_mm_s,
     )
@@ -816,7 +861,7 @@ def stage_right_to_lr2_and_gripper_cycle(ctx: FlowContext) -> dict:
     """Approach LR2 from 50 mm above, exercise the gripper, then leave it open.
 
     This is intentionally a separate operator stage before the AprilTag
-    screwdriver grasp.  The one-second hold is a real pause after feedback
+    screwdriver grasp.  The half-second hold is a real pause after feedback
     confirms the close command has taken effect; it is not folded into the next gate, so a
     gate takeover cannot interrupt the close/open cycle halfway through.
     """
@@ -826,14 +871,14 @@ def stage_right_to_lr2_and_gripper_cycle(ctx: FlowContext) -> dict:
             close_right_gripper_on_pose_stream,
             move_right_gripper_on_pose_stream,
         )
-        from .right_hole_motion import move_right_via_vertical_clearance, right_preset_end_pose
+        from .right_post_grasp_sequence import move_right_after_current_lift
     except ImportError:
         from right_apriltag_grasp_gdk import (
             require_mapping,
             close_right_gripper_on_pose_stream,
             move_right_gripper_on_pose_stream,
         )
-        from right_hole_motion import move_right_via_vertical_clearance, right_preset_end_pose
+        from right_post_grasp_sequence import move_right_after_current_lift
     config = ctx.services.get("right_config")
     if config is None:
         config = require_mapping(
@@ -841,12 +886,10 @@ def stage_right_to_lr2_and_gripper_cycle(ctx: FlowContext) -> dict:
         )
     gripper = require_mapping(config.get("gripper"), "gripper")
     target_joints = ctx.runtime.load_right_preset("LR2")
-    target_pose = right_preset_end_pose(ctx.services.controller, target_joints)
-    clearance = move_right_via_vertical_clearance(
-        ctx.services.controller,
-        target_pose=target_pose,
-        clearance_mm=50.0,
-        speed_mm_s=ctx.args.auto_speed_mm_s,
+    clearance = move_right_after_current_lift(
+        ctx.services.controller, target_joints, preset_name='LR2',
+        velocity_rad_s=ctx.args.auto_preset_velocity_rad_s,
+        emit=ctx.runtime.emit_event,
     )
     ctx.runtime.emit_event(clearance)
     ctx.runtime.emit_event({"event": "right_lr2_clearance_arrived", "preset": "LR2"})
@@ -870,7 +913,7 @@ def stage_right_to_lr2_and_gripper_cycle(ctx: FlowContext) -> dict:
             close_target,
             settle_s=float(gripper.get("close_settle_s", 0.8)),
         )
-        ctx.runtime.sleep(1.0)
+        ctx.runtime.sleep(0.5)
         open_record = move_right_gripper_on_pose_stream(
             ctx.services.controller,
             stream,
@@ -883,7 +926,7 @@ def stage_right_to_lr2_and_gripper_cycle(ctx: FlowContext) -> dict:
     cycle = ctx.runtime.emit_event({
         "event": "right_lr2_gripper_cycle",
         "preset": "LR2",
-        "hold_s": 1.0,
+        "hold_s": 0.5,
         "close_target_rad": close_target,
         "open_target_rad": open_target,
         "close": close_record,
@@ -938,6 +981,7 @@ def _one_shot_right_fixture_check(ctx: FlowContext, *, phase: str) -> dict:
         from .vlm_flow_checks import run_right_fixture_grasp_check
     except ImportError:
         from vlm_flow_checks import run_right_fixture_grasp_check
+    ctx.runtime.emit_event({"event": "vlm_check_start", "task": "right-fixture-grasp", "workflow_phase": phase})
     record = {**run_right_fixture_grasp_check(ctx.services.web, client), "workflow_phase": phase}
     ctx.runtime.emit_event(record)
     return record
@@ -952,32 +996,52 @@ def _one_shot_four_screws_check(ctx: FlowContext, *, phase: str) -> dict:
         from .vlm_flow_checks import run_four_screws_check
     except ImportError:
         from vlm_flow_checks import run_four_screws_check
+    ctx.runtime.emit_event({"event": "vlm_check_start", "task": "four-screws", "workflow_phase": phase})
     record = {**run_four_screws_check(ctx.services.web, client), "workflow_phase": phase}
     ctx.runtime.emit_event(record)
     return record
 
 
-def stage_vlm_gripper_check(ctx: FlowContext) -> dict:
+def _confirm_left_grasp(ctx):
     if not vlm_enabled(ctx.args):
         return {"skipped": True, "reason": "disabled"}
     monitor = ctx.services.get('vlm_gripper_monitor')
     if monitor is not None:
-        # Background serial requests continue through transport/placement.
-        # Do not wait for a remote response or declare this stage grasp success.
         monitor.set_phase('post_grasp')
-        return {'task': 'gripper', 'monitoring': True}
-    try:
-        from .vlm_flow_checks import run_gripper_check
-    except ImportError:
-        from vlm_flow_checks import run_gripper_check
-    record = run_gripper_check(ctx.services.web, ctx.services.get("vlm_client"))
-    ctx.runtime.emit_event(record)
-    return {"task": "gripper", "ok": record["ok"]}
+        record = monitor.wait_for_attached(
+            timeout_s=5.0 * ctx.args.vlm_timeout_s + 5.0,
+            guard=ctx.services.controller.check_automatic_guard,
+        )
+        return {'task': 'gripper', 'ok': True, 'state': record['stable_state']}
+    state = _one_shot_gripper_check(ctx, phase='post_grasp')
+    if state in {'not_attached', 'dropped'}:
+        try:
+            from .vlm_gripper_monitor import VlmRegraspRequested
+        except ImportError:
+            from vlm_gripper_monitor import VlmRegraspRequested
+        raise VlmRegraspRequested('VLM 确认铰链未抓住；拒绝插入')
+    if state != 'attached':
+        raise SafetyError('VLM 未确认铰链抓取成功；保持夹持，拒绝插入')
+    return {'task': 'gripper', 'ok': True, 'state': state}
+
+
+def stage_vlm_gripper_check(ctx: FlowContext) -> dict:
+    return _confirm_left_grasp(ctx)
 
 
 def stage_vlm_assembly_check(ctx: FlowContext) -> dict:
     if not vlm_enabled(ctx.args):
         return {"skipped": True, "reason": "disabled"}
+    job = ctx.services.get('insertion_review_job')
+    if job is not None:
+        while not job.done.wait(.02):
+            ctx.services.controller.check_automatic_guard()
+        ctx.services.put('insertion_review_job', None)
+        if job.error is not None:
+            raise job.error
+        records = job.records
+        return {"tasks": [record["task"] for record in records],
+                "ok": all(record["ok"] for record in records), "started_during_left_lift": True}
     try:
         from .vlm_flow_checks import run_assembly_review
     except ImportError:
@@ -1220,6 +1284,7 @@ def run_flow(args: argparse.Namespace) -> int:
                     from vlm_tts import VlmTtsAnnouncer
                 tts_announcer = VlmTtsAnnouncer(
                     agibot_gdk.Interaction(),
+                    event_sink=flow_event_sink,
                     warning_sink=lambda error: flow_event_sink({
                         "event": "tts_warning", "error": error,
                     }),
@@ -1356,6 +1421,10 @@ def run_flow(args: argparse.Namespace) -> int:
         return _drive(ctx, args)
     finally:
         if services is not None:
+            insertion_job = services.get('insertion_review_job')
+            if insertion_job is not None:
+                insertion_job.stop.set()
+                insertion_job.thread.join(timeout=1.0)
             monitor = services.get('vlm_gripper_monitor')
             if monitor is not None:
                 monitor.stop()

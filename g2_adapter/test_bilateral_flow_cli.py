@@ -127,7 +127,7 @@ class OrchestratorCliTests(unittest.TestCase):
 
     def test_teach_stage_does_not_execute_ll1_or_force_descent(self):
         from types import SimpleNamespace
-        ctx = SimpleNamespace(args=flow.parse_args(["--teach-enable", "--left-teach-trajectory", "demo.json"]), services=StageServices())
+        ctx = SimpleNamespace(args=flow.parse_args(["--teach-enable", "--left-teach-trajectory", "demo.json"]), services=StageServices(), runtime=SimpleNamespace(emit_event=lambda _: None))
         with patch("left_teach_placement.replay_left_placement", return_value={"method": "teach", "sent": 5}) as replay:
             self.assertEqual(flow.stage_left_to_ll1_and_seat(ctx), {"method": "teach", "sent": 5})
         replay.assert_called_once()
@@ -538,7 +538,7 @@ class DispatchTests(unittest.TestCase):
         self.assertTrue(warnings[0]["read_only"])
         self.assertEqual(warnings[0]["action"], "continue_release")
 
-    def test_right_lr2_cycle_closes_holds_one_second_then_opens(self):
+    def test_right_lr2_cycle_closes_holds_half_second_then_opens(self):
         context, runtime = self.make_context()
         context.services.put("right_config", {
             "gripper": {"closed_rad": 0.0, "open_rad": -0.785, "close_settle_s": 0.8},
@@ -547,9 +547,8 @@ class DispatchTests(unittest.TestCase):
         stream = Mock()
         context.services.controller.start_right_end_effector_position_stream = lambda *a, **k: stream
         target_pose = object()
-        with patch("right_hole_motion.right_preset_end_pose", return_value=target_pose) as pose, \
-             patch("right_hole_motion.move_right_via_vertical_clearance", return_value={
-            "event": "right_lr2_clearance_round_trip", "clearance_mm": 50.0,
+        with patch("right_post_grasp_sequence.move_right_after_current_lift", return_value={
+            "event": "LR2_arrived", "preset": "LR2",
         }) as clearance, \
              patch("right_apriltag_grasp_gdk.close_right_gripper_on_pose_stream", return_value={
                  "target_rad": 0.0,
@@ -563,12 +562,10 @@ class DispatchTests(unittest.TestCase):
 
         self.assertEqual(runtime.right_presets, [])
         self.assertEqual(runtime.right_preset_loads, ["LR2"])
-        pose.assert_called_once_with(context.services.controller, [0.0] * 7)
         clearance.assert_called_once_with(
-            context.services.controller,
-            target_pose=target_pose,
-            clearance_mm=50.0,
-            speed_mm_s=context.args.auto_speed_mm_s,
+            context.services.controller, [0.0] * 7, preset_name='LR2',
+            velocity_rad_s=context.args.auto_preset_velocity_rad_s,
+            emit=context.runtime.emit_event,
         )
         close.assert_called_once_with(
             context.services.controller, stream, 0.0, settle_s=0.8,
@@ -577,7 +574,7 @@ class DispatchTests(unittest.TestCase):
             context.services.controller, stream, -0.785,
             tolerance_rad=0.05, timeout_s=3.0,
         )
-        self.assertEqual(runtime.sleep_calls, [1.0])
+        self.assertEqual(runtime.sleep_calls, [0.5])
         self.assertEqual(result["preset"], "LR2")
         self.assertEqual(result["gripper_cycle"], "closed_held_opened")
 

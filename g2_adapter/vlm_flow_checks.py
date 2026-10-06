@@ -309,6 +309,7 @@ def run_right_fixture_grasp_check(web, client, clock=time.monotonic, *, frames_o
 def run_hole_alignment_review(web, client, emit, *, sleep=time.sleep):
     """Three fresh right-camera ROI judgments followed by a conservative majority."""
     from vlm_checks.src.migrated_checks import alignment_roi, alignment_vote
+    emit({"event": "vlm_check_start", "task": "hole-alignment"})
     records, results = [], []
     for index in range(1, 4):
         if index > 1:
@@ -336,6 +337,8 @@ def run_assembly_review(
     web, client, emit, *, sleep=time.sleep, include_convex: bool = False, include_c_hole: bool = True,
     include_pin: bool = True,
 ):
+    if include_convex:
+        emit({"event": "vlm_check_start", "task": "convex-inserted"})
     records = []
     convex_votes = []
     for round_index in range(1,4):

@@ -183,6 +183,33 @@ def lift_after_grasp(
         stream.stop()
 
 
+def move_right_after_current_lift(controller, target, *, preset_name, velocity_rad_s, emit=None):
+    """Reach current TCP +100 mm in base Z, then the named preset joints."""
+    try:
+        from .right_hole_joint_move import move_right_hole_joint_target
+    except ImportError:
+        from right_hole_joint_move import move_right_hole_joint_target
+    current = controller.read_end_effector_pose('arm_r_end_link')
+    above = CartesianPoseTarget(
+        (current.position_m[0], current.position_m[1], current.position_m[2] + .10),
+        current.orientation_xyzw,
+    )
+    if emit is not None:
+        emit({'event': 'right_preset_clearance_start', 'control_method': 'endpoint_ik_joint_plan',
+              'control_mode': 3, 'velocity_rad_s': velocity_rad_s, 'lift_mm': 100.0,
+              'start_position_m': list(current.position_m), 'target_position_m': list(above.position_m)})
+    actual = move_right_hole_joint_target(
+        controller, above, velocity_rad_s=velocity_rad_s, control_mode=3,
+    )
+    if emit is not None:
+        emit({'event': 'right_preset_clearance_arrived', 'control_mode': 3,
+              'actual_position_m': list(actual.position_m), 'target_position_m': list(above.position_m)})
+    return move_right_preset(
+        controller, target, preset_name=preset_name, velocity_rad_s=velocity_rad_s,
+        control_mode=3,
+    )
+
+
 def move_right_preset(
     controller: G2Controller,
     target: list[float],

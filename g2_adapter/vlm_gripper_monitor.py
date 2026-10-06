@@ -26,6 +26,7 @@ class GripperMonitor:
         self.latest = None
         self.regrasp_reason = None
         self.lock = threading.RLock()
+        self.confirmed = threading.Event()
         self.stop_event = threading.Event()
         self.thread = None
 
@@ -36,6 +37,7 @@ class GripperMonitor:
             self.phase = phase
             self.phase_started = time.monotonic()
             self.epoch += 1
+            self.confirmed.clear()
             self.reference = None
             self.votes.clear()
             self.latest = None
@@ -46,6 +48,21 @@ class GripperMonitor:
             reason = self.regrasp_reason
         if reason is not None:
             raise VlmRegraspRequested(reason)
+
+    def wait_for_attached(self, *, timeout_s, guard=None):
+        deadline = time.monotonic() + timeout_s
+        while True:
+            if guard is not None:
+                guard()
+            with self.lock:
+                self.raise_if_regrasp_requested()
+                if self.phase != 'post_grasp' or self.stop_event.is_set():
+                    raise SafetyError('铰链抓取监测未处于本次抓取阶段；拒绝插入')
+                if self.confirmed.is_set() and self.latest and self.latest.get('stable_state') == 'attached':
+                    return self.latest
+            if time.monotonic() >= deadline:
+                raise SafetyError('VLM 铰链抓取确认超时或不确定；保持夹持，拒绝插入')
+            time.sleep(.02)
 
     def finish_before_release(self):
         with self.lock:
@@ -99,6 +116,12 @@ class GripperMonitor:
             if phase == 'post_grasp' and stable == 'not_attached':
                 self.regrasp_reason = 'VLM 最近五次多数票确认未抓住（至少三票）'
         self.emit(record)
+        with self.lock:
+            if self.epoch == epoch and phase == 'post_grasp':
+                if stable == 'attached':
+                    self.confirmed.set()
+                else:
+                    self.confirmed.clear()
         return record
 
     def start(self):

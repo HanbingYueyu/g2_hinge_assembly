@@ -42,6 +42,123 @@ class BlockingInteraction:
 
 
 class VlmTtsTests(unittest.TestCase):
+    def test_insertion_start_and_result_have_speech_delivery_records(self):
+        records = []
+        announcer = load_module().VlmTtsAnnouncer(FakeInteraction(), event_sink=records.append)
+        try:
+            announcer.handle_event({'event': 'vlm_check_start', 'task': 'convex-inserted'})
+            announcer.handle_event({'event': 'vlm_convex_inserted_result', 'ok': True,
+                                   'aggregate': True, 'result': {'decision': '已插入'}})
+        finally:
+            announcer.close()
+        for text in ('正在检查铰链是否插入', '铰链成功插入'):
+            self.assertEqual({r['event'] for r in records if r['text'] == text},
+                             {'tts_queued', 'tts_send_start', 'tts_send_returned'})
+
+
+    def test_tool_start_is_announced_only_once_per_demo_round(self):
+        announcer = load_module().VlmTtsAnnouncer(interaction := FakeInteraction())
+        try:
+            for round_number in (1, 2):
+                announcer._queue.join()
+                announcer.handle_event({'event': 'demo_round_start', 'mode': '6', 'round': round_number})
+                for point in range(4):
+                    self.assertEqual(announcer.handle_event({'event': 'dianpi_started'}), point == 0)
+                    announcer.handle_event({'event': 'dianpi_finished'})
+        finally:
+            announcer.close()
+        self.assertEqual(interaction.messages, ['开始打螺丝'] * 2)
+
+    def test_playback_failure_allows_same_event_to_retry(self):
+        warnings = []
+        interaction = FakeInteraction(error=RuntimeError('voice unavailable'))
+        announcer = load_module().VlmTtsAnnouncer(interaction, warning_sink=warnings.append)
+        event = {'event': 'left_above_hinge_arrived'}
+        try:
+            self.assertTrue(announcer.handle_event(event))
+            announcer._queue.join()
+            interaction.error = None
+            self.assertTrue(announcer.handle_event(event))
+            announcer._queue.join()
+        finally:
+            announcer.close()
+        self.assertEqual(interaction.messages, ['现在开始抓取铰链'])
+        self.assertEqual(len(warnings), 1)
+
+    def test_new_round_discards_old_pending_speech(self):
+        interaction = BlockingInteraction()
+        announcer = load_module().VlmTtsAnnouncer(interaction)
+        try:
+            announcer.handle_event({'event': 'demo_round_start', 'mode': '5'})
+            announcer.handle_event({'event': 'left_above_hinge_arrived'})
+            self.assertTrue(interaction.started.wait(1))
+            announcer.handle_event({'event': 'left_insertion_start'})
+            announcer.handle_event({'event': 'demo_round_start', 'mode': '3'})
+            interaction.release.set()
+            announcer._queue.join()
+            self.assertTrue(announcer.handle_event({'event': 'left_above_hinge_arrived'}))
+        finally:
+            interaction.release.set()
+            announcer.close()
+
+
+    def test_all_flow_and_grasp_speech_reset_on_every_mode_selection(self):
+        announcer = load_module().VlmTtsAnnouncer(interaction := FakeInteraction())
+        events = [
+            {'event': 'stage_start', 'stage': 'home'},
+            {'event': 'left_above_hinge_arrived'},
+            {'event': 'vlm_gripper_result', 'workflow_phase': 'post_grasp', 'stable_state': 'attached'},
+            {'event': 'left_insertion_start'},
+            {'event': 'right_lr2_clearance_arrived'},
+            {'event': 'right_pr1_premove_arrived', 'preset': 'RR1'},
+            {'event': 'dianpi_started'},
+            {'event': 'stage_start', 'stage': 'finish'},
+        ]
+        try:
+            for mode in ('5', '6', '5', '4', '1'):
+                announcer.handle_event({'event': 'demo_round_start', 'mode': mode})
+                for event in events:
+                    self.assertTrue(announcer.handle_event(event), (mode, event))
+                    self.assertFalse(announcer.handle_event(event))
+        finally:
+            announcer.close()
+
+
+    def test_hole_arrival_does_not_announce_insertion_and_success_precedes_insertion(self):
+        announcer = load_module().VlmTtsAnnouncer(interaction := FakeInteraction())
+        try:
+            self.assertFalse(announcer.handle_event({'event': 'left_stage_complete_above_hole'}))
+            self.assertTrue(announcer.handle_event({'event': 'vlm_gripper_result', 'ok': True,
+                'workflow_phase': 'post_grasp', 'stable_state': 'attached'}))
+            self.assertTrue(announcer.handle_event({'event': 'left_insertion_start'}))
+        finally:
+            announcer.close()
+        self.assertEqual(interaction.messages, ['铰链抓取成功', '现在插入铰链'])
+
+
+    def test_check_start_speech_is_repeated_for_each_demo_round(self):
+        announcer = load_module().VlmTtsAnnouncer(interaction := FakeInteraction())
+        events = [
+            {'event': 'vlm_check_start', 'task': 'convex-inserted'},
+            {'event': 'vlm_check_start', 'task': 'hole-alignment'},
+            {'event': 'vlm_check_start', 'task': 'right-fixture-grasp'},
+            {'event': 'vlm_check_start', 'task': 'four-screws'},
+        ]
+        try:
+            for mode in ('5', '6'):
+                announcer._queue.join()
+                announcer.handle_event({'event': 'demo_round_start', 'mode': mode})
+                for event in events:
+                    self.assertTrue(announcer.handle_event(event))
+                    self.assertFalse(announcer.handle_event(event))
+        finally:
+            announcer.close()
+        self.assertEqual(interaction.messages, [
+            '正在检查铰链是否插入', '正在检查螺丝孔是否对齐', '正在检查电批是否夹住',
+            '正在检查四颗螺丝是否打好',
+        ] * 2)
+
+
     def test_aligned_hole_vote_uses_revised_success_phrase(self):
         announcer = load_module().VlmTtsAnnouncer(interaction := FakeInteraction())
         self.assertTrue(announcer.handle_event({
@@ -56,7 +173,7 @@ class VlmTtsTests(unittest.TestCase):
         events = [
             ({'event': 'stage_start', 'stage': 'home'}, '现在开始演示冰箱铰链装配锁附作业流程'),
             ({'event': 'left_above_hinge_arrived'}, '现在开始抓取铰链'),
-            ({'event': 'left_stage_complete_above_hole'}, '现在插入铰链'),
+            ({'event': 'left_insertion_start'}, '现在插入铰链'),
             ({'event': 'right_lr2_clearance_arrived', 'preset': 'LR2'}, '开始对齐铰链螺丝孔'),
             ({'event': 'right_pr1_premove_arrived', 'preset': 'RR1'}, '开始抓取电批'),
             ({'event': 'dianpi_started'}, '开始打螺丝'),
@@ -114,7 +231,7 @@ class VlmTtsTests(unittest.TestCase):
         self.assertEqual(interaction.messages, ['铰链脱落，重新抓取'])
 
     def test_mode_two_keeps_hole_arrival_silent_without_muting_normal_flow(self):
-        arrival = {'event': 'left_stage_complete_above_hole'}
+        arrival = {'event': 'left_insertion_start'}
         demo = load_module().VlmTtsAnnouncer(demo_interaction := FakeInteraction())
         normal = load_module().VlmTtsAnnouncer(normal_interaction := FakeInteraction())
         try:
@@ -136,7 +253,7 @@ class VlmTtsTests(unittest.TestCase):
             with self.subTest(regrasp=regrasp['event']):
                 interaction = FakeInteraction()
                 announcer = load_module().VlmTtsAnnouncer(interaction)
-                arrival = {'event': 'left_stage_complete_above_hole'}
+                arrival = {'event': 'left_insertion_start'}
                 try:
                     self.assertTrue(announcer.handle_event(arrival))
                     self.assertFalse(announcer.handle_event(arrival))
@@ -153,6 +270,7 @@ class VlmTtsTests(unittest.TestCase):
                   'result': {'decision': '抓住'}}
         self.assertTrue(announcer.handle_event(result))
         self.assertFalse(announcer.handle_event(result))
+        announcer._queue.join()
         self.assertFalse(announcer.handle_event({'event': 'demo_round_start', 'mode': '3'}))
         self.assertTrue(announcer.handle_event(result))
         announcer.close()

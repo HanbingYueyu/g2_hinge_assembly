@@ -1969,9 +1969,7 @@ def run_right_grasp_stage(*, services=None, argv=None) -> int:
                         "preset": args.premove_pose,
                     })
                 premove_record = move_right_preset(
-                    controller,
-                    pr1_target,
-                    preset_name=args.premove_pose,
+                    controller, pr1_target, preset_name=args.premove_pose,
                     velocity_rad_s=preset_velocity_rad_s,
                 )
                 premove_record = {

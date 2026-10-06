@@ -61,7 +61,8 @@ class VlmFlowChecksTests(unittest.TestCase):
         raw = jpeg(1280, 1056)
         records = run_hole_alignment_review(FakeWeb({'right': raw, 'left': b'wrong camera'}), Client(), emitted.append, sleep=lambda _: None)
         self.assertEqual(calls, [('hole-alignment', [raw])] * 3)
-        self.assertEqual(len(emitted), 4)
+        self.assertEqual(len(emitted), 5)
+        self.assertEqual(emitted[0], {"event": "vlm_check_start", "task": "hole-alignment"})
         self.assertEqual([record['review_round'] for record in records[:-1]], [1, 2, 3])
         self.assertTrue(all(record['review_total'] == 3 for record in records[:-1]))
         self.assertTrue(records[-1]['aggregate'])
@@ -94,7 +95,8 @@ class VlmFlowChecksTests(unittest.TestCase):
         run_assembly_review(FakeWeb({'right': b'right'}), Client(), emitted.append,
                             sleep=lambda _: None, include_convex=True,
                             include_c_hole=False, include_pin=False)
-        self.assertEqual(len(emitted), 4)
+        self.assertEqual(len(emitted), 5)
+        self.assertEqual(emitted[0], {"event": "vlm_check_start", "task": "convex-inserted"})
         self.assertEqual(emitted[-1]['result']['decision'], '已插入')
         self.assertTrue(emitted[-1]['aggregate'])
 

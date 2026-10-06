@@ -5,6 +5,21 @@ from vlm_gripper_monitor import GripperMonitor, VlmRegraspRequested
 
 
 class MonitorTests(unittest.TestCase):
+    def test_confirmation_waits_for_success_event_publication(self):
+        monitor = GripperMonitor(None, None, lambda _: None)
+        monitor.set_phase('post_grasp')
+        with self.assertRaisesRegex(Exception, '抓取确认超时'):
+            monitor.wait_for_attached(timeout_s=0)
+        with patch('vlm_gripper_monitor._snapshots', return_value=({'left': b'full'}, {})), \
+             patch('vlm_gripper_monitor.run_gripper_check', return_value={'ok': True, 'result': {'state': 'attached'}}):
+            for _ in range(5):
+                monitor.sample()
+        monitor.wait_for_attached(timeout_s=0)
+        monitor.set_phase('idle')
+        with self.assertRaises(Exception):
+            monitor.wait_for_attached(timeout_s=0)
+
+
     def test_unknown_and_network_failure_do_not_trigger_regrasp(self):
         monitor = GripperMonitor(None, None, lambda record: None)
         monitor.set_phase('post_grasp')

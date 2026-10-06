@@ -14,7 +14,7 @@ Step mapping (operator spec):
 4. right arm to ``LR1``
 5. left arm to ``LL1`` -> force-guarded descent -> SpaceMouse gate 1 -> release
    -> lift 100 mm -> ``LL2``
-6. after the left arm leaves, right arm clears 50 mm above ``LR2`` -> descends to ``LR2`` -> close for 1 s -> open -> SpaceMouse gate
+6. after the left arm leaves, right arm clears 100 mm above its current pose -> joint-plans to ``LR2`` -> close for 0.5 s -> open -> SpaceMouse gate
 7. right arm to ``RR1`` -> AprilTag grasp of the electric screwdriver
 8. lift 100 mm -> fixed downward orientation above detected ``hole``
 9. SpaceMouse gate 2 -> right arm returns to the saved grasp pose
@@ -70,7 +70,7 @@ DEFAULT_PLAN: tuple[StageSpec, ...] = (
     StageSpec(Stage.GATE_LEFT, "等待 SpaceMouse 下一阶段指令（门1）", "5", waits_for_advance=True),
     StageSpec(Stage.LEFT_RELEASE_LIFT_TO_LL2, "张开左爪、上抬 100 mm 并移动到 LL2", "5"),
     StageSpec(Stage.VLM_ASSEMBLY_CHECK, "VLM 只读检查凸轴 B 是否插入", "5"),
-    StageSpec(Stage.RIGHT_TO_LR2_AND_GRIPPER_CYCLE, "右臂先到 LR2 上方 50 mm 再下降到 LR2、闭合夹爪保持 1 秒后张开", "6"),
+    StageSpec(Stage.RIGHT_TO_LR2_AND_GRIPPER_CYCLE, "右臂先到当前位置上方 100 mm 再关节规划到 LR2、闭合夹爪保持 0.5 秒后张开", "6"),
     StageSpec(Stage.VLM_C_HOLE_CHECK, "VLM 右相机孔对齐判别（3次多数票）", "6"),
     StageSpec(Stage.GATE_RIGHT_PRE_GRASP, "等待 SpaceMouse 下一阶段指令（门2，右手抓取电批前）", "6", waits_for_advance=True),
     StageSpec(

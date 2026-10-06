@@ -10,7 +10,7 @@ from typing import Callable
 _FLOW_PHRASES = {
     ("stage_start", "home"): "现在开始演示冰箱铰链装配锁附作业流程",
     ("left_above_hinge_arrived", None): "现在开始抓取铰链",
-    ("left_stage_complete_above_hole", None): "现在插入铰链",
+    ("left_insertion_start", None): "现在插入铰链",
     ("right_lr2_clearance_arrived", None): "开始对齐铰链螺丝孔",
     ("right_pr1_premove_arrived", "RR1"): "开始抓取电批",
     ("dianpi_started", None): "开始打螺丝",
@@ -24,6 +24,17 @@ def _result_message(event: dict) -> tuple[tuple[str, str], str] | None:
                 event.get("preset") if event_name == "right_pr1_premove_arrived" else None)
     if flow_key in _FLOW_PHRASES:
         return ("flow", str(flow_key)), _FLOW_PHRASES[flow_key]
+    if event_name == "vlm_check_start":
+        task = event.get("task")
+        phrases = {
+            "convex-inserted": "正在检查铰链是否插入",
+            "hole-alignment": "正在检查螺丝孔是否对齐",
+            "right-fixture-grasp": "正在检查电批是否夹住",
+            "four-screws": "正在检查四颗螺丝是否打好",
+        }
+        if task in phrases:
+            return ("check_start", task), phrases[task]
+        return None
     result = event.get("result") or {}
     if event_name == "vlm_regrasp_requested":
         return ("gripper", "lost"), "铰链脱落，重新抓取"
@@ -77,10 +88,13 @@ class VlmTtsAnnouncer:
         self,
         interaction,
         warning_sink: Callable[[str], None] | None = None,
+        event_sink: Callable[[dict], None] | None = None,
     ) -> None:
         self._interaction = interaction
         self._warning_sink = warning_sink
-        self._queue: queue.Queue[str | None] = queue.Queue()
+        self._event_sink = event_sink
+        self._queue: queue.Queue[tuple[int, tuple[str, str], str] | None] = queue.Queue()
+        self._generation = 0
         self._lock = threading.Lock()
         self._spoken_or_queued: set[tuple[str, str]] = set()
         self._demo_mode: str | None = None
@@ -93,14 +107,14 @@ class VlmTtsAnnouncer:
         if event.get("event") == "demo_round_start":
             with self._lock:
                 self._demo_mode = str(event.get("mode"))
-        if event.get("event") == "demo_round_start" and str(event.get("mode")) == "3":
+                self._generation += 1
+                self._spoken_or_queued.clear()
+        if event.get("event") in {"vlm_regrasp_requested", "left_visual_regrasp_requested"}:
             with self._lock:
-                self._spoken_or_queued.discard(("fixture", "True"))
-                self._spoken_or_queued.discard(("fixture", "False"))
-                self._spoken_or_queued.discard(("flow", str(("right_pr1_premove_arrived", "RR1"))))
+                self._spoken_or_queued.discard(("flow", str(("left_above_hinge_arrived", None))))
         if event.get("event") == "vlm_regrasp_requested":
             with self._lock:
-                self._spoken_or_queued.discard(_result_message({"event": "left_stage_complete_above_hole"})[0])
+                self._spoken_or_queued.discard(_result_message({"event": "left_insertion_start"})[0])
                 loss_already_queued = ("gripper", "lost") in self._spoken_or_queued
                 self._spoken_or_queued = {
                     key for key in self._spoken_or_queued if key[0] != "gripper"
@@ -110,9 +124,9 @@ class VlmTtsAnnouncer:
                     return False
         elif event.get("event") == "left_visual_regrasp_requested":
             with self._lock:
-                self._spoken_or_queued.discard(_result_message({"event": "left_stage_complete_above_hole"})[0])
+                self._spoken_or_queued.discard(_result_message({"event": "left_insertion_start"})[0])
                 self._spoken_or_queued.discard(("gripper", "attached"))
-        if event.get("event") == "left_stage_complete_above_hole":
+        if event.get("event") == "left_insertion_start":
             with self._lock:
                 if self._demo_mode == "2":
                     return False
@@ -126,18 +140,37 @@ class VlmTtsAnnouncer:
             if self._closed or key in self._spoken_or_queued:
                 return False
             self._spoken_or_queued.add(key)
-            self._queue.put(message)
+            generation = self._generation
+            self._queue.put((generation, key, message))
+        self._audit('tts_queued', message, generation)
         return True
+
+    def _audit(self, event, message, generation, **fields):
+        if self._event_sink is not None:
+            try:
+                self._event_sink({'event': event, 'text': message, 'generation': generation, **fields})
+            except Exception:
+                pass
 
     def _run(self) -> None:
         while True:
-            message = self._queue.get()
+            item = self._queue.get()
             try:
-                if message is None:
+                if item is None:
                     return
+                generation, key, message = item
+                with self._lock:
+                    if generation != self._generation:
+                        continue
                 try:
+                    self._audit('tts_send_start', message, generation)
                     self._interaction.play_tts(message)
+                    self._audit('tts_send_returned', message, generation)
                 except Exception as exc:  # noqa: BLE001 - speech must not affect robot flow
+                    self._audit('tts_send_failed', message, generation, error=str(exc))
+                    with self._lock:
+                        if generation == self._generation:
+                            self._spoken_or_queued.discard(key)
                     if self._warning_sink is not None:
                         try:
                             self._warning_sink(str(exc))

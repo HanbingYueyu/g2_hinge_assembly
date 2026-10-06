@@ -300,6 +300,19 @@ class BilateralRuntime:
             resend_period_s=resend_period_s, event="left_gripper_opened",
         )
 
+    def lift_after_screw(self, *, distance_mm=20.0):
+        """Retract the right tool along base +Z and confirm actual arrival."""
+        try:
+            from .right_hole_motion import lift_right_before_return
+        except ImportError:
+            from right_hole_motion import lift_right_before_return
+        self.controller.check_automatic_guard()
+        result = lift_right_before_return(
+            self.controller, speed_mm_s=self.args.auto_speed_mm_s,
+            distance_mm=distance_mm,
+        )
+        return self.emit_event({**result, "event": "right_post_screw_lift_complete"})
+
     # ------------------------------------------------------------------ home
     def move_both_to_home(
         self, *, velocity_rad_s: float = 0.08, arrival_tolerance_rad: float = 0.03, timeout_s: float = 25.0,

@@ -34,6 +34,7 @@ class AutomatedDemoTests(unittest.TestCase):
         proxy=demo.AutomaticDemoRuntime(runtime, '5', runner)
         proxy.on_right_teach_point(1, {})
         runner.trigger.assert_not_called()
+        runtime.lift_after_screw.assert_not_called()
         self.assertGreaterEqual(now[0],3.)
 
     def test_mode6_triggers_once_then_checks_completion(self):
@@ -50,6 +51,7 @@ class AutomatedDemoTests(unittest.TestCase):
         proxy=demo.AutomaticDemoRuntime(runtime,'6',runner)
         proxy.on_right_teach_point(1,{})
         runner.trigger.assert_called_once_with(automatic=True)
+        runtime.lift_after_screw.assert_called_once_with(distance_mm=20.0)
         self.assertGreaterEqual(started[0],1.)
         self.assertLess(now[0],1.05)
 

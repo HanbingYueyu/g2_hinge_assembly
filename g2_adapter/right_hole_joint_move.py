@@ -17,10 +17,12 @@ except ImportError:
 
 
 def move_right_hole_joint_target(controller, target, *, velocity_rad_s,
-                                 timeout_s=30., sleep_fn=time.sleep, clock=time.monotonic):
+                                 timeout_s=30., sleep_fn=time.sleep, clock=time.monotonic, control_mode=1):
     """Plan the endpoint pose as right joints and verify the live endpoint arrived."""
     if not math.isfinite(velocity_rad_s) or velocity_rad_s <= 0:
         raise ValueError('right endpoint joint velocity must be positive and finite')
+    if control_mode not in (1, 3):
+        raise ValueError('right endpoint joint control_mode must be 1 or 3')
     model = UrdfKinematics(DEFAULT_URDF.resolve())
     verify_live_model(model, controller.robot, 'right')
     state = _joint_map(controller.robot)
@@ -32,9 +34,9 @@ def move_right_hole_joint_target(controller, target, *, velocity_rad_s,
         RIGHT_ARM_JOINT_NAMES, transform, initial,
         joint_limits=ARM_POSITION_LIMITS[7:], reference_weight=0.)
     controller.check_automatic_guard()
-    # The right arm must remain in position mode while carrying the screwdriver.
+    # Carrying the tool defaults to position mode; pre-grasp clearance can use mode 3.
     controller.move_preset('right', solution, velocity_rad_s=velocity_rad_s,
-        life_time_s=30., detail='right endpoint IK', control_mode=1)
+        life_time_s=30., detail='right endpoint IK', control_mode=control_mode)
     # A large joint move at half the preset speed can legitimately exceed 30 s.
     expected_travel_s = max(abs(float(goal) - start) for goal, start in zip(solution, initial)) / velocity_rad_s
     deadline = clock() + max(timeout_s, expected_travel_s + 10.)

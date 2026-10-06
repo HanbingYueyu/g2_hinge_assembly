@@ -294,16 +294,11 @@ class MotionPauseGate:
             return
         with self._condition:
             thread_id = threading.get_ident()
-            cancel_guard = getattr(self, 'cancel_guard', None)
-            if cancel_guard is not None:
-                cancel_guard()
             while (
                 self._paused and not self._advance_requested and self._aborted is None
                 and thread_id not in self._cancelled_thread_ids
             ):
-                self._condition.wait(timeout=.02)
-                if cancel_guard is not None:
-                    cancel_guard()
+                self._condition.wait()
             if thread_id in self._cancelled_thread_ids:
                 raise MotionWriteCancelled("automatic motion writer was stopped")
             if self._aborted is not None:
