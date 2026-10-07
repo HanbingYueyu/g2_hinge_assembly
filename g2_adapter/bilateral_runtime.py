@@ -293,8 +293,23 @@ class BilateralRuntime:
         open_rad: float = OPEN_GRIPPER_RAD,
         timeout_s: float = 6.0,
         resend_period_s: float = 0.1,
+        hold_pose_stream: bool = False,
     ) -> dict:
         """Release the left jaw only, with the same repeated-request feedback."""
+        if hold_pose_stream:
+            try:
+                from .left_grasp_gdk import open_left_gripper_with_feedback
+            except ImportError:
+                from left_grasp_gdk import open_left_gripper_with_feedback
+            result = open_left_gripper_with_feedback(
+                self.controller, target_rad=open_rad,
+                tolerance_rad=GRIPPER_OPEN_TOLERANCE_RAD, timeout_s=timeout_s,
+            )
+            return self.emit(
+                'left_gripper_opened', target_rad=result['target_rad'],
+                actual_position_rad={'left': result['actual_position_rad']},
+                sides=['left'], control_method='end_effector_pose_gripper_stream',
+            )
         return self._open_grippers(
             ("left",), open_rad=open_rad, timeout_s=timeout_s,
             resend_period_s=resend_period_s, event="left_gripper_opened",

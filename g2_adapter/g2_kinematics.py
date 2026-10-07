@@ -155,6 +155,7 @@ class UrdfKinematics:
         damping: float = 0.02, reference_weight: float = 1e-4,
         max_joint_step: float = 0.05, max_iterations: int = 250,
         position_tolerance_m: float = 5e-5, orientation_tolerance_rad: float = 5e-4,
+        adaptive_steps: bool = False,
     ) -> tuple[np.ndarray, IKDiagnostics]:
         names = tuple(active_joint_names)
         q = np.asarray(initial, dtype=np.float64).copy()
@@ -164,6 +165,7 @@ class UrdfKinematics:
             raise KinematicsError("IK dimensions do not match active joints")
         if np.asarray(target).shape != (4, 4):
             raise KinematicsError("target pose must be a 4x4 transform")
+        current_damping = damping
         for iteration in range(1, max_iterations + 1):
             state = {**fixed_joint_positions, **dict(zip(names, q))}
             actual = self.forward(base_link, tip_link, state)
@@ -174,14 +176,34 @@ class UrdfKinematics:
                 return q, IKDiagnostics(iteration-1, position_norm, orientation_norm)
             jacobian = self.jacobian(base_link, tip_link, state, names)
             error = np.concatenate((position_error, orientation_error))
-            lhs = jacobian.T @ jacobian + (damping*damping + reference_weight) * np.eye(len(names))
+            lhs = jacobian.T @ jacobian + (current_damping*current_damping + reference_weight) * np.eye(len(names))
             rhs = jacobian.T @ error + reference_weight * (ref - q)
             try:
                 delta = np.linalg.solve(lhs, rhs)
             except np.linalg.LinAlgError as exc:
                 raise KinematicsError("IK linear solve failed") from exc
             scale = max(1.0, float(np.max(np.abs(delta))) / max_joint_step)
-            q = np.clip(q + delta/scale, limits[:, 0], limits[:, 1])
+            if not adaptive_steps:
+                q = np.clip(q + delta/scale, limits[:, 0], limits[:, 1])
+                continue
+            # Backtrack within joint bounds; accept only an improving pose.
+            old_cost = float(error @ error)
+            accepted = False
+            for factor in (1., .5, .25, .125, .0625):
+                candidate = np.clip(q + factor * delta/scale, limits[:, 0], limits[:, 1])
+                pose = self.forward(base_link, tip_link,
+                    {**fixed_joint_positions, **dict(zip(names, candidate))})
+                residual = np.concatenate((target[:3, 3] - pose[:3, 3],
+                    rotation_error(target[:3, :3], pose[:3, :3])))
+                if float(residual @ residual) < old_cost:
+                    q = candidate
+                    current_damping = max(.001, current_damping * .7)
+                    accepted = True
+                    break
+            if not accepted:
+                current_damping = min(.5, current_damping * 2.)
+                if np.max(np.abs(delta)) < 1e-9:
+                    break
         raise KinematicsError(
             f"pose IK did not converge: position_error={position_norm:.6f}m orientation_error={orientation_norm:.6f}rad"
         )

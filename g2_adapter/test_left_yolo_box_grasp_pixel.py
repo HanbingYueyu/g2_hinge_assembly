@@ -20,14 +20,21 @@ class YoloBoxGraspPixelTests(unittest.TestCase):
         self.assertEqual(bgr.shape, rgb.shape)
         self.assertEqual(valid_roi, (30, 15, 170, 85))
 
-    def test_uses_box_55_percent_up_from_bottom(self):
+    def test_uses_box_50_percent_up_from_bottom(self):
         item = {"bbox_xyxy": [3.0, 2.0, 18.0, 11.0]}
         result = yolo_box_fraction_grasp_pixel(item)
         self.assertAlmostEqual(result[0], 10.5)
-        self.assertAlmostEqual(result[1], 6.05)
+        self.assertAlmostEqual(result[1], 6.5)
 
     def test_gripper_target_is_screen_center_and_55_percent_up_from_bottom(self):
         np.testing.assert_allclose(screen_gripper_target_pixel((1056, 1280, 3)), [640.0, 475.2])
+
+    def test_extra_lift_requires_actual_motion(self):
+        from left_grasp_gdk import extra_lift_arrived
+        self.assertFalse(extra_lift_arrived((0, 0, 0), (0, 0, .005), .005))
+        self.assertFalse(extra_lift_arrived((0, 0, .002), (0, 0, .005), .005))
+        self.assertTrue(extra_lift_arrived((0, 0, .0045), (0, 0, .005), .005))
+        self.assertFalse(extra_lift_arrived((0, 0, 0), (0, 0, .0005), .0005))
 
     def test_supports_an_explicit_fraction(self):
         item = {"bbox_xyxy": [2.0, 1.0, 8.0, 9.0]}

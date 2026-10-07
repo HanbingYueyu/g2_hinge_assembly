@@ -164,7 +164,7 @@ class ReturnMotionTests(unittest.TestCase):
         from pathlib import Path
         from control import CartesianPoseTarget
         saved = CartesianPoseTarget((.4, .1, .7), (0, 0, 0, 1))
-        upper = CartesianPoseTarget((.4, .1, .8), saved.orientation_xyzw)
+        upper = CartesianPoseTarget((.408, .1, .8), saved.orientation_xyzw)
         services = Mock()
         services.get.side_effect = lambda key: saved if key == 'left_demo_grasp_pose' else None
         services.controller.read_end_effector_pose.side_effect = [upper, upper, saved]
@@ -173,9 +173,11 @@ class ReturnMotionTests(unittest.TestCase):
             config.write_text('{"contact":{"force_delta_threshold_n":3}}')
             ctx = SimpleNamespace(services=services, runtime=Mock(), args=SimpleNamespace(
                 left_config=config, auto_speed_mm_s=30, auto_preset_velocity_rad_s=.2))
-            with patch('left_hole_joint_move.move_left_hole_joint_target'), \
+            with patch('left_hole_joint_move.move_left_hole_joint_target') as move, \
                  patch('left_seat_motion.force_guarded_left_descent', return_value={'stop_reason':'max_distance'}) as descent, \
                  patch('left_seat_motion.move_left_vertical', return_value={}):
                 demo._move_left_to_saved_pose(ctx)
+            self.assertAlmostEqual(move.call_args.args[1].position_m[0], .408)
+            self.assertEqual(saved.position_m, (.4, .1, .7))
             self.assertEqual(descent.call_args.kwargs['speed_mm_s'], 30)
             ctx.runtime.open_left_gripper.assert_called_once()

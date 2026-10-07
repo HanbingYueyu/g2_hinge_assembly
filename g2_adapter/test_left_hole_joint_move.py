@@ -49,3 +49,35 @@ class LeftHoleJointTests(unittest.TestCase):
             with self.assertRaisesRegex(motion.SafetyError, '未到位'):
                 motion.move_left_hole_joint_target(controller, target, velocity_rad_s=.2,
                     timeout_s=0., clock=lambda: 0.)
+
+class RobustEndpointTests(unittest.TestCase):
+    def test_retry_changes_seed_and_keeps_accuracy_requirements(self):
+        import left_hole_joint_move as motion
+        from g2_kinematics import KinematicsError
+        model = Mock()
+        model.solve_pose.side_effect = [KinematicsError('local minimum'), (np.zeros(7), None)]
+        with patch.object(motion, '_LAST_SOLUTION', None):
+            result = motion.solve_endpoint(model, Mock(), {}, np.eye(4), np.zeros(7))
+        self.assertEqual(model.solve_pose.call_count, 2)
+        self.assertFalse(np.array_equal(model.solve_pose.call_args_list[0].args[-1],
+                                       model.solve_pose.call_args_list[1].args[-1]))
+        self.assertEqual(model.solve_pose.call_args.kwargs['position_tolerance_m'], .001)
+        self.assertTrue(model.solve_pose.call_args.kwargs['adaptive_steps'])
+
+    def test_adaptive_solver_reaches_known_reachable_urdf_target(self):
+        import json
+        from pathlib import Path
+        import left_hole_joint_move as motion
+        model = motion.UrdfKinematics(motion.DEFAULT_URDF.resolve())
+        root = Path(__file__).resolve().parents[1]
+        q = np.asarray(json.loads((root/'g2_adapter/recorded_poses.json').read_text())['poses']['left_p4']['joint_positions_rad'])
+        state = dict(zip(motion.LEFT_ARM_JOINT_NAMES, q))
+        goal = model.forward('base_link', 'arm_l_end_link', state)
+        solution, diagnostics = model.solve_pose('base_link', 'arm_l_end_link', state,
+            motion.LEFT_ARM_JOINT_NAMES, goal, q + .08,
+            joint_limits=motion.ARM_POSITION_LIMITS[:7], reference_weight=0.,
+            adaptive_steps=True, position_tolerance_m=.001,
+            orientation_tolerance_rad=np.radians(1.))
+        actual = model.forward('base_link', 'arm_l_end_link', dict(zip(motion.LEFT_ARM_JOINT_NAMES, solution)))
+        self.assertLessEqual(np.linalg.norm(actual[:3,3]-goal[:3,3]), .001)
+        self.assertLessEqual(np.linalg.norm(motion.rotation_error(goal[:3,:3], actual[:3,:3])), np.radians(1.))

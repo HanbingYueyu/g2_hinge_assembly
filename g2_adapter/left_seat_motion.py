@@ -8,11 +8,13 @@ import time
 import numpy as np
 
 try:
+    from .return_timing import timed_return_step
     from .control import CartesianPoseTarget
     from .left_grasp_gdk import measured_left_end_link_pose, read_wrench_force
     from .move_left_above_head_hinge_gdk import wait_actual_left_target
     from .safety import SafetyError
 except ImportError:
+    from return_timing import timed_return_step
     from control import CartesianPoseTarget
     from left_grasp_gdk import measured_left_end_link_pose, read_wrench_force
     from move_left_above_head_hinge_gdk import wait_actual_left_target
@@ -41,6 +43,7 @@ def force_guarded_left_descent(controller, robot, *, max_distance_mm: float,
                                force_threshold_n: float, speed_mm_s: float,
                                completion_tolerance_mm: float = 0.5,
                                timeout_s: float | None = None,
+                               diagnose_return: bool = False,
                                sleep=time.sleep, clock=time.monotonic) -> dict:
     """Descend in base_link -Z until distance or relative resultant force wins."""
     if not math.isfinite(max_distance_mm) or not 0.0 < max_distance_mm <= 100.0:
@@ -91,13 +94,15 @@ def force_guarded_left_descent(controller, robot, *, max_distance_mm: float,
                 sleep(0.02)
         # Contact and arrival are safety boundaries: discard the downward
         # velocity before publishing the measured-pose hold.
-        hold = CartesianPoseTarget(actual.position_m, origin.orientation_xyzw)
-        stream.hold_at_pose(hold)
-        hold_timeout_s = max(0.5, max_distance_mm / speed_mm_s + 0.5)
-        if not stream.wait_until_commanded_target(hold, hold_timeout_s):
-            raise SafetyError("左臂力保护下探停止后，保持位姿未确认发送")
+        with timed_return_step('保持位姿确认', enabled=diagnose_return):
+            hold = CartesianPoseTarget(actual.position_m, origin.orientation_xyzw)
+            stream.hold_at_pose(hold)
+            hold_timeout_s = max(0.5, max_distance_mm / speed_mm_s + 0.5)
+            if not stream.wait_until_commanded_target(hold, hold_timeout_s):
+                raise SafetyError("左臂力保护下探停止后，保持位姿未确认发送")
     finally:
-        stream.stop()
+        with timed_return_step('停止运动线程', enabled=diagnose_return):
+            stream.stop()
     return {
         "event": "left_seat_descent_complete",
         "stop_reason": stop_reason,

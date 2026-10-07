@@ -33,7 +33,7 @@ class NearContactForceHold:
 class LargeDescentXYErrorGuard:
     """Pause descent for confirmed large errors until XY is aligned again."""
 
-    def __init__(self, *, threshold_m: float = 0.015, resume_tolerance_m: float = 0.005,
+    def __init__(self, *, threshold_m: float = 0.010, resume_tolerance_m: float = 0.005,
                  consecutive_frames: int = 2):
         if (not math.isfinite(threshold_m) or threshold_m <= 0
                 or not math.isfinite(resume_tolerance_m)

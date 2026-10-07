@@ -115,3 +115,62 @@ class EscapeTests(unittest.TestCase):
             demo._stop_cancelled_round(SimpleNamespace(services=services))
         runner.stop_current_cycle.assert_called_once()
         self.assertIs(controller.demo_cancel_guard, old_guard)
+
+    def test_hinge_round_returns_home_before_next_pick(self):
+        for mode in ('1', '2'):
+            selection = demo.DemoModeSelection()
+            selection.choose(mode)
+            values = {}
+            class Services:
+                controller = SimpleNamespace(motion_gate=None)
+                def get(self, name): return values.get(name)
+                def put(self, name, value): values[name] = value
+            ctx = SimpleNamespace(services=Services(), runtime=SimpleNamespace(emit=Mock()))
+            events = []
+            original_wait = selection.wait_first
+            waits = []
+            def wait():
+                waits.append(1)
+                if len(waits) == 2:
+                    selection.choose('q')
+                return original_wait()
+            def round_action(*args):
+                events.append('pick_return')
+                if events.count('pick_return') == 2:
+                    selection.choose('q')
+            with patch.object(selection, 'wait_first', side_effect=wait), \
+                 patch('repeated_grasp_demo.run_demo_round', side_effect=round_action), \
+                 patch('run_bilateral_flow_gdk.stage_home', side_effect=lambda ctx: events.append('home')):
+                self.assertEqual(demo.run_repeated_demo(ctx, selection), 0)
+            self.assertEqual(events, ['home', 'pick_return', 'home', 'pick_return', 'home'])
+
+    def test_failed_hinge_grasp_retries_before_queued_switch(self):
+        from vlm_gripper_monitor import VlmRegraspRequested
+        selection = demo.DemoModeSelection()
+        selection.choose('1')
+        values = {}
+        class Services:
+            controller = SimpleNamespace(motion_gate=None)
+            def get(self, name): return values.get(name)
+            def put(self, name, value): values[name] = value
+        ctx = SimpleNamespace(services=Services(), runtime=SimpleNamespace(emit=Mock()))
+        rounds = []
+        original_wait = selection.wait_first
+        waits = []
+        def wait():
+            waits.append(1)
+            if len(waits) == 2: selection.choose('q')
+            return original_wait()
+        def action(mode, actions):
+            rounds.append(mode)
+            if len(rounds) == 1:
+                selection.choose('3')
+                raise VlmRegraspRequested('not attached')
+            if mode == '3': selection.choose('q')
+        with patch.object(selection, 'wait_first', side_effect=wait), \
+             patch('repeated_grasp_demo.run_demo_round', side_effect=action), \
+             patch('repeated_grasp_demo._recover_hinge_grasp') as recover, \
+             patch('run_bilateral_flow_gdk.stage_home'):
+            self.assertEqual(demo.run_repeated_demo(ctx, selection), 0)
+        self.assertEqual(rounds, ['1', '1', '3'])
+        recover.assert_called_once()

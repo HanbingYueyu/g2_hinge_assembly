@@ -134,8 +134,8 @@ HINGE_CLASS_ID = 0
 SHAFT_CLASS_ID = 1
 SCREEN_GRIPPER_TARGET_HEIGHT_FRACTION = 0.45
 # The object grasp landmark is measured upward from the bottom of the YOLO
-# box.  Thus 0.55 means 55% up from the box bottom (45% down from its top).
-YOLO_GRASP_BOTTOM_UP_FRACTION = 0.55
+# box.  A fraction of 0.50 selects the vertical box centre.
+YOLO_GRASP_BOTTOM_UP_FRACTION = 0.50
 YOLO_CENTER_CROP_FRACTION = 0.70
 
 
@@ -155,6 +155,12 @@ def prepare_yolo_input(
     return cv2.cvtColor(image, cv2.COLOR_RGB2BGR), center_crop_bounds(
         image.shape, fraction=valid_fraction,
     )
+
+
+def extra_lift_arrived(actual_position, target_position, distance_m):
+    tolerance_m = min(0.001, float(distance_m) * 0.2)
+    error_m = float(np.linalg.norm(np.asarray(actual_position) - np.asarray(target_position)))
+    return bool(np.isfinite(error_m) and error_m <= tolerance_m)
 
 
 def yolo_box_fraction_grasp_pixel(
@@ -662,7 +668,7 @@ def parse_args(argv=None) -> argparse.Namespace:
         "--yolo-box-height-fraction",
         type=float,
         default=YOLO_GRASP_BOTTOM_UP_FRACTION,
-        help="YOLO 框从底部向上比例，默认 0.55（55%%）；横坐标取检测框中心。",
+        help="YOLO 框从底部向上比例，默认 0.50（50%%）；横坐标取检测框中心。",
     )
     parser.add_argument(
         "--height-reference",
@@ -1157,6 +1163,8 @@ def compact_record(record: dict) -> dict:
             for key in (
                 "required", "released", "latest_delta_force_n",
                 "consecutive_hits", "speed_mm_s", "max_lift_m",
+                "extra_lift_m", "extra_lift_settled", "extra_lift_actual_mm",
+                "extra_lift_target_mm", "extra_lift_tolerance_mm",
             )
             if key in relief
         }
@@ -4788,10 +4796,7 @@ def run_left_cycle(*, services=None, argv=None) -> int:
                                                 force_relief_completed
                                                 and contact_detector.parameters.relief_extra_lift_m > 0.0
                                             ):
-                                                # Wait for the extra clearance to settle
-                                                # before allowing closure.  Not reaching
-                                                # it is recorded but not fatal: the force
-                                                # has already been released.
+                                                # Require measured extra clearance before closure.
                                                 extra_settle_m = float(
                                                     contact_detector.parameters.relief_extra_lift_m
                                                 )
@@ -4802,18 +4807,24 @@ def run_left_cycle(*, services=None, argv=None) -> int:
                                                 extra_settled = False
                                                 while time.monotonic() < extra_deadline:
                                                     position_stream.raise_if_failed()
-                                                    extra_delta = (
-                                                        np.asarray(
-                                                            measured_left_end_link_pose(controller).position_m
-                                                        )
-                                                        - np.asarray(last_end_link_target.position_m)
-                                                    )
-                                                    if float(np.linalg.norm(extra_delta)) <= 0.005:
+                                                    extra_actual = measured_left_end_link_pose(controller)
+                                                    if extra_lift_arrived(
+                                                        extra_actual.position_m, last_end_link_target.position_m,
+                                                        extra_settle_m,
+                                                    ):
                                                         extra_settled = True
                                                         break
                                                     time.sleep(contact_detector.parameters.sample_period_s)
                                                 record["force_relief"]["extra_lift_m"] = extra_settle_m
                                                 record["force_relief"]["extra_lift_settled"] = extra_settled
+                                                record["force_relief"]["extra_lift_actual_mm"] = (
+                                                    extra_actual.position_m[2] - relief_pose.position_m[2]
+                                                ) * 1000.0
+                                                record["force_relief"]["extra_lift_target_mm"] = extra_settle_m * 1000.0
+                                                record["force_relief"]["extra_lift_tolerance_mm"] = min(1.0, extra_settle_m * 200.0)
+                                                if not extra_settled:
+                                                    json_record(log, record)
+                                                    raise SafetyError('卸力后额外上抬未实际到位；停止且不闭爪')
                                             if not force_relief_completed:
                                                 # Return to the pre-descent height before
                                                 # permitting another visual alignment.

@@ -188,6 +188,12 @@ def check_left_return_arrival(*, saved_position, actual_position, descent: dict)
         )
 
 
+try:
+    from .return_timing import timed_return_step
+except ImportError:
+    from return_timing import timed_return_step
+
+
 def _move_left_to_saved_pose(ctx) -> None:
     """Return the held hinge from clearance height to its measured pickup pose."""
     try:
@@ -199,10 +205,11 @@ def _move_left_to_saved_pose(ctx) -> None:
     saved = ctx.services.get('left_demo_grasp_pose')
     if saved is None:
         raise SafetyError('本轮没有保存左手抓取位姿；拒绝放回并松爪')
+    return_position = (saved.position_m[0] + 0.008, saved.position_m[1], saved.position_m[2])
     controller = ctx.services.controller
     current = controller.read_end_effector_pose('arm_l_end_link')
     upper = CartesianPoseTarget(
-        (saved.position_m[0], saved.position_m[1], saved.position_m[2] + 0.10),
+        (return_position[0], return_position[1], return_position[2] + 0.10),
         saved.orientation_xyzw,
     )
     travel = float(np.linalg.norm(np.asarray(current.position_m) - np.asarray(upper.position_m)))
@@ -219,17 +226,21 @@ def _move_left_to_saved_pose(ctx) -> None:
         controller, ctx.services.robot, max_distance_mm=100.0,
         force_threshold_n=float(contact_config['force_delta_threshold_n']),
         speed_mm_s=ctx.args.auto_speed_mm_s,
-        completion_tolerance_mm=5.0, timeout_s=30.0,
+        completion_tolerance_mm=5.0, timeout_s=30.0, diagnose_return=True,
     )
-    ctx.runtime.emit_event(descent)
-    actual = controller.read_end_effector_pose('arm_l_end_link')
-    check_left_return_arrival(
-        saved_position=saved.position_m, actual_position=actual.position_m, descent=descent,
-    )
+    with timed_return_step('放回事件处理'):
+        ctx.runtime.emit_event(descent)
+    with timed_return_step('放回位置核对'):
+        actual = controller.read_end_effector_pose('arm_l_end_link')
+        check_left_return_arrival(
+            saved_position=return_position, actual_position=actual.position_m, descent=descent,
+        )
     monitor = ctx.services.get('vlm_gripper_monitor')
     if monitor is not None:
-        monitor.finish_before_release()
-    ctx.runtime.open_left_gripper()
+        with timed_return_step('结束夹持监测'):
+            monitor.finish_before_release()
+    with timed_return_step('夹爪张开指令及反馈'):
+        ctx.runtime.open_left_gripper(hold_pose_stream=True)
     try:
         from .left_seat_motion import move_left_vertical
     except ImportError:
@@ -458,6 +469,27 @@ def print_demo_menu():
     )
 
 
+def _recover_hinge_grasp(ctx, reason):
+    monitor = ctx.services.get('vlm_gripper_monitor')
+    if monitor is None or not (ctx.services.get('head_targets') or {}).get('hinge'):
+        raise SafetyError('VLM 重抓缺少本次头部铰链定位或夹持监测')
+    monitor.set_phase('idle')
+    ctx.runtime.emit('vlm_regrasp_requested', reason=str(reason))
+    controller = ctx.services.controller
+    controller.prepare_joint_impedance_control(('left',))
+    current = list(controller.checked_arm_state()[:7])
+    for _ in range(20):
+        controller.hold_joint_positions('left', current)
+        time.sleep(.01)
+    try:
+        from .left_seat_motion import move_left_vertical
+    except ImportError:
+        from left_seat_motion import move_left_vertical
+    ctx.runtime.emit_event(move_left_vertical(
+        controller, distance_mm=50., speed_mm_s=ctx.args.auto_speed_mm_s))
+    print('[VLM 重抓] 已停止当前动作并上抬 50 mm，重新定位抓取铰链。', flush=True)
+
+
 def _stop_cancelled_round(ctx):
     monitor = ctx.services.get('vlm_gripper_monitor')
     if monitor is not None:
@@ -595,6 +627,9 @@ def _run_repeated_demo(ctx, selection: DemoModeSelection) -> int:
                 'right_return': lambda: _release_right_in_place(ctx) if mode == '3' else _return_right(ctx),
             }
             run_demo_round(mode, actions)
+            if mode in {'1', '2'}:
+                ctx.runtime.emit('demo_home_start', mode=mode)
+                stage_home(ctx)
             selection.check_cancelled()
             ctx.runtime.emit('demo_round_complete', mode=mode, round=round_number)
         except Exception as exc:
@@ -614,13 +649,34 @@ def _run_repeated_demo(ctx, selection: DemoModeSelection) -> int:
                 if mode is None:
                     return 0
                 continue
+            try:
+                from .vlm_gripper_monitor import VlmRegraspRequested
+            except ImportError:
+                from vlm_gripper_monitor import VlmRegraspRequested
+            if mode in {'1', '2'} and isinstance(exc, VlmRegraspRequested):
+                try:
+                    _recover_hinge_grasp(ctx, exc)
+                except Exception as recovery_error:
+                    if selection._cancel.is_set():
+                        _stop_cancelled_round(ctx)
+                        selection.return_to_menu()
+                        ctx.runtime.emit('demo_round_cancelled', mode=mode, round=round_number)
+                        print_demo_menu()
+                        mode = selection.wait_first()
+                        previous = None
+                        continue
+                    ctx.runtime.emit('demo_round_failed', mode=mode, error=str(recovery_error))
+                    print(f'[重抓恢复失败] {recovery_error}', file=sys.stderr, flush=True)
+                    return 1
+                previous = mode
+                continue
             ctx.runtime.emit('demo_round_failed', mode=mode, round=round_number, error=str(exc))
             print(f'[演示停止] {exc}', file=sys.stderr, flush=True)
             return 1
         previous = mode
         mode = selection.next_round()
         if mode is None and selection.active is None:
-            if previous not in {'5', '6'}:
+            if previous not in {'1', '2', '5', '6'}:
                 selection.active = previous
                 try:
                     stage_home(ctx)
