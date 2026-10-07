@@ -104,6 +104,11 @@ class VlmTtsAnnouncer:
 
     def handle_event(self, event: dict) -> bool:
         """Queue a supported semantic result once per run or demo round."""
+        if event.get("event") == "demo_round_cancelled":
+            with self._lock:
+                self._generation += 1
+                self._spoken_or_queued.clear()
+            return False
         if event.get("event") == "demo_round_start":
             with self._lock:
                 self._demo_mode = str(event.get("mode"))

@@ -7,7 +7,7 @@ from vlm_checks.src.vlm_three_checks import VlmClient, api_key_from_environment,
 
 ASSETS = Path(__file__).with_name('vlm_four_screws_20261006')
 LABELS = ['参考图：实际0颗螺丝。', '参考图：实际4颗螺丝。',
-          '待测当前图。数清实际螺丝，只输出JSON {"count":0}，看不清返回{"count":"unknown"}。']
+          '待测当前图。']
 
 
 def decode_result(raw):
@@ -36,10 +36,15 @@ class FourScrews20261006Client(VlmClient):
             raise ValueError('需要当前相机裁剪图')
         return (*self.references, frames[-1])
 
-    def run_bytes(self, task, images):
+    def run_bytes(self, task, images, *, yolo_count=None):
         if task != 'four-screws' or len(images) != 3:
             raise ValueError('输入必须为零颗参考图、四颗参考图、当前裁剪图')
-        content = [{'type': 'text', 'text': self.prompt}]
+        prompt = self.prompt
+        if yolo_count is not None:
+            if type(yolo_count) is not int or yolo_count < 0:
+                raise ValueError('YOLO 框数量必须为非负整数')
+            prompt += f'\n\n最后一张当前图中，YOLO识别到的候选螺丝头框数量为{yolo_count}个。'
+        content = [{'type': 'text', 'text': prompt}]
         for label, data in zip(LABELS, images, strict=True):
             url = 'data:image/jpeg;base64,'+base64.b64encode(data).decode('ascii')
             content.extend([{'type': 'text', 'text': label},

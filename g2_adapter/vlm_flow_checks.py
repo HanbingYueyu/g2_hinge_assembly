@@ -258,15 +258,15 @@ def run_convex_insert_check(web, client, clock=time.monotonic, *, frames_overrid
 
 
 def run_four_screws_check(web, client, clock=time.monotonic, *, frames_override=None) -> dict:
-    """Read-only four-screw check over four fresh original right-camera frames."""
+    """Read-only four-screw check over one fresh original right-camera frame."""
     try:
         if frames_override is None:
-            images, statuses = _snapshot_sequence(web, "right", not_before=time.monotonic())
+            images, statuses = _snapshot_sequence(web, "right", count=1, not_before=time.monotonic())
         else:
             images = [bytes(frame) for frame in frames_override]
             statuses = {"right": {"raw_age_s": 0.0}}
-        if len(images) != 4:
-            raise ValueError("four-screws VLM check requires four frames")
+        if len(images) != 1:
+            raise ValueError("four-screws VLM check requires one frame")
         if client is None:
             raise RuntimeError("VLM client is unavailable")
     except Exception as exc:
@@ -306,6 +306,17 @@ def run_right_fixture_grasp_check(web, client, clock=time.monotonic, *, frames_o
     return _safe_check(client, "right-fixture-grasp", images, statuses, clock)
 
 
+def _same_review_decision(first, second):
+    if not first.get('ok') or not second.get('ok'):
+        return False
+    task = first.get('task')
+    field = {'pin': 'pin_inserted', 'c-hole': 'obvious_c_leak'}.get(task, 'decision')
+    a, b = first.get('result', {}), second.get('result', {})
+    if field == 'decision' and a.get(field) not in {'已插入', '未插入', '不确定', '无明显大偏差', '明显大偏差'}:
+        return False
+    return field in a and field in b and a[field] == b[field]
+
+
 def run_hole_alignment_review(web, client, emit, *, sleep=time.sleep):
     """Three fresh right-camera ROI judgments followed by a conservative majority."""
     from vlm_checks.src.migrated_checks import alignment_roi, alignment_vote
@@ -326,9 +337,17 @@ def run_hole_alignment_review(web, client, emit, *, sleep=time.sleep):
         records.append(record)
         results.append(record.get('result', {'decision': '不确定'}))
         emit(record)
+        if index == 2 and _same_review_decision(records[0], records[1]):
+            break
+    if len(results) == 2:
+        decision = results[0]['decision']
+        vote = {'decision': decision, 'votes': {decision: 2}, 'observations': results,
+                'reason': f'前两次判别一致：{decision}'}
+    else:
+        vote = alignment_vote(results)
     summary = {"event": RESULT_EVENTS['hole-alignment'], "task": 'hole-alignment',
                "ok": any(record.get('ok') for record in records),
-               "aggregate": True, "result": alignment_vote(results)}
+               "aggregate": True, "result": vote, "review_count": len(records)}
     emit(summary)
     return [*records, summary]
 
@@ -357,12 +376,19 @@ def run_assembly_review(
             records.append(record)
             emit(record)
             convex_votes.append(record.get('result', {}).get('decision') if record.get('ok') else None)
+        if round_index == 2:
+            first = {r['task']: r for r in records if r['review_round'] == 1}
+            second = {r['task']: r for r in records if r['review_round'] == 2}
+            if first and first.keys() == second.keys() and all(
+                _same_review_decision(first[task], second[task]) for task in first
+            ):
+                break
     if include_convex:
         decision = ('已插入' if convex_votes.count('已插入') >= 2 else
                     '未插入' if convex_votes.count('未插入') >= 2 else '不确定')
         summary = {'event': RESULT_EVENTS['convex-inserted'], 'task': 'convex-inserted',
                    'ok': any(vote is not None for vote in convex_votes),
-                   'aggregate': True, 'result': {'decision': decision}}
+                   'aggregate': True, 'review_count': len(convex_votes), 'result': {'decision': decision}}
         records.append(summary)
         emit(summary)
     return records
@@ -378,4 +404,6 @@ def run_c_hole_review(web, client, emit, *, sleep=time.sleep):
         record['review_round'] = round_index
         records.append(record)
         emit(record)
+        if round_index == 2 and _same_review_decision(records[0], records[1]):
+            break
     return records

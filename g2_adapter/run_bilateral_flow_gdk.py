@@ -614,6 +614,9 @@ def _head_live_publisher(ctx: "FlowContext"):
         from move_left_above_head_hinge_gdk import draw_head_targets_overlay
 
     def publish(bgr, masks, scores, classes) -> None:
+        guard = getattr(ctx.services.controller, 'demo_cancel_guard', None)
+        if guard is not None:
+            guard()
         web = getattr(ctx.services, "web", None)
         if web is None:
             return
@@ -1009,7 +1012,7 @@ def _confirm_left_grasp(ctx):
     if monitor is not None:
         monitor.set_phase('post_grasp')
         record = monitor.wait_for_attached(
-            timeout_s=5.0 * ctx.args.vlm_timeout_s + 5.0,
+            timeout_s=4.0 * ctx.args.vlm_timeout_s + 5.0,
             guard=ctx.services.controller.check_automatic_guard,
         )
         return {'task': 'gripper', 'ok': True, 'state': record['stable_state']}

@@ -1423,6 +1423,9 @@ class G2Controller:
         return self.motion_gate.automatic_motion()
 
     def check_automatic_guard(self):
+        cancel_guard = getattr(self, 'demo_cancel_guard', None)
+        if cancel_guard is not None:
+            cancel_guard()
         # Background servo/feedback threads must not consume a recovery
         # request. The owning main thread unwinds and stops their streams.
         guard = getattr(self, 'automatic_guard', None)

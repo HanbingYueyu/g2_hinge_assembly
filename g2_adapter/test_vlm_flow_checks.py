@@ -39,6 +39,25 @@ class FakeWeb:
 
 
 class VlmFlowChecksTests(unittest.TestCase):
+    def test_convex_matching_first_two_skip_third(self):
+        with patch('vlm_flow_checks.run_convex_insert_check', return_value={
+            'task': 'convex-inserted', 'ok': True, 'result': {'decision': '已插入'},
+        }) as check:
+            records = run_assembly_review(None, None, lambda _: None, sleep=lambda _: None,
+                include_convex=True, include_c_hole=False, include_pin=False)
+        self.assertEqual(check.call_count, 2)
+        self.assertEqual(records[-1]['review_count'], 2)
+        self.assertEqual(records[-1]['result']['decision'], '已插入')
+
+    def test_failed_first_two_do_not_skip_third(self):
+        with patch('vlm_flow_checks.run_convex_insert_check', return_value={
+            'task': 'convex-inserted', 'ok': False,
+        }) as check:
+            run_assembly_review(None, None, lambda _: None, sleep=lambda _: None,
+                include_convex=True, include_c_hole=False, include_pin=False)
+        self.assertEqual(check.call_count, 3)
+
+
     def test_snapshot_rejects_cached_frame_from_before_arrival(self):
         from vlm_flow_checks import _snapshots
         from unittest.mock import Mock
@@ -60,15 +79,15 @@ class VlmFlowChecksTests(unittest.TestCase):
                 return {'decision': '无明显大偏差' if len(calls) <= 2 else '明显大偏差'}
         raw = jpeg(1280, 1056)
         records = run_hole_alignment_review(FakeWeb({'right': raw, 'left': b'wrong camera'}), Client(), emitted.append, sleep=lambda _: None)
-        self.assertEqual(calls, [('hole-alignment', [raw])] * 3)
-        self.assertEqual(len(emitted), 5)
+        self.assertEqual(calls, [('hole-alignment', [raw])] * 2)
+        self.assertEqual(len(emitted), 4)
         self.assertEqual(emitted[0], {"event": "vlm_check_start", "task": "hole-alignment"})
-        self.assertEqual([record['review_round'] for record in records[:-1]], [1, 2, 3])
+        self.assertEqual([record['review_round'] for record in records[:-1]], [1, 2])
         self.assertTrue(all(record['review_total'] == 3 for record in records[:-1]))
         self.assertTrue(records[-1]['aggregate'])
         self.assertEqual(records[-1]['result']['decision'], '无明显大偏差')
-        self.assertEqual(len(list(self.output.rglob('*_crop.jpg'))), 3)
-        self.assertEqual(len(list(self.output.rglob('*_right_vlm_hole_alignment_check_crop.jpg'))), 3)
+        self.assertEqual(len(list(self.output.rglob('*_crop.jpg'))), 2)
+        self.assertEqual(len(list(self.output.rglob('*_right_vlm_hole_alignment_check_crop.jpg'))), 2)
 
     def test_hole_alignment_does_not_mark_all_failed_calls_as_valid_vote(self):
         records = run_hole_alignment_review(FakeWeb({}), None, lambda _: None,
@@ -84,7 +103,7 @@ class VlmFlowChecksTests(unittest.TestCase):
         run_assembly_review(FakeWeb({'right': b'right'}), Client(), lambda _: None,
                             sleep=lambda _: None, include_convex=True,
                             include_c_hole=False, include_pin=False)
-        self.assertEqual(calls, [('convex-inserted', [b'right'])] * 3)
+        self.assertEqual(calls, [('convex-inserted', [b'right'])] * 2)
 
     def test_strict_convex_review_emits_one_majority_vote_after_three_rounds(self):
         decisions = iter(['已插入', '未插入', '已插入'])
@@ -164,9 +183,9 @@ class VlmFlowChecksTests(unittest.TestCase):
             {"task": "c-hole", "ok": True, "result": {"obvious_c_leak": False}},
         ]) as check:
             records = run_c_hole_review(None, None, emit, sleep=lambda _: None)
-        self.assertEqual(check.call_count, 3)
-        self.assertEqual([record["review_round"] for record in records], [1, 2, 3])
-        self.assertEqual(emit.call_count, 3)
+        self.assertEqual(check.call_count, 2)
+        self.assertEqual([record["review_round"] for record in records], [1, 2])
+        self.assertEqual(emit.call_count, 2)
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
@@ -348,18 +367,18 @@ class VlmFlowChecksTests(unittest.TestCase):
         self.assertTrue(record["ok"])
         self.assertEqual(calls, [("convex-inserted", [b"right-original"])])
 
-    def test_screws_and_fixture_checks_send_four_original_frames(self):
+    def test_screws_send_one_frame_and_fixture_sends_four(self):
         calls = []
         class Client:
             def run_bytes(self, task, images):
                 calls.append((task, images))
                 return {"latest_decision": "unknown"} if task == "four-screws" else {"decision": "unknown"}
         frames = [jpeg(1280, 1056) for _ in range(4)]
-        screws = run_four_screws_check(FakeWeb({"right": frames[-1]}), Client(), frames_override=frames)
+        screws = run_four_screws_check(FakeWeb({"right": frames[-1]}), Client(), frames_override=[frames[-1]])
         fixture = run_right_fixture_grasp_check(FakeWeb({"right": frames[-1]}), Client(), frames_override=frames)
         self.assertTrue(screws["ok"])
         self.assertTrue(fixture["ok"])
-        self.assertEqual(calls[0], ("four-screws", frames))
+        self.assertEqual(calls[0], ("four-screws", [frames[-1]]))
         self.assertEqual(calls[1][0], "right-fixture-grasp")
         self.assertEqual(calls[1][1], frames)
 
@@ -387,3 +406,17 @@ class VlmFlowChecksTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class SingleScrewFrameTests(unittest.TestCase):
+    def test_screw_check_requests_one_fresh_frame(self):
+        from unittest.mock import Mock, patch
+        client = Mock()
+        client.run_bytes.return_value = {'latest_decision': 'no'}
+        with patch('vlm_flow_checks._snapshot_sequence', return_value=([b'current'], {})) as snapshot, \
+             patch('vlm_flow_checks._save_inputs'):
+            result = run_four_screws_check(object(), client)
+        self.assertTrue(result['ok'])
+        self.assertEqual(snapshot.call_args.kwargs['count'], 1)
+        self.assertIn('not_before', snapshot.call_args.kwargs)
+        client.run_bytes.assert_called_once_with('four-screws', [b'current'])

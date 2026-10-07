@@ -258,6 +258,11 @@ class VlmClient:
         self.session = requests.Session()
 
     def run_bytes(self, task: str, images: list[bytes]) -> dict[str, Any]:
+        if task == 'four-screws':
+            if str(ROOT.parent) not in sys.path:
+                sys.path.insert(0, str(ROOT.parent))
+            from g2_adapter.flow_four_screws import run_check
+            return run_check(self, images)
         if task == 'gripper':
             if str(ROOT.parent) not in sys.path:
                 sys.path.insert(0, str(ROOT.parent))

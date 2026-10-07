@@ -39,6 +39,17 @@ def crop_frame(frame, roi):
     return data.tobytes()
 
 
+def boxed_screw_frame(frame, model, *, with_count=False):
+    """Detect in the trained ROI, then draw only boxes on the full image."""
+    from right_plate_screw_detection import detect
+    _, _, details = detect(model, frame, confidence=.5)
+    annotated = frame.copy()
+    for detection in details['detections']:
+        x0, y0, x1, y1 = (int(round(v)) for v in detection['bbox_xyxy'])
+        cv2.rectangle(annotated, (x0, y0), (x1, y1), (255, 0, 0), 2)
+    return (annotated, len(details['detections'])) if with_count else annotated
+
+
 def check_result(result):
     if not isinstance(result, dict) or result.get('latest_decision') not in {'yes', 'no', 'unknown'}:
         raise ValueError('VLM 未返回有效 latest_decision（yes/no/unknown）')
@@ -62,8 +73,9 @@ img.src='/input/'+i+'?id='+current;d.append(s.input_labels?.[i]||('第 '+(i+1)+'
 
 
 class LiveReview:
-    def __init__(self, read_frame, client, roi, *, sample_interval=.25, request_interval=1.):
+    def __init__(self, read_frame, client, roi, *, sample_interval=.25, request_interval=1., annotate_frame=None):
         self.read_frame, self.client, self.roi = read_frame, client, roi
+        self.annotate_frame = annotate_frame
         self.sample_interval, self.request_interval = sample_interval, request_interval
         self.lock = threading.Lock()
         self.stop = threading.Event()
@@ -85,14 +97,22 @@ class LiveReview:
         last_sample = float('-inf')
         while not self.stop.is_set():
             try:
-                image = crop_frame(self.read_frame(), self.roi)
+                frame = self.read_frame()
+                yolo_count = None
+                if self.annotate_frame is not None:
+                    annotated = self.annotate_frame(frame)
+                    if isinstance(annotated, tuple):
+                        frame, yolo_count = annotated
+                    else:
+                        frame = annotated
+                image = crop_frame(frame, self.roi)
                 now = time.monotonic()
                 with self.lock:
                     self.latest = image
                     self.state['camera_error'] = None
                     self.state['preview_time'] = time.strftime('%Y-%m-%d %H:%M:%S')
                     if now-last_sample >= self.sample_interval:
-                        self.frames.append((now, image))
+                        self.frames.append((now, image, yolo_count))
                         last_sample = now
             except Exception as exc:
                 with self.lock:
@@ -121,7 +141,8 @@ class LiveReview:
                 continue
             started = time.monotonic()
             try:
-                result = check_result(self.client.run_bytes('four-screws', list(self.inputs)))
+                kwargs = {'yolo_count': frames[-1][2]} if frames[-1][2] is not None else {}
+                result = check_result(self.client.run_bytes('four-screws', list(self.inputs), **kwargs))
                 with self.lock:
                     self.state['result'] = result
             except Exception as exc:
@@ -192,6 +213,9 @@ def main(argv=None):
     sys.path.insert(0, str(ROOT))
     from four_screws_20261006_client import FourScrews20261006Client
     client = FourScrews20261006Client(args.vlm_env_file, None, None, args.vlm_timeout_s, args.vlm_mode)
+    from ultralytics import YOLO
+    from right_plate_screw_detection import MODEL_PATH
+    screw_model = YOLO(str(ROOT / MODEL_PATH))
     gdk = None
     server = None
     review = None
@@ -215,7 +239,8 @@ def main(argv=None):
                 frame = camera.get_latest_image(gdk.CameraType.kHandRightColor, 300.)
                 return cv2.cvtColor(decode_color_rgb(frame, gdk), cv2.COLOR_RGB2BGR)
         review = LiveReview(read_frame, client, roi, sample_interval=args.sample_interval_s,
-                            request_interval=args.request_interval_s)
+                            request_interval=args.request_interval_s,
+                            annotate_frame=lambda frame: boxed_screw_frame(frame, screw_model, with_count=True))
         server = ThreadingHTTPServer((args.web_host, args.web_port), review.handler())
         review.start()
         print(f'浏览器预览：http://127.0.0.1:{args.web_port}；Ctrl+C 停止。裁剪区域：{roi}', flush=True)

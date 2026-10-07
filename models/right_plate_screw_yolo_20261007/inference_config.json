@@ -1,0 +1,33 @@
+{
+  "model": "best.pt",
+  "model_family": "YOLO11n",
+  "task": "detect",
+  "names": {
+    "0": "plate_screw"
+  },
+  "camera": "kHandRightColor",
+  "topic": "/camera/hand_right_color",
+  "image_width": 1280,
+  "image_height": 1056,
+  "fixed_crop_xyxy": [
+    525,
+    435,
+    780,
+    815
+  ],
+  "imgsz": 384,
+  "confidence": 0.5,
+  "nms_iou": 0.5,
+  "count_method": "number of retained per-screw detection boxes; no fixed-count classification",
+  "inference_augmentation": false,
+  "weights_sha256": "cc09ca46495770b5cf4f71b7ee86afd185909c8399f810f7361cbf35165a6120",
+  "dataset": "/home/flyfuture/g2_hinge_assembly/datasets/right_plate_screw_yolo_20261007_v1",
+  "run": "/home/flyfuture/g2_hinge_assembly/runs/right_plate_screw_yolo/20261007_v1",
+  "transfer_initialization": "models/two_hole_head_rgbd_yolo_v2/best.pt; detection class head rebuilt for one screw class",
+  "crop_width": 255,
+  "crop_height": 380,
+  "training_image_width": 1280,
+  "training_image_height": 1056,
+  "bbox_xyxy_coordinates": "full original image",
+  "bbox_crop_xyxy_coordinates": "ROI image"
+}

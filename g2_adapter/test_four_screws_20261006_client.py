@@ -34,3 +34,16 @@ class NewCandidateTests(unittest.TestCase):
         with patch('four_screws_20261006_client.api_key_from_environment', return_value='test'):
             with self.assertRaises(RuntimeError):
                 client.run_bytes('four-screws', inputs)
+
+    def test_yolo_count_updates_prompt_on_every_request(self):
+        client = FourScrews20261006Client.__new__(FourScrews20261006Client)
+        client.prompt = '原提示词'
+        client.session = Mock()
+        client.mode, client.model, client.api_url, client.timeout_s = 'local', 'model', 'http://example', 60
+        client.session.post.return_value.json.return_value = {'choices': [{'message': {'content': '{"count":3}'}}]}
+        with patch('four_screws_20261006_client.api_key_from_environment', return_value='test'):
+            for count in (3, 4, 0):
+                client.run_bytes('four-screws', [b'zero', b'four', b'current'], yolo_count=count)
+                prompt = client.session.post.call_args.kwargs['json']['messages'][0]['content'][0]['text']
+                self.assertEqual(prompt, f'原提示词\n\n最后一张当前图中，YOLO识别到的候选螺丝头框数量为{count}个。')
+        self.assertEqual(client.prompt, '原提示词')

@@ -19,7 +19,7 @@ class GripperMonitor:
     def __init__(self, web, client, emit, crop=None):
         self.web, self.client, self.emit, self.crop = web, client, emit, crop
         self.reference = None
-        self.votes = deque(maxlen=5)
+        self.votes = deque(maxlen=4)
         self.phase = 'idle'
         self.phase_started = time.monotonic()
         self.epoch = 0
@@ -107,14 +107,14 @@ class GripperMonitor:
             state = record.get('result', {}).get('state', 'unknown') if record['ok'] else 'unknown'
             self.votes.append(state)
             stable = 'unknown'
-            if len(self.votes) == 5:
+            if len(self.votes) == 4:
                 for candidate in ('attached', 'not_attached'):
                     if self.votes.count(candidate) >= 3:
                         stable = candidate
             record.update(workflow_phase=phase, stable_state=stable, votes=list(self.votes))
             self.latest = record
             if phase == 'post_grasp' and stable == 'not_attached':
-                self.regrasp_reason = 'VLM 最近五次多数票确认未抓住（至少三票）'
+                self.regrasp_reason = 'VLM 最近四次多数票确认未抓住（至少三票）'
         self.emit(record)
         with self.lock:
             if self.epoch == epoch and phase == 'post_grasp':

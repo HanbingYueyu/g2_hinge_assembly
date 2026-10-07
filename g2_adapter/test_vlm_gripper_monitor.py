@@ -5,6 +5,20 @@ from vlm_gripper_monitor import GripperMonitor, VlmRegraspRequested
 
 
 class MonitorTests(unittest.TestCase):
+    def test_two_to_two_votes_remain_unknown(self):
+        monitor = GripperMonitor(None, None, lambda _: None)
+        monitor.set_phase('post_grasp')
+        results = [{'ok': True, 'result': {'state': state}} for state in
+                   ['attached', 'not_attached', 'attached', 'not_attached']]
+        with patch('vlm_gripper_monitor._snapshots', return_value=({'left': b'full'}, {})), \
+             patch('vlm_gripper_monitor.run_gripper_check', side_effect=results):
+            for _ in range(4):
+                monitor.sample()
+        self.assertEqual(monitor.latest['stable_state'], 'unknown')
+        self.assertFalse(monitor.confirmed.is_set())
+        monitor.raise_if_regrasp_requested()
+
+
     def test_confirmation_waits_for_success_event_publication(self):
         monitor = GripperMonitor(None, None, lambda _: None)
         monitor.set_phase('post_grasp')
@@ -12,7 +26,7 @@ class MonitorTests(unittest.TestCase):
             monitor.wait_for_attached(timeout_s=0)
         with patch('vlm_gripper_monitor._snapshots', return_value=({'left': b'full'}, {})), \
              patch('vlm_gripper_monitor.run_gripper_check', return_value={'ok': True, 'result': {'state': 'attached'}}):
-            for _ in range(5):
+            for _ in range(4):
                 monitor.sample()
         monitor.wait_for_attached(timeout_s=0)
         monitor.set_phase('idle')
@@ -43,12 +57,12 @@ class MonitorTests(unittest.TestCase):
         G2Controller.check_automatic_guard(controller)
         self.assertEqual(calls, ['guard'])
 
-    def test_failure_requires_three_of_five_post_grasp_votes(self):
+    def test_failure_requires_three_of_four_post_grasp_votes(self):
         monitor = GripperMonitor(None, None, lambda record: None)
         monitor.set_phase('post_grasp')
-        results = [{'ok': True, 'result': {'state': s}} for s in ['not_attached','attached','not_attached','unknown','not_attached']]
+        results = [{'ok': True, 'result': {'state': s}} for s in ['not_attached','attached','not_attached','not_attached']]
         with patch('vlm_gripper_monitor._snapshots', return_value=({'left': b'full'}, {})), patch('vlm_gripper_monitor.run_gripper_check', side_effect=results):
-            for _ in range(4):
+            for _ in range(3):
                 monitor.sample()
                 monitor.raise_if_regrasp_requested()
             monitor.sample()

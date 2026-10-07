@@ -32,6 +32,10 @@ MODE_LABELS = {
 }
 
 
+class DemoCancelled(SafetyError):
+    """Esc cancelled this round; the existing GDK session remains reusable."""
+
+
 class DemoModeSelection:
     """The input thread only queues a request; robot code commits it between rounds."""
 
@@ -40,14 +44,30 @@ class DemoModeSelection:
         self._ready = threading.Event()
         self.active = None
         self.pending = None
+        self._cancel = threading.Event()
 
     def choose(self, key: str) -> str:
+        if key in {'esc', '\x1b'}:
+            with self._lock:
+                if self.active in MODE_LABELS:
+                    self._cancel.set()
+            return '停止当前流程并返回选择界面'
         if key not in (*MODE_LABELS, 'q'):
             raise ValueError('请选择 1、2、3、4、5、6 或 q')
         with self._lock:
             self.pending = key
             self._ready.set()
         return ('完成当前轮后返回选择界面' if self.active in MODE_LABELS else '退出演示') if key == 'q' else MODE_LABELS[key]
+
+    def check_cancelled(self):
+        if self._cancel.is_set():
+            raise DemoCancelled('Esc 取消当前演示')
+
+    def return_to_menu(self):
+        with self._lock:
+            self.active = self.pending = None
+            self._ready.clear()
+            self._cancel = threading.Event()
 
     def wait_first(self) -> str | None:
         while True:
@@ -112,9 +132,9 @@ class DemoKeyboard:
                     keys = [line.strip()[:1][0] for line in lines if line.strip()]
                 for byte in keys:
                     key = chr(byte).lower()
-                    if key in MODE_LABELS or key == 'q':
+                    if key in MODE_LABELS or key in {'q', '\x1b'}:
                         label = self.selection.choose(key)
-                        print(f'\n[演示选择] {label}' + ('。' if key == 'q' else '；当前轮完成后生效。'), flush=True)
+                        print(f'\n[演示选择] {label}' + ('。' if key in {'q', '\x1b'} else '；当前轮完成后生效。'), flush=True)
             except (OSError, ValueError, TypeError):
                 self.selection.choose('q')
                 return
@@ -432,12 +452,110 @@ def print_demo_menu():
         '4.抓取电批并移动\n'
         '5.全流程不启动电批（单次）\n'
         '6.全流程启动电批（单次）\n'
-        'q.结束',
+        'Esc.停止当前流程并回到选择界面\n'
+        'q.完成本轮后回到选择界面（选择界面按 q 结束）',
         flush=True,
     )
 
 
+def _stop_cancelled_round(ctx):
+    monitor = ctx.services.get('vlm_gripper_monitor')
+    if monitor is not None:
+        monitor.set_phase('idle')
+    job = ctx.services.get('insertion_review_job')
+    if job is not None:
+        job.stop.set()
+        ctx.services.put('insertion_review_job', None)
+    ctx.services.dianpi_runner.stop_current_cycle()
+    controller = ctx.services.controller
+    # All owning stage streams have unwound. Replace remaining planned goals
+    # with measured joints, and retain both gripper states.
+    guard = controller.demo_cancel_guard
+    controller.demo_cancel_guard = None
+    try:
+        with controller.manual_motion():
+            controller.prepare_joint_impedance_control(('left', 'right'))
+            current = tuple(controller.checked_arm_state())
+            controller.hold_joint_positions('left', current[:7])
+            controller.hold_joint_positions('right', current[7:])
+    finally:
+        controller.demo_cancel_guard = guard
+
+
+class _CancelableRuntime:
+    def __init__(self, runtime, selection):
+        self._runtime, self.selection = runtime, selection
+
+    def __getattr__(self, name):
+        return getattr(self._runtime, name)
+
+    def emit(self, *args, **kwargs):
+        self.selection.check_cancelled()
+        return self._runtime.emit(*args, **kwargs)
+
+    def emit_event(self, record):
+        self.selection.check_cancelled()
+        return self._runtime.emit_event(record)
+
+
+class _CancelableVlmClient:
+    """Unwind the motion owner without waiting for a slow read-only HTTP call."""
+    def __init__(self, client, selection):
+        self.client, self.selection = client, selection
+        self.lock = threading.Lock()
+
+    def __getattr__(self, name):
+        return getattr(self.client, name)
+
+    def run_bytes(self, *args, **kwargs):
+        done = threading.Event()
+        result, errors = [], []
+        cancel = self.selection._cancel
+        def request():
+            try:
+                with self.lock:
+                    if cancel.is_set():
+                        return
+                    result.append(self.client.run_bytes(*args, **kwargs))
+            except Exception as exc:
+                errors.append(exc)
+            finally:
+                done.set()
+        threading.Thread(target=request, name='demo-vlm-request', daemon=True).start()
+        while not done.wait(.02):
+            self.selection.check_cancelled()
+        self.selection.check_cancelled()
+        if errors:
+            raise errors[0]
+        if not result:
+            raise DemoCancelled('VLM 请求已取消')
+        return result[0]
+
+
 def run_repeated_demo(ctx, selection: DemoModeSelection) -> int:
+    controller = ctx.services.controller
+    gate = controller.motion_gate
+    old_guard = getattr(controller, 'demo_cancel_guard', None)
+    old_gate_guard = getattr(gate, 'cancel_guard', None) if gate is not None else None
+    previous_runtime = ctx.runtime
+    previous_client = ctx.services.get('vlm_client')
+    ctx.runtime = _CancelableRuntime(previous_runtime, selection)
+    if previous_client is not None:
+        ctx.services.put('vlm_client', _CancelableVlmClient(previous_client, selection))
+    controller.demo_cancel_guard = selection.check_cancelled
+    if gate is not None:
+        gate.cancel_guard = selection.check_cancelled
+    try:
+        return _run_repeated_demo(ctx, selection)
+    finally:
+        ctx.runtime = previous_runtime
+        ctx.services.put('vlm_client', previous_client)
+        controller.demo_cancel_guard = old_guard
+        if gate is not None:
+            gate.cancel_guard = old_gate_guard
+
+
+def _run_repeated_demo(ctx, selection: DemoModeSelection) -> int:
     """Reuse the full-flow GDK session, models, cameras, motion gate and stages."""
     try:
         from .run_bilateral_flow_gdk import (
@@ -477,8 +595,25 @@ def run_repeated_demo(ctx, selection: DemoModeSelection) -> int:
                 'right_return': lambda: _release_right_in_place(ctx) if mode == '3' else _return_right(ctx),
             }
             run_demo_round(mode, actions)
+            selection.check_cancelled()
             ctx.runtime.emit('demo_round_complete', mode=mode, round=round_number)
         except Exception as exc:
+            if selection._cancel.is_set():
+                try:
+                    _stop_cancelled_round(ctx)
+                except Exception as stop_error:
+                    ctx.runtime._runtime.emit('demo_stop_failed', error=str(stop_error))
+                    print(f'[停止失败] {stop_error}', file=sys.stderr, flush=True)
+                    return 1
+                selection.return_to_menu()
+                ctx.runtime.emit('demo_round_cancelled', mode=mode, round=round_number)
+                print('[演示已停止] 保持当前位置和夹爪状态，请重新选择。', flush=True)
+                previous = None
+                print_demo_menu()
+                mode = selection.wait_first()
+                if mode is None:
+                    return 0
+                continue
             ctx.runtime.emit('demo_round_failed', mode=mode, round=round_number, error=str(exc))
             print(f'[演示停止] {exc}', file=sys.stderr, flush=True)
             return 1
@@ -486,11 +621,23 @@ def run_repeated_demo(ctx, selection: DemoModeSelection) -> int:
         mode = selection.next_round()
         if mode is None and selection.active is None:
             if previous not in {'5', '6'}:
+                selection.active = previous
                 try:
                     stage_home(ctx)
+                    selection.check_cancelled()
                 except Exception as exc:
-                    ctx.runtime.emit('demo_finish_failed', error=str(exc))
-                    return 1
+                    if not selection._cancel.is_set():
+                        ctx.runtime.emit('demo_finish_failed', error=str(exc))
+                        return 1
+                    try:
+                        _stop_cancelled_round(ctx)
+                    except Exception as stop_error:
+                        ctx.runtime._runtime.emit('demo_stop_failed', error=str(stop_error))
+                        return 1
+                    selection.return_to_menu()
+                    ctx.runtime.emit('demo_round_cancelled', mode=previous, round=round_number)
+                    print('[演示已停止] 保持当前位置和夹爪状态，请重新选择。', flush=True)
+                selection.active = None
             previous = None
             print_demo_menu()
             mode = selection.wait_first()
