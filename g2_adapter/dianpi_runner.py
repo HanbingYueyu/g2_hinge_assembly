@@ -65,6 +65,7 @@ class DianpiCycleRunner:
         self._last_error: BaseException | None = None
         self._trigger_enabled = True
         self._automatic_only = False
+        self._gpio_trigger_override = None
 
     @property
     def running(self) -> bool:
@@ -129,9 +130,20 @@ class DianpiCycleRunner:
             self._automatic_only = bool(automatic_only)
             return previous
 
-    def trigger(self, *, automatic: bool = False) -> DianpiTriggerResult:
+    def set_gpio_trigger_override(self, enabled: bool | None) -> bool | None:
+        """Override only the physical P10 source; None restores normal policy."""
         with self._lock:
-            if not self._trigger_enabled or (self._automatic_only and not automatic):
+            previous = self._gpio_trigger_override
+            self._gpio_trigger_override = None if enabled is None else bool(enabled)
+            return previous
+
+    def trigger(self, *, automatic: bool = False, source: str = "manual") -> DianpiTriggerResult:
+        with self._lock:
+            if source == "gpio" and self._gpio_trigger_override is not None:
+                allowed = self._gpio_trigger_override
+            else:
+                allowed = self._trigger_enabled and (not self._automatic_only or automatic)
+            if not allowed:
                 return DianpiTriggerResult.DISABLED
             if self._closed:
                 self._emit({"event": "dianpi_error", "error": "runner closed"})
@@ -197,7 +209,7 @@ class DianpiCycleRunner:
                     raise RuntimeError("RM1010 输入读取失败")
                 current_start = int(states.get(10, 1))
                 if current_start == 0 and previous_start == 1:
-                    self.trigger()
+                    self.trigger(source="gpio")
                 previous_start = current_start
             except BaseException as exc:
                 if self._monitor_stop.is_set():

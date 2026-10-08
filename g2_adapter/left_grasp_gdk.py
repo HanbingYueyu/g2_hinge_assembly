@@ -2984,6 +2984,10 @@ def run_left_cycle(*, services=None, argv=None) -> int:
                 motion_gate=motion_gate,
             )
             controller.checked_arm_state()
+        if args.allow_motion:
+            # The reused controller may still carry the preceding right-tool phase.
+            # Restore the left-grasp mode before home, coarse IK or pose streaming.
+            controller.begin_left_grasp_control()
         if services is not None:
             dianpi_runner = services.dianpi_runner
         if args.spacemouse_device and dianpi_runner is None:

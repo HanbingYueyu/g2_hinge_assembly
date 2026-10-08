@@ -52,11 +52,13 @@ class DemoModeSelection:
                 if self.active in MODE_LABELS:
                     self._cancel.set()
             return '停止当前流程并返回选择界面'
-        if key not in (*MODE_LABELS, 'q'):
-            raise ValueError('请选择 1、2、3、4、5、6 或 q')
+        if key not in (*MODE_LABELS, '0', 'q'):
+            raise ValueError('请选择 0、1、2、3、4、5、6 或 q')
         with self._lock:
             self.pending = key
             self._ready.set()
+        if key == '0':
+            return '切换左右夹爪张开/闭合'
         return ('完成当前轮后返回选择界面' if self.active in MODE_LABELS else '退出演示') if key == 'q' else MODE_LABELS[key]
 
     def check_cancelled(self):
@@ -132,7 +134,7 @@ class DemoKeyboard:
                     keys = [line.strip()[:1][0] for line in lines if line.strip()]
                 for byte in keys:
                     key = chr(byte).lower()
-                    if key in MODE_LABELS or key in {'q', '\x1b'}:
+                    if key in MODE_LABELS or key in {'0', 'q', '\x1b'}:
                         label = self.selection.choose(key)
                         print(f'\n[演示选择] {label}' + ('。' if key in {'q', '\x1b'} else '；当前轮完成后生效。'), flush=True)
             except (OSError, ValueError, TypeError):
@@ -454,9 +456,24 @@ def _run_full_flow_demo(ctx, mode):
         runner.set_trigger_policy(enabled=policy[0], automatic_only=policy[1])
 
 
+def toggle_demo_grippers(ctx):
+    controller = ctx.services.controller
+    actual = [controller.read_gripper_position(side) for side in ('left', 'right')]
+    if any(value is None or not np.isfinite(value) for value in actual):
+        raise SafetyError('无法读取左右夹爪状态；不执行切换')
+    target = 0. if all(abs(value + np.pi / 4.) <= .035 for value in actual) else -np.pi / 4.
+    result = ctx.runtime._open_grippers(
+        ('left', 'right'), open_rad=target, timeout_s=6., resend_period_s=.1,
+        event='demo_grippers_toggled',
+    )
+    print('[夹爪] 左右夹爪已' + ('闭合' if target == 0. else '张开'), flush=True)
+    return result
+
+
 def print_demo_menu():
     print(
         '\n演示选项：\n'
+        '0.左右夹爪同时张开/闭合（运行中按下，本轮完成后执行）\n'
         '1.抓取铰链\n'
         '2.抓取铰链并移动\n'
         '3.抓取电批\n'
@@ -571,6 +588,8 @@ def run_repeated_demo(ctx, selection: DemoModeSelection) -> int:
     old_gate_guard = getattr(gate, 'cancel_guard', None) if gate is not None else None
     previous_runtime = ctx.runtime
     previous_client = ctx.services.get('vlm_client')
+    runner = getattr(ctx.services, "dianpi_runner", None)
+    previous_gpio_policy = runner.set_gpio_trigger_override(True) if runner is not None else None
     ctx.runtime = _CancelableRuntime(previous_runtime, selection)
     if previous_client is not None:
         ctx.services.put('vlm_client', _CancelableVlmClient(previous_client, selection))
@@ -580,6 +599,8 @@ def run_repeated_demo(ctx, selection: DemoModeSelection) -> int:
     try:
         return _run_repeated_demo(ctx, selection)
     finally:
+        if runner is not None:
+            runner.set_gpio_trigger_override(previous_gpio_policy)
         ctx.runtime = previous_runtime
         ctx.services.put('vlm_client', previous_client)
         controller.demo_cancel_guard = old_guard
@@ -604,6 +625,18 @@ def _run_repeated_demo(ctx, selection: DemoModeSelection) -> int:
     previous = None
     round_number = 0
     while mode is not None:
+        if mode == '0':
+            try:
+                toggle_demo_grippers(ctx)
+            except Exception as exc:
+                print(f'[夹爪切换失败] {exc}', file=sys.stderr, flush=True)
+            # Complete this menu action without discarding a newly queued key.
+            with selection._lock:
+                selection.active = None
+            previous = None
+            print_demo_menu()
+            mode = selection.wait_first()
+            continue
         try:
             round_number += 1
             ctx.runtime.emit('demo_round_start', mode=mode, label=MODE_LABELS[mode], round=round_number)
@@ -701,7 +734,7 @@ def _run_repeated_demo(ctx, selection: DemoModeSelection) -> int:
                 return 0
         else:
             print_demo_menu()
-        if mode != previous and mode is not None:
+        if mode != previous and mode in MODE_LABELS:
             print(f'[演示切换] 下一轮：{MODE_LABELS[mode]}', flush=True)
     # A completed cycle has already returned the part and raised the jaw.
     try:

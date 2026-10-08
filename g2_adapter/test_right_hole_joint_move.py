@@ -11,6 +11,7 @@ class RightHoleJointMoveTests(unittest.TestCase):
         import right_hole_joint_move as motion
 
         controller = Mock()
+        controller.checked_arm_state.return_value = (0.,) * 14
         target = CartesianPoseTarget((.4, -.2, .6), (0., 0., 0., 1.))
         controller.read_end_effector_pose.return_value = target
         model = Mock()
@@ -31,6 +32,7 @@ class RightHoleJointMoveTests(unittest.TestCase):
         import right_hole_joint_move as motion
 
         controller = Mock()
+        controller.checked_arm_state.return_value = (0.,) * 14
         model = Mock()
         model.solve_pose.side_effect = ValueError('unreachable')
         with patch.object(motion, 'UrdfKinematics', return_value=model), \

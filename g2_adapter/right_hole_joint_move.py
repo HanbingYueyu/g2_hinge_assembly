@@ -8,11 +8,13 @@ try:
     from .cartesian_teach_trajectory_gdk import DEFAULT_URDF, _joint_map, verify_live_model
     from .cartesian_teach import quaternion_to_matrix
     from .g2_kinematics import UrdfKinematics, rotation_error
+    from .endpoint_ik_candidates import solve_candidates, submit_candidates
     from .safety import RIGHT_ARM_JOINT_NAMES, ARM_POSITION_LIMITS, SafetyError
 except ImportError:
     from cartesian_teach_trajectory_gdk import DEFAULT_URDF, _joint_map, verify_live_model
     from cartesian_teach import quaternion_to_matrix
     from g2_kinematics import UrdfKinematics, rotation_error
+    from endpoint_ik_candidates import solve_candidates, submit_candidates
     from safety import RIGHT_ARM_JOINT_NAMES, ARM_POSITION_LIMITS, SafetyError
 
 
@@ -30,13 +32,8 @@ def move_right_hole_joint_target(controller, target, *, velocity_rad_s,
     transform = np.eye(4)
     transform[:3, :3] = quaternion_to_matrix(target.orientation_xyzw)
     transform[:3, 3] = target.position_m
-    solution, _ = model.solve_pose('base_link', 'arm_r_end_link', state,
-        RIGHT_ARM_JOINT_NAMES, transform, initial,
-        joint_limits=ARM_POSITION_LIMITS[7:], reference_weight=0.)
-    controller.check_automatic_guard()
-    # Carrying the tool defaults to position mode; pre-grasp clearance can use mode 3.
-    controller.move_preset('right', solution, velocity_rad_s=velocity_rad_s,
-        life_time_s=30., detail='right endpoint IK', control_mode=control_mode)
+    candidates = solve_candidates(model, controller, state, transform, initial, 'right', return_all=True)
+    solution = submit_candidates(controller, 'right', candidates, velocity_rad_s=velocity_rad_s, control_mode=control_mode)
     # A large joint move at half the preset speed can legitimately exceed 30 s.
     expected_travel_s = max(abs(float(goal) - start) for goal, start in zip(solution, initial)) / velocity_rad_s
     deadline = clock() + max(timeout_s, expected_travel_s + 10.)

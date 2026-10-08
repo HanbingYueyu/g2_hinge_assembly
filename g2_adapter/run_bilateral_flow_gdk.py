@@ -479,6 +479,8 @@ def validate_args(args: argparse.Namespace) -> int | None:
 # --------------------------------------------------------------------- stages
 def stage_home(ctx: FlowContext) -> dict:
     opened = ctx.runtime.open_all_grippers()
+    if ctx.services.controller is not None:
+        ctx.services.controller.set_position_control_phase(False)
     home = ctx.runtime.move_both_to_home(
         velocity_rad_s=ctx.args.auto_preset_velocity_rad_s,
         arrival_tolerance_rad=ctx.args.preset_arrival_tolerance_rad,

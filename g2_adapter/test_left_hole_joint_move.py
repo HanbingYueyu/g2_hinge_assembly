@@ -8,6 +8,7 @@ class LeftHoleJointTests(unittest.TestCase):
     def test_endpoint_ik_uses_preset_speed_and_checks_actual_pose(self):
         import left_hole_joint_move as motion
         controller = Mock()
+        controller.checked_arm_state.return_value = (0.,) * 14
         target = CartesianPoseTarget((.4, .2, .5), (0., 0., 0., 1.))
         controller.read_end_effector_pose.return_value = target
         model = Mock()
@@ -26,6 +27,7 @@ class LeftHoleJointTests(unittest.TestCase):
     def test_failed_ik_does_not_move(self):
         import left_hole_joint_move as motion
         controller = Mock()
+        controller.checked_arm_state.return_value = (0.,) * 14
         model = Mock()
         model.solve_pose.side_effect = ValueError('unreachable')
         with patch.object(motion, 'UrdfKinematics', return_value=model), \
@@ -39,6 +41,7 @@ class LeftHoleJointTests(unittest.TestCase):
     def test_wrong_actual_orientation_is_not_success(self):
         import left_hole_joint_move as motion
         controller = Mock()
+        controller.checked_arm_state.return_value = (0.,) * 14
         target = CartesianPoseTarget((.4,.2,.5), (0.,0.,0.,1.))
         controller.read_end_effector_pose.return_value = CartesianPoseTarget(target.position_m, (1.,0.,0.,0.))
         model = Mock()

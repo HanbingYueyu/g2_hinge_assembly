@@ -33,7 +33,7 @@
     "final_descent_completion_tolerance_m": 0.0005
   },
   "gripper": {
-    "open_rad": -0.51025,
+    "open_rad": -0.43175,
     "close_tolerance_rad": 0.035,
     "close_timeout_s": 6.0
   },

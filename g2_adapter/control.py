@@ -1356,6 +1356,13 @@ class G2Controller:
         """
         self.position_control_phase = bool(enabled)
 
+    def begin_left_grasp_control(self) -> None:
+        """Begin a new left grasp after the preceding tool phase has ended."""
+        self._require_motion()
+        self.check_automatic_guard()
+        self.set_position_control_phase(False)
+        self.prepare_joint_impedance_control(("left",))
+
     def checked_arm_state(self) -> tuple[float, ...]:
         self.check_automatic_guard()
         whole = dict(self.robot.get_whole_body_status())
