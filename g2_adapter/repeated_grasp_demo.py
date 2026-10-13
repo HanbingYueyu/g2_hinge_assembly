@@ -415,7 +415,7 @@ class AutomaticDemoRuntime:
                     raise SafetyError("等待电批运行结束超过 120 秒；停止自动演示")
                 self.sleep(.02)
             self._check_guard()
-            self._runtime.lift_after_screw(distance_mm=20.0)
+            self._runtime.lift_after_screw(distance_mm=10.0)
             self._check_guard()
         self.emit('demo_screw_point_hold_complete', point=index, mode=self.automatic_demo_mode)
 

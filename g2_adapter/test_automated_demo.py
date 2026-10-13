@@ -51,7 +51,7 @@ class AutomatedDemoTests(unittest.TestCase):
         proxy=demo.AutomaticDemoRuntime(runtime,'6',runner)
         proxy.on_right_teach_point(1,{})
         runner.trigger.assert_called_once_with(automatic=True)
-        runtime.lift_after_screw.assert_called_once_with(distance_mm=20.0)
+        runtime.lift_after_screw.assert_called_once_with(distance_mm=10.0)
         self.assertGreaterEqual(started[0],1.)
         self.assertLess(now[0],1.05)
 

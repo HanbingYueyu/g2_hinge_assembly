@@ -315,7 +315,7 @@ class BilateralRuntime:
             resend_period_s=resend_period_s, event="left_gripper_opened",
         )
 
-    def lift_after_screw(self, *, distance_mm=20.0):
+    def lift_after_screw(self, *, distance_mm=10.0):
         """Retract the right tool along base +Z and confirm actual arrival."""
         try:
             from .right_hole_motion import lift_right_before_return
