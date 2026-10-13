@@ -29,6 +29,11 @@ import numpy as np
 import torch
 
 try:
+    from .grasp_lift_diagnostics import stop_timed_out_lift, lift_record
+except ImportError:
+    from grasp_lift_diagnostics import stop_timed_out_lift, lift_record
+
+try:
     from .left_step_xy import xy_error, bounded_xy
     from .bilateral_rgbd_geometry import apply_transform
     from .left_step_rgb import OcclusionTrackerPool
@@ -3319,6 +3324,10 @@ def run_left_cycle(*, services=None, argv=None) -> int:
                     assert position_stream is not None
                     verify = post_grasp_verify_motion
                     if position_stream.is_target_reached():
+                        json_record(log, lift_record(
+                            controller, position_stream, verify, measured_left_end_link_pose(controller),
+                            'post_grasp_verify_lift_arrival_diagnostics',
+                        ))
                         last_end_link_target = verify["target"]
                         post_grasp_verify_baseline = verify["baseline"]
                         post_grasp_verify_samples.clear()
@@ -3331,23 +3340,12 @@ def run_left_cycle(*, services=None, argv=None) -> int:
                         })
                     elif time.monotonic() > verify["deadline"]:
                         current = measured_left_end_link_pose(controller)
-                        position_stream.update_target(CartesianPoseTarget(
-                            current.position_m, last_end_link_target.orientation_xyzw,
-                        ))
-                        position_stream.stop()
-                        position_stream = None
-                        assert gripper_open is not None and gripper_close_timeout is not None
                         if services is not None and services.get('vlm_gripper_monitor') is not None:
                             services.get('vlm_gripper_monitor').set_phase('idle')
-                        post_grasp_regrasp_open_stream = controller.start_left_gripper_position_stream(gripper_open)
-                        post_grasp_regrasp_open = {
-                            "reason": "post_grasp_verify_lift_target_not_reached",
-                            "orientation_xyzw": last_end_link_target.orientation_xyzw,
-                            "deadline": time.monotonic() + gripper_close_timeout,
-                            "next_command_at": time.monotonic() + 0.10,
-                            "attempts": 1,
-                        }
-                        post_grasp_verify_motion = None
+                        stop_timed_out_lift(
+                            controller, position_stream, verify, current,
+                            lambda event: json_record(log, event),
+                        )
                     continue
                 if premove_sequence is not None:
                     complete, event = premove_sequence.tick(controller, log)
@@ -5515,14 +5513,22 @@ def run_left_cycle(*, services=None, argv=None) -> int:
                                     1.5,
                                     args.post_grasp_verify_lift_m / parameters.final_descent_speed_mps + 1.0,
                                 )
+                                verify_started_at = time.monotonic()
                                 post_grasp_verify_motion = {
+                                    "origin": verify_origin,
+                                    "started_at": verify_started_at,
+                                    "timeout_s": verify_timeout_s,
                                     "target": verify_target,
-                                    "deadline": time.monotonic() + verify_timeout_s,
+                                    "deadline": verify_started_at + verify_timeout_s,
                                     "baseline": {
                                         "center_px": [float(value) for value in item["center_px"]],
                                         "area_px": int(item["area_px"]),
                                     },
                                 }
+                                json_record(log, lift_record(
+                                    controller, position_stream, post_grasp_verify_motion, verify_origin,
+                                    'post_grasp_verify_lift_start_diagnostics',
+                                ))
                                 record.update({
                                     "state": "post_grasp_verify_lift_in_flight",
                                     "reason": "nonblocking_lift_before_same_target_verification",

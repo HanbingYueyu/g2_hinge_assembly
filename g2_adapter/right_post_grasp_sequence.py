@@ -27,7 +27,7 @@ except ImportError:
 PR1_POSE_NAME = "right_pr1"
 PR2_POSE_NAME = "right_pr2"
 RIGHT_ARM_OFFSET = 7
-POST_GRASP_LIFT_M = 0.10
+POST_GRASP_LIFT_M = 0.07
 POST_GRASP_LIFT_SPEED_MPS = 0.01
 POST_GRASP_LIFT_TOLERANCE_M = 0.01
 POST_GRASP_LIFT_ORIENTATION_TOLERANCE_DEG = 0.5
@@ -129,7 +129,7 @@ def lift_after_grasp(
     speed_mps: float | None = None,
     control_mode: int = 3,
 ) -> dict:
-    """Lift the held right end-link 100 mm in base +Z and verify feedback."""
+    """Lift the held right end-link 70 mm in base +Z and verify feedback."""
     target = lift_target_from_pose(before)
     lift_speed_mps = POST_GRASP_LIFT_SPEED_MPS if speed_mps is None else float(speed_mps)
     if not 0.001 <= lift_speed_mps <= 0.03:
@@ -152,7 +152,7 @@ def lift_after_grasp(
             stable_samples=POST_GRASP_LIFT_STABLE_SAMPLES,
         )
         if actual is None:
-            raise RuntimeError("抓取后右手上抬 100 mm 未在限定时间内实际到位；停止前往 PR2")
+            raise RuntimeError("抓取后右手上抬 70 mm 未在限定时间内实际到位；停止前往 PR2")
         after = controller.read_end_effector_pose("arm_r_end_link")
         delta = tuple(
             float(actual_value - before_value)

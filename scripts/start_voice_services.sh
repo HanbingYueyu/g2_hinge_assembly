@@ -10,7 +10,7 @@ usage() {
 Usage: ./scripts/start_voice_services.sh
 
 在开发机执行：检查 G2 网络与 genie_app.service，通过 SSH 启动/复用 G2
-语音服务和远程 GDK 桥接，随后在本机前台启动 ptp_hard.sh。
+语音服务和远程 GDK 桥接，将 G2 音量设置为 100，随后在本机前台启动 ptp_hard.sh。
 
 可选环境变量：
   SSHPASS          SSH 密码；未设置时会安全地交互输入
@@ -140,6 +140,29 @@ remote_command="printf '%s' '${remote_payload}' | base64 -d | sudo bash -s"
 
 echo "[G2 服务] 通过 SSH 启动语音服务和远程 GDK 桥接..."
 sshpass -e ssh -tt -o ConnectTimeout=8 "${G2_SSH_TARGET}" "${remote_command}"
+
+echo "[音量] 设置 G2 音量为 100..."
+G2_VOICE_SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+"${G2_VOICE_SCRIPT_DIR}/run_gdk_python.sh" - <<'PYTHON'
+import time
+import agibot_gdk as gdk
+
+if gdk.gdk_init() != gdk.GDKRes.kSuccess:
+    raise RuntimeError("GDK 初始化失败，无法设置音量")
+try:
+    interaction = gdk.Interaction()
+    for attempt in range(3):
+        try:
+            interaction.set_volume(100)
+            print("G2 音量已设置为 100")
+            break
+        except RuntimeError:
+            if attempt == 2:
+                raise
+            time.sleep(1.0)
+finally:
+    gdk.gdk_release()
+PYTHON
 
 echo "[PTP] 启动开发机时间同步；保持此终端运行，按 Ctrl+C 停止 PTP。"
 sudo bash "${G2_PTP_SCRIPT}"

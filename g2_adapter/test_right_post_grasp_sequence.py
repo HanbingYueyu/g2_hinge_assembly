@@ -94,7 +94,7 @@ class RightPostGraspSequenceTests(unittest.TestCase):
             with self.assertRaises(RuntimeError):
                 load_pr1_pose(path)
 
-    def test_lift_target_adds_100_mm_in_base_z_and_keeps_orientation(self):
+    def test_lift_target_adds_70_mm_in_base_z_and_keeps_orientation(self):
         before = CartesianPoseTarget(
             (0.2, -0.3, 0.4),
             (0.0, 0.0, 0.2, 0.9797958971),
@@ -102,8 +102,8 @@ class RightPostGraspSequenceTests(unittest.TestCase):
         target = lift_target_from_pose(before)
         self.assertAlmostEqual(target.position_m[0], before.position_m[0])
         self.assertAlmostEqual(target.position_m[1], before.position_m[1])
-        self.assertAlmostEqual(POST_GRASP_LIFT_M, 0.10)
-        self.assertAlmostEqual(target.position_m[2] - before.position_m[2], 0.10)
+        self.assertAlmostEqual(POST_GRASP_LIFT_M, 0.07)
+        self.assertAlmostEqual(target.position_m[2] - before.position_m[2], 0.07)
         self.assertEqual(target.orientation_xyzw, before.orientation_xyzw)
 
     def test_pose_snapshot_saves_current_right_end_link_and_joints(self):

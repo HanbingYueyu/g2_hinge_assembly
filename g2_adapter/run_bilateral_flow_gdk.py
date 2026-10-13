@@ -297,6 +297,10 @@ def parse_args(argv=None) -> argparse.Namespace:
         "--tts-enable", nargs="?", const=True, default=False, type=_parse_bool,
         help="语音播报 VLM 判别结果，可写 true/false；默认关闭。",
     )
+    parser.add_argument(
+        "--tts-mode", choices=("g2", "local"), default="g2",
+        help="g2：现有 G2 TTS 播报；local：本机扬声器播放录制 WAV；默认 g2。",
+    )
     # Kept as a hidden compatibility switch for old launch wrappers.  The
     # public interface is now the positive --vlm-enable flag.
     parser.add_argument("--disable-vlm-checks", action="store_true", help=argparse.SUPPRESS)
@@ -1287,8 +1291,16 @@ def run_flow(args: argparse.Namespace) -> int:
                     from .vlm_tts import VlmTtsAnnouncer
                 except ImportError:
                     from vlm_tts import VlmTtsAnnouncer
+                if args.tts_mode == "local":
+                    try:
+                        from .recorded_tts import RecordedAudioPlayer
+                    except ImportError:
+                        from recorded_tts import RecordedAudioPlayer
+                    speech_player = RecordedAudioPlayer()
+                else:
+                    speech_player = agibot_gdk.Interaction()
                 tts_announcer = VlmTtsAnnouncer(
-                    agibot_gdk.Interaction(),
+                    speech_player,
                     event_sink=flow_event_sink,
                     warning_sink=lambda error: flow_event_sink({
                         "event": "tts_warning", "error": error,
