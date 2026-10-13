@@ -5509,9 +5509,10 @@ def run_left_cycle(*, services=None, argv=None) -> int:
                                 # Rebase so the lift starts from the real arm.
                                 position_stream.rebase_to_measured_pose()
                                 position_stream.update_target(verify_target)
+                                # Allow smoothing, feedback lag and stable arrival after closure.
                                 verify_timeout_s = max(
-                                    1.5,
-                                    args.post_grasp_verify_lift_m / parameters.final_descent_speed_mps + 1.0,
+                                    3.0,
+                                    args.post_grasp_verify_lift_m / parameters.final_descent_speed_mps + 3.0,
                                 )
                                 verify_started_at = time.monotonic()
                                 post_grasp_verify_motion = {

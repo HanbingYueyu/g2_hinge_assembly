@@ -3,10 +3,10 @@ import time
 from datetime import datetime,timezone
 import numpy as np
 try:
-    from .control import quaternion_angle_deg
+    from .control import quaternion_angle_deg, CartesianPoseTarget
     from .safety import SafetyError
 except ImportError:
-    from control import quaternion_angle_deg
+    from control import quaternion_angle_deg, CartesianPoseTarget
     from safety import SafetyError
 
 
@@ -34,7 +34,7 @@ def stop_timed_out_lift(controller,stream,verify,actual,emit,*,now=None):
     # Replace the movement destination, then stop its sole writer before joint hold.
     # Do not send any new gripper command or open it on a motion timeout.
     try:
-        stream.hold_at_pose(actual)
+        stream.hold_at_pose(CartesianPoseTarget(actual.position_m, verify['target'].orientation_xyzw))
     finally:
         stream.stop()
     controller.hold_joint_positions('left',controller.checked_arm_state()[:7])

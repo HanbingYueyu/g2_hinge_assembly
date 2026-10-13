@@ -243,7 +243,7 @@ def replay_trajectory(
     while True:
         state = _joint_map(robot)
         error = max(abs(state[name]-target) for name, target in zip(trajectory.joint_names, request.joint_positions))
-        if error <= 0.03:
+        if error <= 0.01:
             break
         if not move_to_start:
             raise RuntimeError("当前关节不在示教起点；请先运行 left_to_teach_start 阶段")
