@@ -78,10 +78,10 @@ def end_on_takeover(result, robot, label, worker=None):
         yield
     except AdvanceRightRequested:
         result.update(interrupted_by_advance=True, sent=robot.sent)
-        print(f"{label}示教已结束；进入下一阶段。", flush=True)
+        print(f"{label}当前移动已结束；进入下一阶段。", flush=True)
     except TeachReplayTakenOver:
         result.update(interrupted_by_takeover=True, sent=robot.sent)
-        print(f"{label}示教已因 SpaceMouse 接管结束；不再回放或等待终点。", flush=True)
+        print(f"{label}已切换为 SpaceMouse 手动控制；自动移动已停止。", flush=True)
     finally:
         if worker is not None:
             worker.allow_advance_right = previous
@@ -91,7 +91,7 @@ def move_left_to_teach_start(services, args):
     spec = validate_teach_args(args)
     robot = _GatedRobot(services.robot, services.gate,
         automatic_guard=getattr(getattr(services, 'controller', None), 'check_automatic_guard', None))
-    print("正在移动到左手示教起点…", flush=True)
+    print("正在移动到左手装配准备位置…", flush=True)
     if spec.kind == "cartesian_solved":
         replay_solved_trajectory(services.gdk, robot, spec,
             speed_scale=args.left_teach_speed_scale,
@@ -107,7 +107,7 @@ def move_left_to_teach_start(services, args):
         initial = spec.trajectory.samples[0].joint_positions_rad
         session._plan_to_start(initial, velocity_rad_s=args.left_teach_start_velocity_rad_s)
         session._wait_for_start(initial)
-    print("左手示教起点已到达。", flush=True)
+    print("左手装配准备位置已到达。", flush=True)
     return {"method": "teach_start", "trajectory": str(spec.path)}
 
 
@@ -133,7 +133,7 @@ def replay_left_placement(services, args):
                 max_acceleration_rad_s2=getattr(args, "teach_max_acceleration_rad_s2", 15.0),
                 move_to_start=False,
             )
-            print(f"左手末端示教放置完成：发送 {result['sent']} 个关节目标。", flush=True)
+            print("左手铰链放置动作已完成。", flush=True)
         return result
     trajectory = spec.trajectory
     session = G2TrajectorySession(
@@ -142,11 +142,11 @@ def replay_left_placement(services, args):
         "left",
         controller=getattr(services, "controller", None),
         monotonic_fn=robot.clock,
-        event_sink=print,
+        event_sink=lambda message: None if message.startswith("移动进度：") else print(message),
     )
     result = {"method": "teach", "trajectory": str(spec.path), "speed_scale": args.left_teach_speed_scale}
     with end_on_takeover(result, robot, "左手", getattr(services, "worker", None)):
         result["sent"] = session.replay(trajectory, speed_scale=args.left_teach_speed_scale, start_velocity_rad_s=args.left_teach_start_velocity_rad_s, move_to_start=False)
         session._wait_for_start(trajectory.samples[-1].joint_positions_rad)
-        print(f"左手示教放置完成：发送 {result['sent']} 个关节目标。", flush=True)
+        print("左手铰链放置动作已完成。", flush=True)
     return result

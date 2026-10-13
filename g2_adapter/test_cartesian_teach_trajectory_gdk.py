@@ -328,7 +328,7 @@ class ReplayTests(unittest.TestCase):
             progress_sink=progress.append,
         )
 
-        self.assertEqual(progress, [f"回放点进度：{value}%" for value in range(0, 101, 10)])
+        self.assertEqual(progress, [f"移动进度：{value}%" for value in range(0, 101, 10)])
 
 
 class RecordOptimizeTests(unittest.TestCase):

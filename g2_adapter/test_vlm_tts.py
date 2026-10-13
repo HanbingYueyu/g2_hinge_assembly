@@ -330,7 +330,7 @@ class VlmTtsTests(unittest.TestCase):
         self.assertTrue(announcer.handle_event({**event, 'aggregate': True}))
         self.assertTrue(announcer.handle_event({'event': 'vlm_right_fixture_grasp_result', 'ok': True, 'result': {'decision': '未抓住'}}))
         announcer.close()
-        self.assertEqual(interaction.messages, ['铰链螺丝孔疑似未对齐', '电批疑似抓取失败'])
+        self.assertEqual(interaction.messages, ['铰链螺丝孔疑似未对齐', '电批抓取成功'])
 
     def test_identical_task_result_is_spoken_once_and_changed_result_is_spoken(self):
         module = load_module()

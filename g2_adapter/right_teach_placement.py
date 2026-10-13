@@ -42,9 +42,9 @@ def run_right_teach_sequence(services, args, runtime):
     for index, path in enumerate(paths, 1):
         automatic_demo = getattr(runtime, "automatic_demo_mode", None) in {"5", "6"}
         if index > 1 and not automatic_demo:
-            print(f"[右手示教] 等待右键长按2秒开始第 {index}/{len(paths)} 段。", flush=True)
+            print(f"[右手作业] 等待右键长按2秒开始第 {index}/{len(paths)} 个点位。", flush=True)
             runtime.wait_for_advance(SimpleNamespace(stage=f"right_teach_gate_{index}"))
-        print(f"[右手示教] 开始第 {index}/{len(paths)} 段：{path}", flush=True)
+        print(f"[右手作业] 正在移动到第 {index}/{len(paths)} 个螺丝点位。", flush=True)
         segment_args = copy(args)
         segment_args.right_teach_trajectory = path
         segment_args.right_teach_trajectories = None
@@ -85,7 +85,7 @@ def replay_right_placement(services, args):
                 max_velocity_rad_s=getattr(args, "teach_max_velocity_rad_s", 1.0),
                 max_acceleration_rad_s2=getattr(args, "teach_max_acceleration_rad_s2", 15.0),
             )
-            print(f"右手末端示教回放完成：发送 {result['sent']} 个关节目标。", flush=True)
+            print("右手已到达当前作业点位。", flush=True)
         return result
     trajectory = spec.trajectory
     session = G2TrajectorySession(
@@ -94,7 +94,7 @@ def replay_right_placement(services, args):
         "right",
         controller=getattr(services, "controller", None),
         monotonic_fn=robot.clock,
-        event_sink=print,
+        event_sink=lambda message: None if message.startswith("移动进度：") else print(message),
     )
     result = {"method": "teach", "trajectory": str(spec.path), "speed_scale": args.right_teach_speed_scale}
     with end_on_takeover(result, robot, "右手", getattr(services, "worker", None)):

@@ -1,0 +1,34 @@
+{
+  "model": "best.pt",
+  "model_family": "YOLO11n",
+  "task": "detect",
+  "names": {
+    "0": "plate_screw"
+  },
+  "camera": "kHandRightColor",
+  "topic": "/camera/hand_right_color",
+  "image_width": 1280,
+  "image_height": 1056,
+  "fixed_crop_xyxy": [
+    525,
+    435,
+    780,
+    815
+  ],
+  "imgsz": 384,
+  "confidence": 0.5,
+  "nms_iou": 0.5,
+  "count_method": "number of retained per-screw detection boxes; no fixed-count classification",
+  "inference_augmentation": false,
+  "weights_sha256": "befe7c17b390cc9ee6cf6a6e405f09c3e91ed54160f13370ca021bd5e4d403b4",
+  "dataset": "/home/flyfuture/g2_hinge_assembly/datasets/right_plate_screw_yolo_20261007_v1",
+  "run": "/home/flyfuture/g2_hinge_assembly/runs/right_plate_screw_yolo/20261013_merged_v1",
+  "transfer_initialization": "/home/flyfuture/g2_hinge_assembly/models/right_plate_screw_yolo_20261007/best.pt",
+  "crop_width": 255,
+  "crop_height": 380,
+  "training_image_width": 1280,
+  "training_image_height": 1056,
+  "bbox_xyxy_coordinates": "full original image",
+  "bbox_crop_xyxy_coordinates": "ROI image",
+  "training_date": "2026-10-13"
+}

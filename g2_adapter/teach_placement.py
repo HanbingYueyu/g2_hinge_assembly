@@ -88,13 +88,8 @@ def replay_solved_trajectory(
     if trajectory.urdf_sha256 != _sha256(urdf):
         raise ValueError("当前 URDF 与末端轨迹离线 IK 使用的 URDF 不一致")
     model_error = verify_live_model(UrdfKinematics(urdf), robot, spec.side)
-    print(
-        f"末端轨迹模型核对通过：{model_error[0] * 1000:.3f} mm，"
-        f"{math.degrees(model_error[1]):.3f}°",
-        flush=True,
-    )
     if not start_only:
-        print(f"轨迹已通过离线验证；即将以 {speed_scale:g} 倍速位控回放。", flush=True)
+        print("运动检查通过，开始移动。", flush=True)
     return replay_trajectory(
         gdk,
         robot,

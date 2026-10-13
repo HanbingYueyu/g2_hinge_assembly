@@ -228,7 +228,7 @@ class G2TrajectorySession:
                 else 100
             )
             if progress_percent >= next_progress_percent:
-                self._event_sink(f"回放点进度：{min(progress_percent, 100)}%")
+                self._event_sink(f"移动进度：{min(progress_percent, 100)}%")
                 next_progress_percent = (progress_percent // 10 + 1) * 10
             deadline += REPLAY_CONTROL_PERIOD_S
             remaining_s = deadline - self._monotonic()
@@ -339,7 +339,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             robot,
             trajectory.side,
             controller=controller,
-            event_sink=lambda message: print(message, flush=True),
+            event_sink=lambda message: None if message.startswith("移动进度：") else print(message, flush=True),
         )
         sent = session.replay(
             trajectory,

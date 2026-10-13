@@ -214,7 +214,7 @@ def replay_trajectory(
     if not math.isfinite(start_velocity_rad_s) or start_velocity_rad_s <= 0.0:
         raise ValueError("start_velocity_rad_s must be positive and finite")
     if progress_sink is None:
-        progress_sink = lambda message: print(message, flush=True)
+        progress_sink = lambda message: None
     limits = ARM_POSITION_LIMITS[:7] if trajectory.side == "left" else ARM_POSITION_LIMITS[7:]
     local_report = validate_joint_trajectory(
         trajectory,
@@ -266,7 +266,7 @@ def replay_trajectory(
         completed = min(sent-1, max(0, total_targets-1))
         progress_percent = 100 if total_targets <= 1 else int(100*completed/(total_targets-1))
         if progress_percent >= next_progress_percent:
-            progress_sink(f"回放点进度：{min(progress_percent, 100)}%")
+            progress_sink(f"移动进度：{min(progress_percent, 100)}%")
             next_progress_percent = (progress_percent//10+1)*10
         send_deadline += 0.01
         remaining = send_deadline-monotonic_fn()
@@ -323,7 +323,7 @@ def _parser() -> argparse.ArgumentParser:
     combined = commands.add_parser("record-optimize", help="录制并保存原始末端轨迹，随后离线优化和整轨 IK")
     combined.add_argument("--side", choices=("left", "right"), required=True)
     combined.add_argument("--raw-output", type=Path, required=True)
-    combined.add_argument("--output", type=Path, required=True, help="优化后的 *_cartesian_solved.json")
+    combined.add_argument("--output", type=Path, help="优化后的轨迹；默认将 --raw-output 的 _raw 后缀替换为 _solved.json")
     combined.add_argument("--spline-output", type=Path, help="B 样条关节轨迹，默认同目录 *_bspline_solved.json")
     combined.add_argument("--comparison-output", type=Path, help="对比图，默认同目录 *_comparison.png")
     combined.add_argument("--bspline-control-points", type=int, default=6)
@@ -419,7 +419,7 @@ def main(argv=None) -> int:
     try:
         if args.command == "record-optimize":
             raw_output = args.raw_output.expanduser().resolve()
-            output = args.output.expanduser().resolve()
+            output = (args.output or raw_output.with_name(raw_output.stem.removesuffix("_raw") + "_solved.json")).expanduser().resolve()
             stem = output.stem.removesuffix("_solved")
             spline_output = (args.spline_output or output.with_name(stem + "_bspline_solved.json")).expanduser().resolve()
             comparison_output = (args.comparison_output or output.with_name(stem + "_comparison.png")).expanduser().resolve()

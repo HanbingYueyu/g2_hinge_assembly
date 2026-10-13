@@ -212,8 +212,8 @@ class G2TrajectorySessionTests(unittest.TestCase):
         )
         self.assertTrue(any("起点已到达" in event for event in events))
         self.assertEqual(
-            [event for event in events if event.startswith("回放点进度：")],
-            [f"回放点进度：{percent}%" for percent in (0, 20, 40, 60, 80, 90, 100)],
+            [event for event in events if event.startswith("移动进度：")],
+            [f"移动进度：{percent}%" for percent in (0, 20, 40, 60, 80, 90, 100)],
         )
         self.assertEqual(robot.control_modes, [3])
 

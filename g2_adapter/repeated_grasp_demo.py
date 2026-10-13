@@ -95,8 +95,9 @@ class DemoModeSelection:
 class DemoKeyboard:
     """Read 1/2/3/4/5/6/q without sending robot motion from the input thread."""
 
-    def __init__(self, selection: DemoModeSelection, stream=None):
+    def __init__(self, selection: DemoModeSelection, stream=None, *, language_switch=None):
         self.selection = selection
+        self.language_switch = language_switch
         self.stream = sys.stdin if stream is None else stream
         self._stop = threading.Event()
         self._thread = None
@@ -134,6 +135,13 @@ class DemoKeyboard:
                     keys = [line.strip()[:1][0] for line in lines if line.strip()]
                 for byte in keys:
                     key = chr(byte).lower()
+                    if key == '9':
+                        if self.language_switch is None:
+                            print('\n[语音] 语音播报未启用。', flush=True)
+                        else:
+                            language = self.language_switch()
+                            print('\n[语音] 已切换为' + ('英文' if language == 'en' else '中文'), flush=True)
+                        continue
                     if key in MODE_LABELS or key in {'0', 'q', '\x1b'}:
                         label = self.selection.choose(key)
                         print(f'\n[演示选择] {label}' + ('。' if key in {'q', '\x1b'} else '；当前轮完成后生效。'), flush=True)
@@ -480,6 +488,7 @@ def print_demo_menu():
         '4.抓取电批并移动\n'
         '5.全流程不启动电批（单次）\n'
         '6.全流程启动电批（单次）\n'
+        '9.切换中文/英文语音\n'
         'Esc.停止当前流程并回到选择界面\n'
         'q.完成本轮后回到选择界面（选择界面按 q 结束）',
         flush=True,

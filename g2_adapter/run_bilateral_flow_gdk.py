@@ -301,6 +301,8 @@ def parse_args(argv=None) -> argparse.Namespace:
         "--tts-mode", choices=("g2", "local"), default="g2",
         help="g2：现有 G2 TTS 播报；local：本机扬声器播放录制 WAV；默认 g2。",
     )
+    parser.add_argument("--tts-language", choices=("zh", "en"), default="zh",
+                        help="播报语言；默认 zh，演示中按 9 切换。")
     # Kept as a hidden compatibility switch for old launch wrappers.  The
     # public interface is now the positive --vlm-enable flag.
     parser.add_argument("--disable-vlm-checks", action="store_true", help=argparse.SUPPRESS)
@@ -1133,7 +1135,7 @@ def stage_right_grasp(ctx: FlowContext) -> dict:
             from .right_teach_placement import run_right_teach_sequence
         except ImportError:
             from right_teach_placement import run_right_teach_sequence
-        print("右手已到 hole 偏移点；开始示教回放。", flush=True)
+        print("右手已到装配准备位置；开始移动到螺丝点位。", flush=True)
         result["placement"] = run_right_teach_sequence(ctx.services, ctx.args, ctx.runtime)
     return result
 
@@ -1291,14 +1293,15 @@ def run_flow(args: argparse.Namespace) -> int:
                     from .vlm_tts import VlmTtsAnnouncer
                 except ImportError:
                     from vlm_tts import VlmTtsAnnouncer
-                if args.tts_mode == "local":
-                    try:
-                        from .recorded_tts import RecordedAudioPlayer
-                    except ImportError:
-                        from recorded_tts import RecordedAudioPlayer
-                    speech_player = RecordedAudioPlayer()
-                else:
-                    speech_player = agibot_gdk.Interaction()
+                try:
+                    from .recorded_tts import LanguageSpeechPlayer
+                except ImportError:
+                    from recorded_tts import LanguageSpeechPlayer
+                speech_player = LanguageSpeechPlayer(
+                    args.tts_mode,
+                    agibot_gdk.Interaction() if args.tts_mode == "g2" else None,
+                    language=args.tts_language,
+                )
                 tts_announcer = VlmTtsAnnouncer(
                     speech_player,
                     event_sink=flow_event_sink,
@@ -1332,7 +1335,9 @@ def run_flow(args: argparse.Namespace) -> int:
             except ImportError:
                 from repeated_grasp_demo import DemoKeyboard, DemoModeSelection
             demo_selection = DemoModeSelection()
-            keyboard = DemoKeyboard(demo_selection)
+            keyboard = DemoKeyboard(
+                demo_selection, language_switch=(speech_player.toggle_language if tts_announcer is not None else None),
+            )
         else:
             keyboard = KeyboardStageAdvance(worker)
         keyboard.start()

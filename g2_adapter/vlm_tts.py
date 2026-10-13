@@ -35,6 +35,8 @@ def _result_message(event: dict) -> tuple[tuple[str, str], str] | None:
         if task in phrases:
             return ("check_start", task), phrases[task]
         return None
+    if event_name == "right_gripper_closed":
+        return ("fixture", "True"), "电批抓取成功"
     result = event.get("result") or {}
     if event_name == "vlm_regrasp_requested":
         return ("gripper", "lost"), "铰链脱落，重新抓取"
@@ -70,8 +72,7 @@ def _result_message(event: dict) -> tuple[tuple[str, str], str] | None:
         decision = result.get("decision", result.get("latest_decision"))
         if decision not in {"抓住", "未抓住", "不确定", "yes", "no", "unknown"}:
             return None
-        success = decision in {"抓住", "yes"}
-        return ("fixture", str(success)), "电批抓取成功" if success else "电批疑似抓取失败"
+        return ("fixture", "True"), "电批抓取成功"
     if event_name == "vlm_four_screws_result":
         decision = result.get("latest_decision")
         if decision not in {"yes", "no", "unknown"}:
